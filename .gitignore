@@ -1,0 +1,17 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Editor settings
+.vscode/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Mobile build output added later
+android/
+ios/
+dist/
+build/
