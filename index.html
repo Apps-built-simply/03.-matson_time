@@ -3,52 +3,182 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta name="theme-color" content="#2563EB">
+  <meta name="theme-color" content="#121316">
   <title>Matson Time</title>
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
   <div class="app-shell">
-    <header class="app-header">
-      <div>
-        <p class="eyebrow" id="todayDate"></p>
-        <h1>Today</h1>
-      </div>
-      <button class="icon-button" id="openAddButton" aria-label="Add an item">+</button>
-    </header>
+    <!-- Today view -->
+    <div id="todayView">
+      <header class="app-header">
+        <div class="container">
+          <p class="eyebrow" id="todayDate"></p>
+          <h1>Today</h1>
+        </div>
+      </header>
 
-    <main>
-      <section class="progress-summary" aria-labelledby="progressTitle">
-        <div class="progress-ring" id="progressRing"><strong id="progressPercent">0%</strong></div>
-        <div>
+      <main class="container">
+        <!-- Daily progress is a restrained text summary -->
+        <section class="progress-summary" aria-labelledby="progressTitle">
           <h2 id="progressTitle">Daily progress</h2>
           <p><strong id="completedCount">0</strong> completed · <strong id="remainingCount">0</strong> remaining</p>
-        </div>
-      </section>
+        </section>
 
-      <section aria-labelledby="nowTitle">
-        <div class="section-heading">
-          <h2 id="nowTitle">What should I do now?</h2>
-        </div>
-        <div id="nowCard"></div>
-      </section>
+        <section aria-labelledby="attentionTitle">
+          <div class="section-heading">
+            <h2 id="attentionTitle">What needs attention</h2>
+          </div>
+          <div id="nowCard"></div>
+        </section>
 
-      <section aria-labelledby="scheduleTitle">
-        <div class="section-heading">
-          <h2 id="scheduleTitle">Today’s schedule</h2>
-          <span id="scheduleCount" class="muted"></span>
-        </div>
-        <div id="conflictNotice" aria-live="polite"></div>
-        <div id="scheduleList" class="schedule-list"></div>
-      </section>
-    </main>
+        <section aria-labelledby="scheduleTitle">
+          <div class="section-heading">
+            <h2 id="scheduleTitle">Today’s schedule</h2>
+            <span id="scheduleCount" class="muted"></span>
+          </div>
+          <div id="conflictNotice" aria-live="polite"></div>
+          <div id="scheduleList" class="schedule-list"></div>
+        </section>
+      </main>
+    </div>
 
+    <!-- Calendar view -->
+    <div id="calendarView" hidden>
+      <header class="app-header">
+        <div class="container">
+          <div class="calendar-header">
+            <div>
+              <p class="eyebrow" id="calendarDate"></p>
+              <h1>Calendar</h1>
+            </div>
+            <div class="month-nav">
+              <button class="icon-button secondary" id="prevMonthButton" aria-label="Previous month">‹</button>
+              <p class="month-year" id="monthYear"></p>
+              <button class="icon-button secondary" id="nextMonthButton" aria-label="Next month">›</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="container">
+        <div class="calendar-grid" id="calendarGrid" aria-label="Month calendar"></div>
+
+        <section aria-labelledby="selectedDateTitle">
+          <div class="section-heading">
+            <h2 id="selectedDateTitle"></h2>
+            <span id="selectedCount" class="muted"></span>
+          </div>
+          <div id="selectedConflict" aria-live="polite"></div>
+          <div id="selectedSchedule" class="schedule-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Assistant view -->
+    <div id="assistantView" hidden>
+      <header class="app-header">
+        <div class="container">
+          <p class="eyebrow" id="assistantDate"></p>
+          <h1>Assistant</h1>
+        </div>
+      </header>
+
+      <main class="container assistant-main">
+        <p class="assistant-description">Ask about your schedule or tell Matson Time what you need to do.</p>
+
+        <div class="conversation" id="conversation" aria-live="polite"></div>
+
+        <div class="assistant-empty" id="assistantEmpty">
+          <p class="muted">Ask a question about today or your upcoming schedule.</p>
+          <div class="starter-actions" id="starterActions">
+            <button class="starter" type="button" data-starter="What do I have today?">What do I have today?</button>
+            <button class="starter" type="button" data-starter="What should I do now?">What should I do now?</button>
+            <button class="starter" type="button" data-starter="What is coming next?">What is coming next?</button>
+            <button class="starter" type="button" data-starter="What is still remaining today?">What is still remaining today?</button>
+            <button class="starter" type="button" data-starter="What did I miss this week?">What did I miss this week?</button>
+            <button class="starter" type="button" data-starter="add">Add something to my schedule</button>
+          </div>
+        </div>
+
+        <div class="assistant-input-area">
+          <div class="assistant-input">
+            <textarea id="assistantInput" rows="1" placeholder="Ask about your schedule"></textarea>
+            <button class="text-button" id="voiceButton" type="button">Voice</button>
+            <button class="primary-button" id="sendButton" type="button">Send</button>
+          </div>
+          <div class="assistant-input-meta">
+            <p class="voice-notice" id="voiceNotice" hidden>Voice input is not connected yet.</p>
+            <button class="text-button muted" id="clearConversation" type="button">Clear conversation</button>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- Progress view -->
+    <div id="progressView" hidden>
+      <header class="app-header">
+        <div class="container">
+          <p class="eyebrow" id="progressDate"></p>
+          <h1>Progress</h1>
+        </div>
+      </header>
+
+      <main class="container">
+        <!-- Daily / Weekly switch -->
+        <div class="view-switch" role="group" aria-label="Progress period">
+          <button type="button" class="view-switch-button active" id="dailyButton" aria-pressed="true">Daily</button>
+          <button type="button" class="view-switch-button" id="weeklyButton" aria-pressed="false">Weekly</button>
+        </div>
+
+        <p class="period-label" id="periodLabel"></p>
+
+        <section class="progress-empty" id="progressEmpty" hidden>
+          <p id="progressEmptyText"></p>
+        </section>
+
+        <section class="progress-main" id="progressMain" hidden>
+          <p class="progress-headline" id="progressHeadline">0 of 0 completed</p>
+          <p class="progress-percent" id="progressPercent">0% complete</p>
+          <div class="progress-line" id="progressLine" role="progressbar" aria-labelledby="progressHeadline" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progressLineFill"></span></div>
+        </section>
+
+        <section id="progressBreakdown" hidden>
+          <div class="section-heading"><h2>Status breakdown</h2></div>
+          <ul class="stat-list">
+            <li><span class="stat-label">Completed</span><span class="stat-value completed" id="statCompleted">0</span></li>
+            <li><span class="stat-label">Missed</span><span class="stat-value missed" id="statMissed">0</span></li>
+            <li><span class="stat-label">Remaining</span><span class="stat-value" id="statRemaining">0</span></li>
+            <li><span class="stat-label">Awaiting check-in</span><span class="stat-value awaiting" id="statAwaiting">0</span></li>
+            <li><span class="stat-label">Postponed</span><span class="stat-value postponed" id="statPostponed">0</span></li>
+          </ul>
+        </section>
+
+        <section id="routineSection" hidden>
+          <div class="section-heading"><h2>Routine completion</h2></div>
+          <ul class="stat-list">
+            <li><span class="stat-label">Routine occurrences</span><span class="stat-value" id="routineTotal">0</span></li>
+            <li><span class="stat-label">Completed routines</span><span class="stat-value completed" id="routineCompleted">0</span></li>
+            <li><span class="stat-label">Missed routines</span><span class="stat-value missed" id="routineMissed">0</span></li>
+            <li><span class="stat-label">Remaining routines</span><span class="stat-value" id="routineRemaining">0</span></li>
+          </ul>
+          <p class="routine-percent" id="routinePercent">0% of routines completed</p>
+        </section>
+
+        <section id="weekBreakdown" hidden>
+          <div class="section-heading"><h2>Day by day</h2></div>
+          <ul class="day-list" id="dayList"></ul>
+        </section>
+      </main>
+    </div>
+
+    <!-- Primary navigation; Add is the central action and opens the Add Item dialog -->
     <nav class="bottom-nav" aria-label="Primary navigation">
-      <button class="nav-item active" data-view="today"><span>●</span>Today</button>
-      <button class="nav-item" data-view="now"><span>◷</span>Now</button>
-      <button class="nav-item" data-view="upcoming"><span>□</span>Upcoming</button>
-      <button class="nav-item" data-view="assistant"><span>◇</span>Assistant</button>
-      <button class="nav-item" data-view="progress"><span>▥</span>Progress</button>
+      <button class="nav-item active" id="navToday" data-view="today">Today</button>
+      <button class="nav-item" id="navCalendar" data-view="calendar">Calendar</button>
+      <button class="nav-item nav-add" id="navAddButton" data-view="add" aria-label="Add an item">Add</button>
+      <button class="nav-item" id="navAssistant" data-view="assistant">Assistant</button>
+      <button class="nav-item" id="navProgress" data-view="progress">Progress</button>
     </nav>
   </div>
 
@@ -63,6 +193,7 @@
       </div>
 
       <label>Title<input name="title" required placeholder="What needs to be done?"></label>
+      <label>Date<input name="date" type="date" required></label>
       <label>Type
         <select name="type" id="itemType">
           <option value="activity">Scheduled activity</option>
@@ -86,5 +217,7 @@
 
   <script src="js/data.js"></script>
   <script src="js/app.js"></script>
+  <script src="js/assistant.js"></script>
+  <script src="js/progress.js"></script>
 </body>
 </html>
