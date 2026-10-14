@@ -17,28 +17,30 @@
   <div class="app-shell" hidden>
     <!-- Today view -->
     <div id="todayView">
-      <header class="app-header">
+      <header class="app-header today-header">
         <div class="container">
-          <p class="eyebrow" id="todayDate"></p>
           <h1>Today</h1>
         </div>
       </header>
 
-      <main class="container">
-        <!-- Daily progress is a restrained text summary -->
-        <section class="progress-summary" aria-labelledby="progressTitle">
-          <h2 id="progressTitle">Daily progress</h2>
-          <p><strong id="completedCount">0</strong> completed · <strong id="remainingCount">0</strong> remaining</p>
+      <main id="todayMain" class="container today-main">
+        <section id="emptyDayState" class="empty-day" hidden aria-labelledby="emptyDayTitle">
+          <h2 id="emptyDayTitle">Your day is open.</h2>
+          <p>Nothing is scheduled for today.</p>
+          <button id="emptyAddButton" class="empty-add" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+            <span>Add something</span>
+          </button>
         </section>
 
-        <section aria-labelledby="attentionTitle">
+        <section id="attentionSection" aria-labelledby="attentionTitle">
           <div class="section-heading">
             <h2 id="attentionTitle">What needs attention</h2>
           </div>
           <div id="nowCard"></div>
         </section>
 
-        <section aria-labelledby="scheduleTitle">
+        <section id="todayScheduleSection" aria-labelledby="scheduleTitle">
           <div class="section-heading">
             <h2 id="scheduleTitle">Today’s schedule</h2>
             <span id="scheduleCount" class="muted"></span>
@@ -46,6 +48,7 @@
           <div id="conflictNotice" aria-live="polite"></div>
           <div id="scheduleList" class="schedule-list"></div>
         </section>
+        <p id="dailyProgress" class="progress-summary" aria-live="polite"></p>
       </main>
     </div>
 
@@ -190,11 +193,25 @@
 
     <!-- Primary navigation; Add is the central action and opens the Add Item dialog -->
     <nav class="bottom-nav" aria-label="Primary navigation">
-      <button class="nav-item active" id="navToday" data-view="today">Today</button>
-      <button class="nav-item" id="navCalendar" data-view="calendar">Calendar</button>
-      <button class="nav-item nav-add" id="navAddButton" data-view="add" aria-label="Add an item">Add</button>
-      <button class="nav-item" id="navAssistant" data-view="assistant">Assistant</button>
-      <button class="nav-item" id="navProgress" data-view="progress">Progress</button>
+      <button class="nav-item active" id="navToday" data-view="today" aria-label="Today">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
+        <span class="nav-label">Today</span>
+      </button>
+      <button class="nav-item" id="navCalendar" data-view="calendar" aria-label="Calendar">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="16" rx="2"/><path d="M8 3v4M16 3v4M4 10h16M8 14h2M14 14h2M8 17h2"/></svg>
+        <span class="nav-label">Calendar</span>
+      </button>
+      <button class="nav-add" id="navAddButton" type="button" aria-label="Add item">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button class="nav-item" id="navAssistant" data-view="assistant" aria-label="Assistant">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-6.5A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8 11h.01M12 11h.01M16 11h.01"/></svg>
+        <span class="nav-label">Assistant</span>
+      </button>
+      <button class="nav-item" id="navProgress" data-view="progress" aria-label="Progress">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V12M10 20V5M16 20V9M22 20V3"/></svg>
+        <span class="nav-label">Progress</span>
+      </button>
     </nav>
   </div>
 

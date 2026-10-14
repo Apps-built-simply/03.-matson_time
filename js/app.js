@@ -5,13 +5,13 @@ let calendarCursor = new Date();
 let selectedDate = localDateString(new Date());
 
 const categoryColors = Object.fromEntries((window.cloudCategories || []).map(category => [category.name, /^#[0-9a-f]{6}$/i.test(category.color || "") ? category.color : "#2563EB"]));
+function getCategoryColor(categoryName) { return categoryColors[categoryName] || "#2563EB"; }
 
 const els = {
   todayView: document.querySelector("#todayView"), calendarView: document.querySelector("#calendarView"), assistantView: document.querySelector("#assistantView"), progressView: document.querySelector("#progressView"),
-  date: document.querySelector("#todayDate"), calendarDate: document.querySelector("#calendarDate"),
+  calendarDate: document.querySelector("#calendarDate"), todayMain: document.querySelector("#todayMain"), emptyDay: document.querySelector("#emptyDayState"), emptyAdd: document.querySelector("#emptyAddButton"), attentionSection: document.querySelector("#attentionSection"), todayScheduleSection: document.querySelector("#todayScheduleSection"), dailyProgress: document.querySelector("#dailyProgress"),
   list: document.querySelector("#scheduleList"), count: document.querySelector("#scheduleCount"),
   now: document.querySelector("#nowCard"), conflict: document.querySelector("#conflictNotice"),
-  completed: document.querySelector("#completedCount"), remaining: document.querySelector("#remainingCount"),
   monthYear: document.querySelector("#monthYear"), calendarGrid: document.querySelector("#calendarGrid"),
   selectedTitle: document.querySelector("#selectedDateTitle"), selectedCount: document.querySelector("#selectedCount"),
   selectedSchedule: document.querySelector("#selectedSchedule"), selectedConflict: document.querySelector("#selectedConflict"),
@@ -47,7 +47,8 @@ function itemTime(item) {
 }
 
 function getAttentionItem(dateItems) {
-  return dateItems.find(item => item.status === "in-progress") || dateItems.find(item => item.status === "overdue") || dateItems.find(item => item.status !== "completed");
+  const activeItems = dateItems.filter(item => !["completed", "cancelled"].includes(item.status));
+  return activeItems.find(item => item.status === "in-progress") || activeItems.find(item => item.status === "overdue") || activeItems[0] || null;
 }
 
 // Overlapping timed activities within a single date
@@ -59,46 +60,84 @@ function detectConflict(dateItems) {
   return null;
 }
 
-function scheduleItemNode(item) {
+function getTodayCategoryColor(category) {
+  const colors = {
+    Health: "#C77F9F",
+    Meetings: "#C98A5D",
+    Music: "#A18ACB",
+    Personal: "#68AAA0",
+    Travel: "#8294C9"
+  };
+  return colors[category] || "#68AAA0";
+}
+
+function scheduleItemNode(item, todayStyle = false) {
   const article = document.createElement("article");
   article.className = "schedule-item";
-  const dot = document.createElement("span");
-  dot.className = "category-dot";
-  dot.style.setProperty("--category-color", categoryColors[item.category] || "#2563EB");
+  const categoryMarker = todayStyle ? null : document.createElement("span");
+  if (categoryMarker) {
+    categoryMarker.className = "category-dot";
+    categoryMarker.style.setProperty("--category-color", getCategoryColor(item.category));
+  }
   const content = document.createElement("div");
   const title = document.createElement("h3");
   title.textContent = item.title;
   const detail = document.createElement("p");
-  detail.textContent = `${itemTime(item)} · ${item.category}`;
+  if (todayStyle) {
+    detail.className = "schedule-meta";
+    const time = document.createElement("span");
+    time.className = "schedule-time";
+    time.textContent = itemTime(item);
+    const separator = document.createElement("span");
+    separator.className = "schedule-separator";
+    separator.textContent = " · ";
+    const category = document.createElement("span");
+    const categoryName = item.category || "Personal";
+    category.className = "schedule-category";
+    category.textContent = categoryName;
+      category.style.color = getTodayCategoryColor(categoryName);
+    detail.append(time, separator, category);
+  } else {
+    detail.textContent = `${itemTime(item)} · ${item.category}`;
+  }
+
   content.append(title, detail);
   const status = document.createElement("span");
   status.className = `item-status status-${String(item.status || "upcoming").replace(/[^a-z-]/gi, "")}`;
-  status.textContent = String(item.status || "upcoming").replaceAll("-", " ");
-  article.append(dot, content, status);
+  status.textContent = todayStyle ? readableStatus(item.status) : String(item.status || "upcoming").replaceAll("-", " ");
+  if (categoryMarker) article.append(categoryMarker);
+  article.append(content, status);
   return article;
+}
+
+function readableStatus(status) {
+  const value = String(status || "upcoming").replaceAll("-", " ");
+  if (value === "in progress") return "In progress";
+  if (value === "awaiting check in") return "Awaiting check-in";
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function renderAttention(dateItems) {
   const attention = getAttentionItem(dateItems);
   if (!attention) {
     const empty = document.createElement("div");
-    empty.className = "empty-state";
+    empty.className = "attention-empty";
     empty.textContent = "Nothing needs attention right now.";
     els.now.replaceChildren(empty);
     return;
   }
   const article = document.createElement("article");
   article.className = "attention-item";
-  const status = document.createElement("span");
-  status.className = "status";
-  status.textContent = String(attention.status || "upcoming").replaceAll("-", " ");
+  const illustration = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  illustration.setAttribute("class", "attention-illustration");
+  illustration.setAttribute("viewBox", "0 0 240 180");
+  illustration.setAttribute("aria-hidden", "true");
+  illustration.setAttribute("focusable", "false");
+  illustration.innerHTML = '<circle cx="151" cy="91" r="70" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="151" cy="91" r="4" fill="currentColor"/><path d="M151 48v43l28 18" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><rect x="19" y="31" width="60" height="13" rx="6.5" fill="currentColor"/><rect x="7" y="57" width="88" height="13" rx="6.5" fill="currentColor"/><rect x="34" y="83" width="45" height="13" rx="6.5" fill="currentColor"/>';
   const title = document.createElement("h3");
   title.textContent = attention.title;
   const time = document.createElement("p");
   time.textContent = itemTime(attention);
-  const reason = document.createElement("p");
-  reason.className = "reason";
-  reason.textContent = attention.status === "in-progress" ? "Currently scheduled" : attention.postponed ? `Postponed ${attention.postponed} time${attention.postponed > 1 ? "s" : ""}` : "Next item needing attention";
   const actions = document.createElement("div");
   actions.className = "actions";
   for (const [action, label, className] of [["complete", "Done", "primary-button"], ["postpone", "Postpone", "secondary-button"]]) {
@@ -110,12 +149,12 @@ function renderAttention(dateItems) {
     button.textContent = label;
     actions.appendChild(button);
   }
-  article.append(status, title, time, reason, actions);
+  article.append(illustration, title, time, actions);
   els.now.replaceChildren(article);
 }
 
-function renderSchedule(dateItems, listEl, conflictEl, emptyText) {
-  if (dateItems.length) listEl.replaceChildren(...dateItems.map(scheduleItemNode));
+function renderSchedule(dateItems, listEl, conflictEl, emptyText, todayStyle = false) {
+  if (dateItems.length) listEl.replaceChildren(...dateItems.map(item => scheduleItemNode(item, todayStyle)));
   else {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -138,6 +177,14 @@ function sortForDate(dateItems) {
   return [...dateItems].sort((a, b) => rank(a) - rank(b) || (rank(a) === 0 ? a.start.localeCompare(b.start) : 0));
 }
 
+function sortTodayItems(dateItems) {
+  return [...dateItems].sort((a, b) => {
+    const aTimed = Boolean(a.start), bTimed = Boolean(b.start);
+    if (aTimed !== bTimed) return aTimed ? -1 : 1;
+    return aTimed ? a.start.localeCompare(b.start) : 0;
+  });
+}
+
 function renderCalendar(today) {
   const year = calendarCursor.getFullYear();
   const month = calendarCursor.getMonth();
@@ -158,7 +205,7 @@ function renderCalendar(today) {
     const date = new Date(year, month, index - firstWeekday + 1);
     const dateStr = localDateString(date);
     const dateItems = itemsByDate.get(dateStr) || [];
-    const dots = dateItems.slice(0, 3).map(item => `<span class="day-dot" style="--category-color:${categoryColors[item.category] || "#2563EB"}"></span>`).join("");
+    const dots = dateItems.slice(0, 3).map(item => `<span class="day-dot" style="--category-color:${getCategoryColor(item.category)}"></span>`).join("");
     const classes = ["calendar-day", date.getMonth() !== month ? "other-month" : "", dateStr === today ? "today" : "", dateStr === selectedDate ? "selected" : ""].filter(Boolean).join(" ");
     cells.push(`<button type="button" class="${classes}" data-date="${dateStr}" aria-label="${formatDateLabel(dateStr)}${dateItems.length ? `, ${dateItems.length} item${dateItems.length > 1 ? "s" : ""}` : ""}"><span class="day-number">${date.getDate()}</span><span class="day-dots" aria-hidden="true">${dots}</span></button>`);
   }
@@ -175,17 +222,28 @@ function renderSelectedDate() {
 
 function render() {
   const today = localDateString(new Date());
-  els.date.textContent = formatDateLabel(today);
-  els.calendarDate.textContent = els.date.textContent;
+  els.calendarDate.textContent = formatDateLabel(today);
 
   const todayItems = items.filter(item => item.date === today);
   const completed = todayItems.filter(item => item.status === "completed").length;
-  els.completed.textContent = completed;
-  els.remaining.textContent = todayItems.length - completed;
-  els.count.textContent = `${todayItems.length} items`;
+  const remaining = todayItems.filter(item => !["completed", "cancelled"].includes(item.status)).length;
+  const hasTodayItems = todayItems.length > 0;
+  els.emptyDay.hidden = hasTodayItems;
+  els.todayMain.classList.toggle("is-empty", !hasTodayItems);
+  els.attentionSection.hidden = !hasTodayItems;
+  els.todayScheduleSection.hidden = !hasTodayItems;
+  els.dailyProgress.hidden = !hasTodayItems;
 
-  renderAttention(todayItems);
-  renderSchedule(todayItems, els.list, els.conflict, "No items planned for today.");
+  if (hasTodayItems) {
+    els.count.textContent = `${todayItems.length} item${todayItems.length === 1 ? "" : "s"}`;
+    els.dailyProgress.textContent = `${completed} completed · ${remaining} remaining`;
+    renderAttention(todayItems);
+    renderSchedule(sortTodayItems(todayItems), els.list, els.conflict, "No items planned for today.", true);
+  } else {
+    els.list.replaceChildren();
+    els.now.replaceChildren();
+    els.conflict.replaceChildren();
+  }
   renderCalendar(today);
   renderSelectedDate();
 }
@@ -219,6 +277,7 @@ function setView(nextView) {
 els.navToday.addEventListener("click", () => setView("today"));
 els.navCalendar.addEventListener("click", () => setView("calendar"));
 els.navAdd.addEventListener("click", openAddDialog);
+els.emptyAdd.addEventListener("click", openAddDialog);
 els.navProgress.addEventListener("click", () => setView("progress"));
 
 // Calendar controls
