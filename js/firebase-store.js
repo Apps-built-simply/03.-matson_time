@@ -259,6 +259,10 @@ export async function saveAssistantState(state) {
   })) : [];
   const pendingOperation = state.pendingOperation && typeof state.pendingOperation === "object" ? {
     intent: String(state.pendingOperation.intent || "").slice(0, 60),
+    state: ["collecting_scope", "collecting_method", "ready_for_proposal", "awaiting_confirmation", "executing", "completed", "cancelled", "expired", "failed"].includes(state.pendingOperation.state) ? state.pendingOperation.state : null,
+    operation: typeof state.pendingOperation.operation === "string" ? state.pendingOperation.operation.slice(0, 40) : null,
+    proposalId: typeof state.pendingOperation.proposalId === "string" ? state.pendingOperation.proposalId.slice(0, 80) : null,
+    method: typeof state.pendingOperation.method === "string" ? state.pendingOperation.method.slice(0, 40) : null,
     targetIds: Array.isArray(state.pendingOperation.targetIds) ? [...new Set(state.pendingOperation.targetIds.filter(id => typeof id === "string"))].slice(0, 20) : [],
     knownFields: state.pendingOperation.knownFields && typeof state.pendingOperation.knownFields === "object" ? Object.fromEntries(Object.entries(state.pendingOperation.knownFields).filter(([, value]) => ["string", "number", "boolean"].includes(typeof value)).slice(0, 12).map(([key, value]) => [key.slice(0, 40), String(value).slice(0, 160)])) : {},
     missingFields: Array.isArray(state.pendingOperation.missingFields) ? state.pendingOperation.missingFields.slice(0, 8).map(value => String(value).slice(0, 40)) : [],
@@ -266,7 +270,7 @@ export async function saveAssistantState(state) {
     scope: state.pendingOperation.scope && typeof state.pendingOperation.scope === "object" ? state.pendingOperation.scope : null
   } : null;
   const referencedSets = Array.isArray(state.referencedSets) ? state.referencedSets.slice(-5).map(set => ({
-    alias: String(set.alias || "").slice(0, 100), targetIds: Array.isArray(set.targetIds) ? [...new Set(set.targetIds.filter(id => typeof id === "string"))].slice(0, 20) : [],
+    alias: String(set.alias || set.title || "").slice(0, 100), targetIds: Array.isArray(set.targetIds || set.ids) ? [...new Set((set.targetIds || set.ids).filter(id => typeof id === "string"))].slice(0, 20) : [],
     updatedAt: String(set.updatedAt || new Date().toISOString()).slice(0, 40)
   })) : [];
   await setDoc(userDoc("assistantState", "current"), {

@@ -330,7 +330,7 @@ function buildRequestContext(message, scheduleItems, pendingClarification, compa
     } : null,
     referencedSets: Array.isArray(referencedSets) ? referencedSets.slice(-5).map(set => ({ alias: String(set.alias || "").slice(0, 100), targetIds: Array.isArray(set.targetIds) ? set.targetIds.filter(id => typeof id === "string").slice(0, 20) : [] })) : [],
     pendingOperation: pendingOperation && typeof pendingOperation === "object" ? {
-      intent: String(pendingOperation.intent || "").slice(0, 60), targetIds: Array.isArray(pendingOperation.targetIds) ? pendingOperation.targetIds.filter(id => typeof id === "string").slice(0, 20) : [],
+      intent: String(pendingOperation.intent || "").slice(0, 60), state: String(pendingOperation.state || "").slice(0, 40), operation: String(pendingOperation.operation || "").slice(0, 40), targetIds: Array.isArray(pendingOperation.targetIds) ? pendingOperation.targetIds.filter(id => typeof id === "string").slice(0, 20) : [],
       knownFields: pendingOperation.knownFields && typeof pendingOperation.knownFields === "object" ? pendingOperation.knownFields : {},
       missingFields: Array.isArray(pendingOperation.missingFields) ? pendingOperation.missingFields.slice(0, 8).map(value => String(value).slice(0, 40)) : [],
       decisions: pendingOperation.decisions && typeof pendingOperation.decisions === "object" ? pendingOperation.decisions : {}, scope: pendingOperation.scope || null
@@ -553,6 +553,8 @@ function logAssistantStageFailure(stage, error, privateData) {
 /* ========== 6. Gemini Response Validation ========== */
 function itemMatchesBulkScope(item, scope) {
   if (!item || !scope) return false;
+  if (scope.scopeType === "absolutely_all") return scope.includeCompleted === true && scope.includeCancelled === true;
+  if (scope.scopeType === "all_active" && !["upcoming", "in-progress", "postponed", "overdue", "awaiting-check-in"].includes(item.status)) return false;
   if (scope.statuses?.length && !scope.statuses.includes(item.status)) return false;
   if (scope.itemTypes?.length && !scope.itemTypes.includes(item.type)) return false;
   if (scope.categories?.length && !scope.categories.includes(item.category)) return false;
@@ -624,7 +626,13 @@ function validateGeminiResponse(response, suppliedItems) {
   if (response.kind === "bulk_proposal") {
     const bulk = response.bulkAction;
     if (!response.requiresConfirmation || response.action !== null || response.plan !== null || !bulk || !Array.isArray(bulk.targetIds) || !bulk.targetIds.length || bulk.targetIds.length > 450 || new Set(bulk.targetIds).size !== bulk.targetIds.length || bulk.affectedCount !== bulk.targetIds.length) return "Invalid bulk proposal";
-    if (!["cancel_items", "delete_items", "complete_items", "reschedule_items", "update_items", "deduplicate_items"].includes(bulk.type) || !bulk.scope || !bulk.scope.scopeType) return "Bulk proposal requires an operation and resolved scope";
+    const validScopes = ["current_item", "selected_item", "referenced_items", "today", "tomorrow", "specific_date", "date_range", "current_week", "next_week", "current_month", "future", "overdue", "completed", "missed", "cancelled", "routines", "tasks", "activities", "category", "title_match", "all_active", "absolutely_all"];
+    if (!["cancel_items", "delete_items", "complete_items", "reschedule_items", "update_items", "deduplicate_items"].includes(bulk.type) || !bulk.scope || !validScopes.includes(bulk.scope.scopeType)) return "Bulk proposal requires an operation and resolved scope";
+    if (bulk.scope.scopeType === "absolutely_all" && (bulk.scope.includeCompleted !== true || bulk.scope.includeCancelled !== true)) return "All schedule items scope must include completed and cancelled items";
+    if (bulk.scope.scopeType === "specific_date" && !isValidLocalDate(bulk.scope.startDate)) return "A specific date scope requires a valid date";
+    if (bulk.scope.scopeType === "date_range" && (!isValidLocalDate(bulk.scope.startDate) || !isValidLocalDate(bulk.scope.endDate) || bulk.scope.startDate > bulk.scope.endDate)) return "A date range scope requires valid start and end dates";
+    if (bulk.scope.scopeType === "category" && !bulk.scope.categories?.length) return "A category scope requires a category";
+    if (bulk.scope.scopeType === "title_match" && !bulk.scope.titleQuery) return "A title scope requires a title match";
     const targets = bulk.targetIds.map(id => suppliedItems.find(item => item.id === id));
     if (targets.some(item => !item) || targets.some(item => !itemMatchesBulkScope(item, bulk.scope))) return "Bulk proposal target IDs do not match the supplied scope";
     if (["delete_items", "deduplicate_items"].includes(bulk.type) && !["absolutely_all", "completed", "cancelled", "missed", "overdue", "today", "tomorrow", "current_week", "next_week", "current_month", "future", "routines", "tasks", "activities", "category", "title_match", "referenced_items", "selected_item", "specific_date", "date_range", "all_active"].includes(bulk.scope.scopeType)) return "Bulk deletion requires a specific resolved scope";
