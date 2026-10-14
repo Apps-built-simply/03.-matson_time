@@ -180,7 +180,7 @@ function buildAnalyticalContext(message, scheduleItems) {
 /* ========== 5. Gemini Request ========== */
 async function callGemini(requestContext) {
   const configError = validateConfig();
-  if (configError) return { error: "Configuration error", details: configError };
+  if (configError) return { error: "Configuration error", category: "missing_environment_configuration" };
 
   const url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY;
   const payload = {
@@ -197,26 +197,77 @@ async function callGemini(requestContext) {
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      if (response.status === 429) return { error: "Gemini quota exceeded", details: "Rate limit reached. Please try again later." };
-      if (response.status === 400) return { error: "Invalid request", details: "The request to the language service was malformed." };
-      if (response.status === 403) return { error: "Authentication failed", details: "The API key is invalid or lacks permissions." };
-      return { error: "Language service error", details: "Service returned " + response.status };
+      const rawErrorBody = await response.text();
+      let providerError = {};
+      try { providerError = JSON.parse(rawErrorBody)?.error || {}; } catch { /* Keep only status when the provider body is not JSON. */ }
+      const providerMessage = typeof providerError.message === "string" ? providerError.message : "";
+      const category = classifyGeminiFailure(response.status, providerMessage);
+      const safeErrorMessage = sanitizeGeminiErrorMessage(providerMessage, requestContext);
+      console.error("Gemini request failed", {
+        model: GEMINI_MODEL,
+        status: response.status,
+        errorCode: safeProviderCode(providerError.code),
+        errorStatus: safeProviderStatus(providerError.status),
+        category,
+        message: safeErrorMessage || category
+      });
+      if (response.status === 429) return { error: "Gemini quota exceeded", details: "Rate limit reached. Please try again later.", category };
+      if (response.status === 400) return { error: "Invalid request", details: "The request to the language service was malformed.", category };
+      if (response.status === 401 || response.status === 403) return { error: "Authentication failed", details: "The API key is invalid or lacks permissions.", category };
+      return { error: "Language service error", details: "Service returned " + response.status, category };
     }
 
     const data = await response.json();
-    if (!data.candidates || !data.candidates.length) return { error: "Empty response", details: "The language service returned no candidates." };
+    if (!data.candidates || !data.candidates.length) return { error: "Empty response", details: "The language service returned no candidates.", category: "invalid_gemini_response" };
     const candidate = data.candidates[0];
-    if (candidate.finishReason === "SAFETY") return { error: "Safety refusal", details: "The request was declined by safety filters." };
+    if (candidate.finishReason === "SAFETY") return { error: "Safety refusal", details: "The request was declined by safety filters.", category: "invalid_gemini_response" };
     const content = candidate.content?.parts?.[0]?.text;
-    if (!content) return { error: "Empty content", details: "The language service returned empty content." };
+    if (!content) return { error: "Empty content", details: "The language service returned empty content.", category: "invalid_gemini_response" };
     let parsed;
-    try { parsed = JSON.parse(content); } catch { return { error: "Invalid JSON", details: "The language service returned malformed JSON." }; }
+    try { parsed = JSON.parse(content); } catch { return { error: "Invalid JSON", details: "The language service returned malformed JSON.", category: "invalid_gemini_response" }; }
     return { response: parsed };
   } catch (err) {
     clearTimeout(timeoutId);
-    if (err.name === "AbortError") return { error: "Timeout", details: "The language service did not respond in time." };
-    return { error: "Network error", details: "Failed to reach the language service." };
+    if (err.name === "AbortError") return { error: "Timeout", details: "The language service did not respond in time.", category: "timeout" };
+    return { error: "Network error", details: "Failed to reach the language service.", category: err instanceof SyntaxError ? "invalid_gemini_response" : "invalid_request" };
   }
+}
+
+function classifyGeminiFailure(status, message) {
+  const text = String(message || "").toLowerCase();
+  if (status === 401 || status === 403 || /api key|authentication|unauthorized|permission denied/.test(text)) return "authentication";
+  if (status === 404 || /model.{0,30}(not found|unavailable|does not exist)/.test(text)) return "unavailable_model";
+  if (status === 429 || /quota|resource_exhausted|rate limit/.test(text)) return "quota";
+  if (/schema|response.?format/.test(text) && /unsupported|not supported|invalid|unknown/.test(text)) return "unsupported_json_schema";
+  if (status === 400) return "invalid_request";
+  return "gemini_http_error";
+}
+
+function safeProviderCode(value) {
+  return typeof value === "number" || (typeof value === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(value)) ? value : undefined;
+}
+
+function safeProviderStatus(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(value) ? value : undefined;
+}
+
+function sanitizeGeminiErrorMessage(message, requestContext) {
+  if (!message) return "";
+  let safe = message.slice(0, 300);
+  if (GEMINI_API_KEY) safe = safe.split(GEMINI_API_KEY).join("[redacted]");
+  const privateValues = [];
+  function collectPrivateValues(value) {
+    if (typeof value === "string" || typeof value === "number") {
+      const text = String(value);
+      if (text.length >= 2) privateValues.push(text);
+      return;
+    }
+    if (Array.isArray(value)) { value.forEach(collectPrivateValues); return; }
+    if (value && typeof value === "object") Object.values(value).forEach(collectPrivateValues);
+  }
+  collectPrivateValues(requestContext);
+  for (const value of privateValues) safe = safe.split(value).join("[redacted]");
+  return safe;
 }
 
 /* ========== 6. Gemini Response Validation ========== */
@@ -256,6 +307,11 @@ function validateConfig() {
 }
 
 module.exports = async function handler(req, res) {
+  console.log("Assistant request reached function", { method: req.method });
+  console.log("Assistant function configuration", {
+    model: GEMINI_MODEL || "missing",
+    hasApiKey: Boolean(GEMINI_API_KEY)
+  });
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     sendJson(res, 405, { kind: "error", message: "Method not allowed." });
@@ -295,6 +351,11 @@ module.exports = async function handler(req, res) {
   const validationError = validateRequest(body);
   if (validationError) { sendJson(res, 400, { kind: "error", message: validationError + "." }); return; }
   if (validateConfig()) {
+    console.error("Assistant request failed", {
+      category: "missing_environment_configuration",
+      model: GEMINI_MODEL || "missing",
+      hasApiKey: Boolean(GEMINI_API_KEY)
+    });
     sendJson(res, 503, { kind: "error", message: "The schedule language service is not connected in this preview." });
     return;
   }
@@ -307,12 +368,16 @@ module.exports = async function handler(req, res) {
 
     const result = await callGemini(requestContext);
     if (result.error) {
+      if (result.category !== "missing_environment_configuration") {
+        console.error("Assistant request failed", { category: result.category || "invalid_request" });
+      }
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
       return;
     }
     const response = result.response;
     const responseError = validateGeminiResponse(response, contextItems);
     if (responseError) {
+      console.error("Assistant request failed", { category: "invalid_gemini_response", reason: responseError });
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
       return;
     }
