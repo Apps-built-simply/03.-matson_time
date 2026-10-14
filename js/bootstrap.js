@@ -7,7 +7,6 @@ const loginForm = document.querySelector("#loginForm");
 const loginError = document.querySelector("#loginError");
 const cloudError = document.querySelector("#cloudError");
 const retryButton = document.querySelector("#retryCloudButton");
-const signOutButton = document.querySelector("#signOutButton");
 let activeUser = null;
 let hasAuthenticated = false;
 let scriptsLoaded = false;
@@ -196,8 +195,6 @@ loginForm.addEventListener("submit", async event => {
   }
 });
 retryButton.addEventListener("click", loadCloudApp);
-signOutButton.addEventListener("click", () => firebaseStore.signOutUser().catch(error => console.error("Sign out failed", { message: String(error?.message || error) })));
-
 firebaseStore.observeAuthState(user => {
   if (!user) {
     if (hasAuthenticated) {

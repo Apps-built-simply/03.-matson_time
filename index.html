@@ -10,11 +10,12 @@
 <body>
   <section id="loginGate" class="auth-screen" hidden aria-labelledby="loginTitle">
     <form id="loginForm" class="auth-form" autocomplete="on">
-      <h1 id="loginTitle">Matson Time</h1>
+      <h1 id="loginTitle">Connect Matson Time</h1>
+      <p>Connect this device to Matson’s private schedule.</p>
       <label>Email<input name="email" type="email" autocomplete="username" required></label>
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <p id="loginError" class="auth-error" role="alert" hidden></p>
-      <button class="primary-button" type="submit">Sign in</button>
+      <button class="primary-button" type="submit">Connect</button>
     </form>
   </section>
   <section id="cloudLoading" class="cloud-loading" hidden aria-live="polite">
@@ -29,7 +30,7 @@
       <header class="app-header">
         <div class="container">
           <p class="eyebrow" id="todayDate"></p>
-          <div class="heading-with-action"><h1>Today</h1><button class="text-button muted" id="signOutButton" type="button">Sign out</button></div>
+          <h1>Today</h1>
         </div>
       </header>
 
