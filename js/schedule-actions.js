@@ -247,10 +247,33 @@ function saGetAllowedActions() {
 }
 
 function saGetRelevantItemsForContext(message, maxItems = 30) {
-  const today = localDateString(new Date());
-  const todayItemsArr = saGetTodayItems();
-  const upcomingItems = saGetUpcomingItems().slice(0, maxItems - todayItemsArr.length);
-  return [...todayItemsArr, ...upcomingItems];
+  const text = String(message || "").toLowerCase();
+  const normalizedText = text.replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const today = parseLocalDate(localDateString(new Date()));
+  const dateMatch = text.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  let constrainedDate = dateMatch?.[1] || null;
+  const relative = /\b(today|tomorrow|yesterday)\b/.exec(text);
+  if (!constrainedDate && relative) {
+    const offset = relative[1] === "tomorrow" ? 1 : relative[1] === "yesterday" ? -1 : 0;
+    const date = new Date(today); date.setDate(date.getDate() + offset);
+    constrainedDate = localDateString(date);
+  }
+  if (!constrainedDate) {
+    const days = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    const weekday = days.findIndex(day => new RegExp(`\\b${day}\\b`).test(text));
+    if (weekday >= 0) {
+      let offset = (weekday - today.getDay() + 7) % 7;
+      if (/\bnext\s+(?:sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/.test(text) || offset === 0) offset += 7;
+      const date = new Date(today); date.setDate(date.getDate() + offset);
+      constrainedDate = localDateString(date);
+    }
+  }
+  const titleMatches = items.filter(item => item.title && normalizedText.includes(String(item.title).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()) && (!constrainedDate || item.date === constrainedDate));
+  const dateMatches = constrainedDate ? items.filter(item => item.date === constrainedDate) : [];
+  if (titleMatches.length || dateMatches.length) return [...new Map([...titleMatches, ...dateMatches].map(item => [item.id, item])).values()].slice(0, Math.min(maxItems, 20));
+  const upcoming = saGetUpcomingItems();
+  const candidates = [...saGetTodayItems(), ...upcoming];
+  return [...new Map(candidates.map(item => [item.id, item])).values()].slice(0, Math.min(maxItems, 20));
 }
 
 function saGetCompactFacts() {
@@ -344,15 +367,27 @@ function saValidatePlanAction(action, scheduleItems = items) {
   if (action.type === "update_item") {
     if (!action.changes || typeof action.changes !== "object") return "Update action is missing changes";
     const changes = Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined));
-    if (action.item) {
-      const itemError = scheduleValidateItem(action.item);
-      if (itemError) return itemError;
+    if (!Object.keys(changes).length) return "Update action requires non-empty changes";
+    if (action.item) return "Update action cannot replace the complete item";
+    if (changes.start && changes.end === undefined && target.start && target.end) {
+      const toMinutes = value => { const [hour, minute] = value.split(":").map(Number); return hour * 60 + minute; };
+      const newEnd = toMinutes(changes.start) + toMinutes(target.end) - toMinutes(target.start);
+      changes.end = `${String(Math.floor(newEnd / 60) % 24).padStart(2, "0")}:${String(newEnd % 60).padStart(2, "0")}`;
+      action.changes.end = changes.end;
     }
     return scheduleValidateItem({ ...target, ...changes });
   }
   if (action.type === "reschedule_item") {
-    if (target.type !== "activity" || !action.item) return "Reschedule requires an activity and new schedule details";
-    const updated = { ...target, date: action.item.date, start: action.item.start, end: action.item.end };
+    const changes = action.changes && typeof action.changes === "object" ? Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined)) : {};
+    if (target.type !== "activity" || !Object.keys(changes).some(key => ["date", "start", "end"].includes(key))) return "Reschedule requires date or time changes";
+    if (action.item) return "Reschedule must provide changes, not a replacement item";
+    if (changes.start && changes.end === undefined && target.start && target.end) {
+      const toMinutes = value => { const [hour, minute] = value.split(":").map(Number); return hour * 60 + minute; };
+      const newEnd = toMinutes(changes.start) + toMinutes(target.end) - toMinutes(target.start);
+      changes.end = `${String(Math.floor(newEnd / 60) % 24).padStart(2, "0")}:${String(newEnd % 60).padStart(2, "0")}`;
+      action.changes.end = changes.end;
+    }
+    const updated = { ...target, ...changes };
     return scheduleValidateItem(updated);
   }
   if (action.type === "postpone_item" && (!target.start || !target.end || !Number.isInteger(action.postponeMinutes) || action.postponeMinutes < 1)) return "Postpone requires a timed item and positive whole number of minutes";
@@ -386,7 +421,7 @@ async function saApplyPlanAtomically(actions) {
       const changes = Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined));
       nextItems[index] = { ...target, ...changes };
     }
-    else if (action.type === "reschedule_item") nextItems[index] = { ...target, date: action.item.date, start: action.item.start, end: action.item.end };
+    else if (action.type === "reschedule_item") nextItems[index] = { ...target, ...(action.changes || {}) };
     else if (action.type === "complete_item") nextItems[index] = { ...target, status: "completed" };
     else if (action.type === "mark_missed") nextItems[index] = { ...target, status: "missed" };
     else if (action.type === "cancel_item") nextItems[index] = { ...target, status: "cancelled" };
@@ -416,7 +451,7 @@ async function saApplyPlanAtomically(actions) {
   }
   items = nextItems;
   triggerScheduleRender();
-  return { success: true, items: nextItems };
+  return { success: true, items: nextItems, changedItems: nextItems.filter(item => changedIds.has(item.id)) };
 }
 
 function saScheduleConflictKeys(scheduleItems) {

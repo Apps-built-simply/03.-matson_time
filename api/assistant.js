@@ -11,7 +11,10 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL;
 /* ========== 2. System Instruction ========== */
 const GEMINI_SYSTEM_INSTRUCTION = `You are the natural-language interpretation and conversational reasoning component of Matson Time, a private personal time-management application.
 
-You operate Matson's personal time-management calendar. Interpret requests using only the supplied message and request context: currentDate (the supplied localDate), currentTime, timezone, availableCategories, relevantItems, pendingClarification, allowedActions, compactFacts, activePlanningContext, and compact priorContext. Never treat this as business reservation management.
+You operate Matson's personal time-management calendar. Interpret requests using only the supplied message and request context: temporalContext (with currentDate, currentTime, and timezone), conversationContext, recentEntities, availableCategories, relevantItems, pendingClarification, allowedActions, actionContract, compactFacts, activePlanningContext, and compact priorContext. Never treat this as business reservation management.
+
+CONTEXT AND ACTION CONTRACT
+The supplied temporalContext is authoritative and uses Africa/Kampala local calendar dates. conversationContext is a small continuity window; recentEntities map natural references to saved schedule items. Relevant items contain the only valid IDs. activePlanningContext may contain unsaved proposals with temporary IDs; those may only be created after confirmation and must never be update/reschedule targets. Use calculated compactFacts as authoritative. Return only fields needed by the selected action: create_item needs item and no targetId/changes; update_item needs targetId and non-empty changes; reschedule_item needs targetId and changes containing date/start/end (item must be null); postpone_item needs targetId and positive postponeMinutes; complete_item, mark_missed, and cancel_item need targetId. A plan_proposal must contain at least two valid actions and be fully valid before confirmation. Answers must derive from supplied context; clarifications ask one focused question and preserve known details. Never execute a write; every write needs confirmation.
 
 SCHEDULING INTENT
 Words such as reserve, block, set aside, schedule, add, plan, book time for, make time for, put on my calendar, put in my schedule, and remind me to are ordinary personal schedule-management language. Do not reject them because they can mean something else outside this app. Infer the supported action from the whole request. Prefer create_item for a new commitment, activity, task, or explicitly recurring routine. Do not return no_action for a request that clearly maps to an allowed action. Use no_action only for unrelated requests or requests that cannot safely map to an allowed action, and explain briefly what you could not map.
@@ -23,6 +26,7 @@ Treat supplied currentDate as the authoritative local calendar date (the localDa
 
 TIME INTERPRETATION
 Convert 2 PM to 14:00, 5 PM to 17:00, 7 in the morning to 07:00, noon to 12:00, and midnight to 00:00. “From 2 to 5 PM” normally means 14:00 to 17:00. “From 2 PM to 5 PM” supplies both exact times. Return times as 24-hour HH:mm.
+When a saved timed item receives a new start without an explicit end or duration, preserve its existing duration in the proposed changes.
 
 ITEM TYPE AND TITLE
 Use activity for a commitment occupying a specific time period, task for something to do without a specified time period, and routine only when recurrence is explicit. Make a short clean title from the user's actual wording: “studio session” becomes “Studio session”; “send Raymond the files” becomes “Send Raymond the files”; “rehearsal” becomes “Rehearsal”. Do not use the entire request as the title or invent people, locations, or details. Use only supplied existing item IDs. When one relevant item uniquely matches an edit or reschedule, use its supplied ID. For a reschedule with a new start but no new end, preserve the item's existing duration if it is supplied; otherwise ask for the missing end time.
@@ -156,7 +160,6 @@ const GEMINI_ACTION_SCHEMA = {
         category: { type: "STRING", nullable: true }, notes: { type: "STRING", nullable: true },
         status: { type: "STRING", nullable: true, enum: ["upcoming", "in-progress", "overdue", "completed", "missed", "cancelled", "postponed", "awaiting-check-in"] }
       },
-      required: ["title", "date", "start", "end", "category", "notes", "status"]
     },
     postponeMinutes: { type: "INTEGER", nullable: true }
   },
@@ -222,6 +225,8 @@ function validateRequest(body) {
   if (body.pendingClarification !== undefined && body.pendingClarification !== null && (typeof body.pendingClarification !== "object" || Array.isArray(body.pendingClarification))) return "Invalid pendingClarification";
   if (body.activePlanningContext !== undefined && body.activePlanningContext !== null && (typeof body.activePlanningContext !== "object" || Array.isArray(body.activePlanningContext))) return "Invalid activePlanningContext";
   if (body.priorContext !== undefined && body.priorContext !== null && (typeof body.priorContext !== "object" || Array.isArray(body.priorContext))) return "Invalid priorContext";
+  if (body.conversationContext !== undefined && body.conversationContext !== null && (typeof body.conversationContext !== "object" || Array.isArray(body.conversationContext))) return "Invalid conversationContext";
+  if (body.calculatedFacts !== undefined && body.calculatedFacts !== null && (typeof body.calculatedFacts !== "object" || Array.isArray(body.calculatedFacts))) return "Invalid calculatedFacts";
   return null;
 }
 
@@ -255,10 +260,26 @@ function getCurrentLocalTime() {
   return new Intl.DateTimeFormat("en-GB", { timeZone: TIMEZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date());
 }
 
-function buildRequestContext(message, scheduleItems, pendingClarification, compactFacts, activePlanningContext, priorContext) {
+function isValidLocalDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || "");
+  if (!match) return false;
+  const [, year, month, day] = match.map(Number);
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
+}
+
+function buildRequestContext(message, scheduleItems, pendingClarification, compactFacts, activePlanningContext, priorContext, conversationContext, calculatedFacts) {
+  const localDate = getCurrentLocalDate();
+  const [year, month, day] = localDate.split("-").map(Number);
+  const weekStartDate = new Date(year, month - 1, day);
+  weekStartDate.setDate(weekStartDate.getDate() - ((weekStartDate.getDay() + 6) % 7));
+  const weekEndDate = new Date(weekStartDate);
+  weekEndDate.setDate(weekEndDate.getDate() + 6);
+  const formatLocalDate = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
   return {
     message: message.trim(),
-    currentDate: getCurrentLocalDate(),
+    temporalContext: { localDate, localTime: getCurrentLocalTime(), timezone: TIMEZONE, weekStart: formatLocalDate(weekStartDate), weekEnd: formatLocalDate(weekEndDate) },
+    currentDate: localDate,
     currentTime: getCurrentLocalTime(),
     timezone: TIMEZONE,
     availableItemTypes: ["activity", "task", "routine"],
@@ -266,7 +287,36 @@ function buildRequestContext(message, scheduleItems, pendingClarification, compa
     allowedActions: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"],
     pendingClarification: pendingClarification,
     activePlanningContext: activePlanningContext || null,
-    relevantItems: scheduleItems.map(item => ({
+    conversationContext: conversationContext && typeof conversationContext === "object" ? {
+      conversationId: typeof conversationContext.conversationId === "string" ? conversationContext.conversationId.slice(0, 160) : null,
+      summary: String(conversationContext.summary || "").slice(0, 700),
+      latestMessages: Array.isArray(conversationContext.latestMessages) ? conversationContext.latestMessages.slice(-6).map(entry => ({ role: entry.role === "user" ? "user" : "assistant", text: String(entry.text || "").slice(0, 240), referencedItemIds: Array.isArray(entry.referencedItemIds) ? entry.referencedItemIds.filter(id => typeof id === "string").slice(0, 10) : [] })) : [],
+      currentTopic: typeof conversationContext.currentTopic === "string" ? conversationContext.currentTopic.slice(0, 160) : null,
+      continuesPreviousTopic: Boolean(conversationContext.continuesPreviousTopic),
+      recentEntities: Array.isArray(conversationContext.recentEntities) ? conversationContext.recentEntities.slice(-10).filter(entity => entity && typeof entity.id === "string" && scheduleItems.some(item => item.id === entity.id)).map(entity => ({ ...entity, id: entity.id.slice(0, 160), title: String(entity.title || "").slice(0, 120), mentionedAs: Array.isArray(entity.mentionedAs) ? entity.mentionedAs.slice(-8).map(value => String(value).slice(0, 120)) : [] })) : []
+    } : null,
+    actionContract: {
+      create_item: "requires item; targetId and changes must be null",
+      update_item: "requires a supplied real targetId and non-empty changes; item must be null",
+      reschedule_item: "requires a supplied real targetId and changes containing date, start, or end; item must be null",
+      postpone_item: "requires supplied real targetId and positive postponeMinutes",
+      complete_item: "requires supplied real targetId",
+      mark_missed: "requires supplied real targetId",
+      cancel_item: "requires supplied real targetId",
+      plan_proposal: "requires two or more valid actions; validate all before confirmation",
+      answer: "factual message from supplied context",
+      clarification: "one focused question and pending context",
+      no_action: "unrelated request or no safe schedule interpretation"
+    },
+    calculatedFacts: calculatedFacts && typeof calculatedFacts === "object" ? {
+      todayItems: Array.isArray(calculatedFacts.todayItems) ? calculatedFacts.todayItems.slice(0, 20).filter(entry => scheduleItems.some(item => item.id === entry.id)).map(entry => ({ id: entry.id, title: String(entry.title || "").slice(0, 120), start: entry.start || null, end: entry.end || null })) : [],
+      nextItem: calculatedFacts.nextItem && scheduleItems.some(item => item.id === calculatedFacts.nextItem.id) ? { id: calculatedFacts.nextItem.id } : null,
+      durations: Array.isArray(calculatedFacts.durations) ? calculatedFacts.durations.slice(0, 20).filter(entry => scheduleItems.some(item => item.id === entry.id) && Number.isFinite(entry.minutes)).map(entry => ({ id: entry.id, minutes: entry.minutes })) : [],
+      gaps: Array.isArray(calculatedFacts.gaps) ? calculatedFacts.gaps.slice(0, 20).filter(entry => scheduleItems.some(item => item.id === entry.afterId) && scheduleItems.some(item => item.id === entry.beforeId) && Number.isFinite(entry.minutes)).map(entry => ({ afterId: entry.afterId, beforeId: entry.beforeId, minutes: entry.minutes })) : [],
+      conflicts: Array.isArray(calculatedFacts.conflicts) ? calculatedFacts.conflicts.slice(0, 20).filter(entry => Array.isArray(entry.itemIds) && entry.itemIds.every(id => scheduleItems.some(item => item.id === id))).map(entry => ({ date: String(entry.date || "").slice(0, 10), itemIds: entry.itemIds.slice(0, 2) })) : [],
+      postponementHistory: Array.isArray(calculatedFacts.postponementHistory) ? calculatedFacts.postponementHistory.slice(0, 20).filter(entry => scheduleItems.some(item => item.id === entry.id) && Number.isInteger(entry.count)).map(entry => ({ id: entry.id, count: entry.count })) : []
+    } : null,
+    relevantItems: scheduleItems.slice(0, 20).map(item => ({
       id: item.id, title: item.title, type: item.type, date: item.date,
       start: item.start || null, end: item.end || null,
       category: item.category, notes: item.notes, status: item.status,
@@ -300,8 +350,9 @@ function buildAnalyticalContext(message, scheduleItems) {
   }
   const conflicts = [];
   for (let i = 0; i < 7; i++) {
-    const date = new Date(getCurrentLocalDate() + "T00:00:00Z"); date.setUTCDate(date.getUTCDate() + i);
-    const dateStr = date.toISOString().slice(0, 10);
+    const [year, month, day] = today.split("-").map(Number);
+    const date = new Date(year, month - 1, day + i);
+    const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
     const timed = scheduleItems.filter(i => i.date === dateStr && i.start && i.end && i.status !== "completed" && i.status !== "cancelled").sort((a, b) => a.start.localeCompare(b.start));
     if (timed.length > 1 && timed[1].start < timed[0].end) conflicts.push({ date: dateStr, items: [timed[0].title, timed[1].title] });
   }
@@ -458,18 +509,35 @@ function validateGeminiResponse(response, suppliedItems) {
   const validateAction = action => {
     const allowed = ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"];
     if (!action || !allowed.includes(action.type)) return "Unsupported action type";
-    if (action.type === "create_item" && (!action.item || action.targetId)) return "Invalid create action";
-    if (action.type !== "create_item" && (!action.targetId || !suppliedItems.some(item => item.id === action.targetId))) return "Target ID was not supplied";
-    if (["create_item", "reschedule_item"].includes(action.type) && !action.item) return "Action item is required";
-    if (action.type === "update_item" && !action.changes) return "Action changes are required";
-    if (action.type === "postpone_item" && (!Number.isInteger(action.postponeMinutes) || action.postponeMinutes < 1)) return "Invalid postpone duration";
+    if (action.type === "create_item" && (!action.item || action.targetId || action.changes)) return "create_item requires item and forbids targetId and changes";
+    const target = action.type === "create_item" ? null : suppliedItems.find(item => item.id === action.targetId);
+    if (action.type !== "create_item" && (!action.targetId || !target)) return `${action.type} requires a supplied targetId`;
+    if (action.type === "update_item" && (!action.changes || typeof action.changes !== "object" || !Object.keys(action.changes).some(key => action.changes[key] !== null && action.changes[key] !== undefined) || action.item)) return "update_item requires targetId and non-empty changes";
+    if (action.type === "reschedule_item" && (!action.changes || !["date", "start", "end"].some(key => action.changes[key] !== null && action.changes[key] !== undefined) || action.item)) return "reschedule_item requires targetId and date/time changes";
+    if (["update_item", "reschedule_item"].includes(action.type) && action.changes) {
+      const changes = Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined));
+      if (changes.start && changes.end === undefined && target.start && target.end) {
+        const toMinutes = value => { const [hour, minute] = value.split(":").map(Number); return hour * 60 + minute; };
+        const newEnd = toMinutes(changes.start) + toMinutes(target.end) - toMinutes(target.start);
+        changes.end = `${String(Math.floor(newEnd / 60) % 24).padStart(2, "0")}:${String(newEnd % 60).padStart(2, "0")}`;
+        action.changes.end = changes.end;
+      }
+      const next = { ...target, ...changes };
+      if (action.type === "reschedule_item" && target.type !== "activity") return "reschedule_item requires an activity target";
+      if (next.date && !isValidLocalDate(next.date)) return "Changes contain an invalid date";
+      if (next.start && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(next.start)) return "Changes contain an invalid start time";
+      if (next.end && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(next.end)) return "Changes contain an invalid end time";
+      if (next.start && next.end && next.start >= next.end) return "End time must be after start time";
+    }
+    if (action.type === "postpone_item" && (!Number.isInteger(action.postponeMinutes) || action.postponeMinutes <= 0)) return "postpone_item requires targetId and positive postponeMinutes";
     if (action.item) {
       const item = action.item;
       if (!["activity", "task", "routine"].includes(item.type)) return "Invalid item type";
       if (!item.title || !item.title.trim()) return "Title is required";
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(item.date || "")) return "Invalid date format";
-      if (item.start && !/^\d{2}:\d{2}$/.test(item.start)) return "Invalid start time format";
-      if (item.end && !/^\d{2}:\d{2}$/.test(item.end)) return "Invalid end time format";
+      if (action.type === "create_item" && !isValidLocalDate(item.date)) return "create_item requires a valid date";
+      if (item.date != null && !isValidLocalDate(item.date)) return "Invalid date format";
+      if (item.start && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(item.start)) return "Invalid start time format";
+      if (item.end && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(item.end)) return "Invalid end time format";
       if (["create_item", "reschedule_item"].includes(action.type) && item.type === "activity" && (!item.start || !item.end)) return "Activity times are required";
       if (item.start && item.end && item.start >= item.end) return "End time must be after start time";
     }
@@ -481,7 +549,7 @@ function validateGeminiResponse(response, suppliedItems) {
     if (error) return error;
   }
   if (response.kind === "plan_proposal") {
-    if (!response.requiresConfirmation || !response.plan || !Array.isArray(response.plan.actions) || !response.plan.actions.length || response.plan.actions.length > 5) return "Invalid plan proposal";
+    if (!response.requiresConfirmation || !response.plan || !Array.isArray(response.plan.actions) || response.plan.actions.length < 2 || response.plan.actions.length > 5) return "Invalid plan proposal";
     for (const action of response.plan.actions) {
       const error = validateAction(action);
       if (error) return error;
@@ -569,7 +637,7 @@ module.exports = async function handler(req, res) {
     const contextItems = Array.isArray(body.context) ? body.context : [];
     let requestContext;
     try {
-      requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null, body.activePlanningContext || null, body.priorContext || null);
+      requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null, body.activePlanningContext || null, body.priorContext || null, body.conversationContext || null, body.calculatedFacts || null);
     } catch (error) {
       logAssistantStageFailure("gemini-request-body-construction", error, body);
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
@@ -602,7 +670,7 @@ module.exports = async function handler(req, res) {
     }
     if (responseError) {
       console.error("Assistant request failed", { category: "invalid_gemini_response", reason: responseError });
-      sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
+      sendJson(res, 502, { kind: "error", message: "Unable to process that request right now.", ...(process.env.NODE_ENV === "production" ? {} : { reason: responseError }) });
       return;
     }
     sendJson(res, 200, response);

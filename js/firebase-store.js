@@ -198,7 +198,7 @@ export async function searchConversationSummaries(keywords, max = 5) {
 
 export async function loadAssistantState() {
   const snapshot = await getDoc(userDoc("assistantState", "current"));
-  return snapshot.exists() ? snapshot.data() : { activeConversationId: null, pendingClarification: null, planningContext: null };
+  return snapshot.exists() ? snapshot.data() : { activeConversationId: null, pendingClarification: null, planningContext: null, entityRegistry: [] };
 }
 export async function saveAssistantState(state) {
   const context = state.planningContext;
@@ -220,10 +220,20 @@ export async function saveAssistantState(state) {
     knownFields: Object.fromEntries(["type", "title", "date", "start", "end"].filter(key => pending.knownFields?.[key] != null).map(key => [key, String(pending.knownFields[key]).slice(0, 120)])),
     missingFields: Array.isArray(pending.missingFields) ? pending.missingFields.slice(0, 8).map(value => String(value).slice(0, 40)) : []
   } : null;
+  const entityRegistry = Array.isArray(state.entityRegistry) ? state.entityRegistry.slice(-10).filter(entity => entity && typeof entity.id === "string" && entity.id).map(entity => ({
+    entityType: "schedule_item", id: entity.id.slice(0, 160), title: String(entity.title || "").slice(0, 120),
+    type: ["activity", "task", "routine"].includes(entity.type) ? entity.type : "activity",
+    date: entity.date ? String(entity.date).slice(0, 10) : null, start: entity.start ? String(entity.start).slice(0, 5) : null,
+    end: entity.end ? String(entity.end).slice(0, 5) : null, status: String(entity.status || "upcoming").slice(0, 30),
+    lastAction: String(entity.lastAction || "updated").slice(0, 30),
+    mentionedAs: Array.isArray(entity.mentionedAs) ? [...new Set(entity.mentionedAs.filter(value => typeof value === "string").map(value => value.slice(0, 120)))].slice(-8) : [],
+    updatedAt: String(entity.updatedAt || new Date().toISOString()).slice(0, 40)
+  })) : [];
   await setDoc(userDoc("assistantState", "current"), {
     activeConversationId: state.activeConversationId || null,
     pendingClarification,
     planningContext,
+    entityRegistry,
     updatedAt: serverTimestamp()
   }, { merge: true });
 }
