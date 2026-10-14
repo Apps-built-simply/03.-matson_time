@@ -1,6 +1,7 @@
 /* Assistant page — coordinator for deterministic and Gemini-assisted schedule requests */
 
 const ASSISTANT_STORAGE_KEY = "matson-time-assistant-v1";
+const PLANNING_CONTEXT_STORAGE_KEY = "matson-time-active-planning-v1";
 const MAX_CONVERSATION_ENTRIES = 30;
 
 const assistantEls = {
@@ -20,6 +21,20 @@ let voiceNoticeTimer = null;
 let conversation = loadConversation();
 let pendingClarification = null;
 let currentProposal = null;
+let activePlanningContext = loadPlanningContext();
+
+function loadPlanningContext() {
+  try {
+    const value = JSON.parse(localStorage.getItem(PLANNING_CONTEXT_STORAGE_KEY) || "null");
+    if (!value || typeof value !== "object" || !Array.isArray(value.proposedItems) || !Array.isArray(value.constraints) || typeof value.goal !== "string") return null;
+    return value;
+  } catch { return null; }
+}
+
+function savePlanningContext() {
+  if (activePlanningContext) localStorage.setItem(PLANNING_CONTEXT_STORAGE_KEY, JSON.stringify(activePlanningContext));
+  else localStorage.removeItem(PLANNING_CONTEXT_STORAGE_KEY);
+}
 
 function loadConversation() {
   try {
@@ -93,7 +108,9 @@ function renderProposal(proposal) {
   const details = document.createElement("div");
   details.className = "proposal-details";
 
-  if (proposal.action?.item) {
+  if (proposal.plan) {
+    renderPlanDetails(details, proposal);
+  } else if (proposal.action?.item) {
     const item = proposal.action.item;
     addDetailRow(details, "Type", item.type);
     addDetailRow(details, "Date", item.date || "");
@@ -140,7 +157,7 @@ function renderProposal(proposal) {
   actionsEl.className = "proposal-actions";
   const confirmBtn = document.createElement("button");
   confirmBtn.className = "primary-button";
-  confirmBtn.textContent = "Confirm";
+  confirmBtn.textContent = proposal.plan ? "Confirm plan" : "Confirm";
   confirmBtn.dataset.action = "confirm";
   const editBtn = document.createElement("button");
   editBtn.className = "secondary-button";
@@ -157,6 +174,69 @@ function renderProposal(proposal) {
   assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
 }
 
+function renderPlanDetails(container, proposal) {
+  const recommendation = document.createElement("p");
+  recommendation.className = "plan-recommendation";
+  recommendation.textContent = proposal.message;
+  container.appendChild(recommendation);
+
+  const list = document.createElement("ol");
+  list.className = "plan-action-list";
+  proposal.plan.actions.forEach((action, index) => {
+    const item = action.item || saFindItemById(action.targetId) || {};
+    const entry = document.createElement("li");
+    entry.className = "plan-action-item";
+    const title = document.createElement("strong");
+    title.textContent = item.title || action.changes?.title || action.type.replaceAll("_", " ");
+    entry.appendChild(title);
+    const details = document.createElement("p");
+    details.textContent = `${item.date ? formatDateLabel(item.date) : "Date not specified"}${item.start ? ` · ${formatTime(item.start)}${item.end ? `–${formatTime(item.end)}` : ""}` : " · Anytime"}${item.category ? ` · ${item.category}` : ""}`;
+    entry.appendChild(details);
+    const editor = document.createElement("div");
+    editor.className = "plan-editor";
+    editor.hidden = true;
+    if (action.item && ["create_item", "reschedule_item"].includes(action.type)) {
+      addPlanEditField(editor, index, "title", "Title", item.title || "", "text");
+      addPlanEditField(editor, index, "date", "Date", item.date || "", "date");
+      addPlanEditField(editor, index, "start", "Start", item.start || "", "time");
+      addPlanEditField(editor, index, "end", "End", item.end || "", "time");
+      addPlanEditField(editor, index, "category", "Category", item.category || "Personal", "text");
+    }
+    entry.appendChild(editor);
+    list.appendChild(entry);
+  });
+  container.appendChild(list);
+}
+
+function addPlanEditField(container, actionIndex, field, label, value, type) {
+  const wrapper = document.createElement("label");
+  wrapper.className = "plan-edit-field";
+  wrapper.textContent = label;
+  const input = document.createElement("input");
+  input.type = type;
+  input.value = value;
+  input.dataset.actionIndex = String(actionIndex);
+  input.dataset.planField = field;
+  wrapper.appendChild(input);
+  container.appendChild(wrapper);
+}
+
+function buildPlanProposalFromGeminiResponse(response) {
+  return {
+    id: crypto.randomUUID(),
+    plan: { title: response.plan.title, actions: response.plan.actions.map(action => ({
+      type: action.type,
+      targetId: action.targetId || null,
+      item: action.item ? { ...action.item } : null,
+      changes: action.changes || null,
+      postponeMinutes: action.postponeMinutes || null
+    })) },
+    message: response.message,
+    planningContext: response.planningContext,
+    source: "gemini"
+  };
+}
+
 function addDetailRow(container, label, value) {
   const row = document.createElement("div");
   row.className = "detail-row";
@@ -171,6 +251,7 @@ function addDetailRow(container, label, value) {
 }
 
 function getProposalTitle(proposal) {
+  if (proposal.plan) return proposal.plan.title || "Proposed plan";
   const actionType = proposal.action?.type;
   switch (actionType) {
     case "create_item": return "Propose new item";
@@ -186,6 +267,20 @@ function getProposalTitle(proposal) {
 
 function classifyRequest(message) {
   const text = message.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.?]+$/i, "");
+
+  const planningPatterns = [
+    /help (?:me )?(?:manage|plan|work this out)/i,
+    /best way.*(?:schedule|manage|conflict|week|it|these)/i,
+    /(?:based on|using) my schedule.*week/i,
+    /fit this into my week/i,
+    /resolve this conflict/i,
+    /where should i move/i,
+    /plan these for me/i,
+    /what do you advise/i,
+    /not enough time.*(?:gym|meeting|schedule|travel)/i,
+    /(?:only|leaves me with).*\d+ minutes/i
+  ];
+  if (planningPatterns.some(pattern => pattern.test(text))) return "analytical_planning";
 
   const deterministicPatterns = [
     /what.*(?:have|doing).*(?:today|now)/i,
@@ -622,44 +717,47 @@ function getDirectActionTarget() {
 
 function validateGeminiResponse(response) {
   if (!response || typeof response !== "object") return "Invalid response format";
-  if (!["answer", "clarification", "proposed_action", "no_action", "error"].includes(response.kind)) {
+  if (!["answer", "clarification", "proposed_action", "plan_proposal", "no_action", "error"].includes(response.kind)) {
     return "Unsupported response kind";
   }
+  if (!Object.prototype.hasOwnProperty.call(response, "planningContext")) return "Missing planning context";
+  if (response.planningContext !== null && (!response.planningContext || typeof response.planningContext !== "object" || !Array.isArray(response.planningContext.proposedItems) || !Array.isArray(response.planningContext.constraints) || typeof response.planningContext.goal !== "string")) return "Invalid planning context";
+  const validateAction = action => {
+    if (!action || !saGetAllowedActions().includes(action.type)) return "Unsupported action type";
+    if (action.type === "create_item" && (!action.item || action.targetId)) return "Invalid create action";
+    if (action.type !== "create_item" && !saFindItemById(action.targetId)) return "Target item not found";
+    return saValidatePlanAction(action);
+  };
   if (response.kind === "proposed_action") {
-    if (!response.action) return "Missing action";
-    if (!["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"].includes(response.action.type)) {
-      return "Unsupported action type";
-    }
     if (!response.requiresConfirmation) return "Proposed action must require confirmation";
-    if (response.action.targetId) {
-      const target = saFindItemById(response.action.targetId);
-      if (!target) return "Target item not found";
-    }
-    if (response.action.item) {
-      const item = response.action.item;
-      if (!["activity", "task", "routine"].includes(item.type)) return "Invalid item type";
-      if (!item.title || !item.title.trim()) return "Title is required";
-      if (item.date && !/^\d{4}-\d{2}-\d{2}$/.test(item.date)) return "Invalid date format";
-      if (item.start && !/^\d{2}:\d{2}$/.test(item.start)) return "Invalid start time format";
-      if (item.end && !/^\d{2}:\d{2}$/.test(item.end)) return "Invalid end time format";
-      if (item.start && item.end && item.start >= item.end) return "End time must be after start time";
-    }
-    if (response.action.postponeMinutes !== null && (typeof response.action.postponeMinutes !== "number" || response.action.postponeMinutes < 1)) {
-      return "Invalid postpone duration";
+    const error = validateAction(response.action);
+    if (error) return error;
+  }
+  if (response.kind === "plan_proposal") {
+    if (!response.requiresConfirmation || response.action !== null || !response.plan || typeof response.plan.title !== "string" || !Array.isArray(response.plan.actions) || !response.plan.actions.length || response.plan.actions.length > 5) return "Invalid plan proposal";
+    const duplicateKeys = new Set();
+    for (const action of response.plan.actions) {
+      const error = validateAction(action);
+      if (error) return error;
+      const key = action.targetId ? `target|${action.targetId}` : `${action.type}|${action.item.type}|${action.item.title.toLowerCase()}|${action.item.date}|${action.item.start || ""}|${action.item.end || ""}`;
+      if (duplicateKeys.has(key)) return "Plan contains duplicate actions";
+      duplicateKeys.add(key);
     }
   }
   return null;
 }
 
-async function callGeminiEndpoint(message) {
-  const relevantItems = saGetRelevantItemsForContext(message);
-  const compactFacts = saGetCompactFacts();
+async function callGeminiEndpoint(message, planningRequest = false) {
+  const isPlanning = planningRequest || Boolean(activePlanningContext);
+  const relevantItems = isPlanning ? saGetPlanningItems(activePlanningContext) : saGetRelevantItemsForContext(message);
+  const compactFacts = isPlanning ? saGetWeeklyAvailabilityFacts() : saGetCompactFacts();
 
   const requestBody = {
     message: message.trim(),
     context: relevantItems,
     pendingClarification: pendingClarification,
-    compactFacts: compactFacts
+    compactFacts: compactFacts,
+    activePlanningContext: activePlanningContext
   };
 
   try {
@@ -692,6 +790,9 @@ function processGeminiResponse(response) {
     };
   }
 
+  activePlanningContext = response.planningContext || null;
+  savePlanningContext();
+
   switch (response.kind) {
     case "answer":
       pendingClarification = null;
@@ -721,6 +822,14 @@ function processGeminiResponse(response) {
         message: response.message || "",
         items: [],
         proposal: proposal
+      };
+
+    case "plan_proposal":
+      pendingClarification = null;
+      return {
+        message: response.message || "Here's the plan I recommend.",
+        items: [],
+        proposal: buildPlanProposalFromGeminiResponse(response)
       };
 
     case "no_action":
@@ -790,6 +899,16 @@ async function sendMessage(rawText) {
 
   appendEntry({ role: "user", text });
 
+  if (/^(?:never mind|forget (?:it|that|the plan)|drop the plan|cancel (?:this|the) plan|abandon (?:this|the) plan)$/i.test(text.trim())) {
+    activePlanningContext = null;
+    pendingClarification = null;
+    currentProposal = null;
+    savePlanningContext();
+    appendEntry({ role: "assistant", text: "Okay, I’ve cleared that planning topic." });
+    renderConversation();
+    return;
+  }
+
   const classification = classifyRequest(text);
 
   let result;
@@ -829,8 +948,8 @@ async function sendMessage(rawText) {
     return;
   }
 
-  if (classification === "analytical_query" || classification === "natural_language_action" || classification === "clarification_reply") {
-    const geminiResponse = await callGeminiEndpoint(text);
+  if (classification === "analytical_query" || classification === "analytical_planning" || classification === "natural_language_action" || classification === "clarification_reply") {
+    const geminiResponse = await callGeminiEndpoint(text, classification === "analytical_planning");
     result = processGeminiResponse(geminiResponse);
 
     if (result.proposal) {
@@ -862,6 +981,10 @@ function handleProposalOrClarification(result, message) {
 
 function confirmProposal() {
   if (!currentProposal) return;
+  if (currentProposal.plan) {
+    confirmPlanProposal();
+    return;
+  }
 
   const action = currentProposal.action;
   let result;
@@ -967,6 +1090,59 @@ function confirmProposal() {
   renderConversation();
 }
 
+function validatePlanProposal(proposal) {
+  if (!proposal || !proposal.plan || typeof proposal.plan.title !== "string" || !Array.isArray(proposal.plan.actions) || !proposal.plan.actions.length || proposal.plan.actions.length > 5) return "This plan does not contain a valid number of actions.";
+  const actionKeys = new Set();
+  for (const action of proposal.plan.actions) {
+    const error = saValidatePlanAction(action);
+    if (error) return error;
+    const key = action.targetId ? `target|${action.targetId}` : `${action.type}|${action.item.type}|${action.item.title.toLowerCase()}|${action.item.date}|${action.item.start || ""}|${action.item.end || ""}`;
+    if (actionKeys.has(key)) return "This plan contains duplicate actions.";
+    actionKeys.add(key);
+  }
+  return null;
+}
+
+function applyPlanEdits(proposal, proposalEl) {
+  for (const input of proposalEl.querySelectorAll("[data-action-index][data-plan-field]")) {
+    const index = Number(input.dataset.actionIndex);
+    const action = proposal.plan.actions[index];
+    if (action?.item) action.item[input.dataset.planField] = input.value || null;
+  }
+}
+
+function confirmPlanProposal() {
+  const proposal = currentProposal;
+  const proposalEl = assistantEls.conversation.querySelector(`.proposal[data-proposal-id="${proposal.id}"]`);
+  if (!proposalEl) return;
+  applyPlanEdits(proposal, proposalEl);
+  const validationError = validatePlanProposal(proposal);
+  if (validationError) {
+    showProcessingError(`I couldn't apply that plan: ${validationError}`);
+    renderConversation();
+    return;
+  }
+  const result = saApplyPlanAtomically(proposal.plan.actions);
+  if (!result.success) {
+    showProcessingError(`I couldn't apply that plan: ${result.error}`);
+    renderConversation();
+    return;
+  }
+  currentProposal = null;
+  pendingClarification = null;
+  activePlanningContext = null;
+  savePlanningContext();
+  appendEntry({ role: "assistant", text: `Confirmed. The complete plan with ${proposal.plan.actions.length} actions has been saved.` });
+  renderConversation();
+}
+
+function togglePlanEditor(proposalEl, button) {
+  const editors = proposalEl.querySelectorAll(".plan-editor");
+  const show = Array.from(editors).some(editor => editor.hidden);
+  editors.forEach(editor => { editor.hidden = !show; });
+  button.textContent = show ? "Done editing" : "Edit";
+}
+
 function editProposal() {
   if (!currentProposal) return;
 
@@ -976,8 +1152,12 @@ function editProposal() {
 function cancelProposal() {
   if (!currentProposal) return;
 
+  const wasPlan = Boolean(currentProposal.plan);
   currentProposal = null;
   pendingClarification = null;
+  activePlanningContext = null;
+  savePlanningContext();
+  if (wasPlan) appendEntry({ role: "assistant", text: "Plan cancelled. No schedule changes were made." });
   renderConversation();
 }
 
@@ -1066,6 +1246,8 @@ assistantEls.clear.addEventListener("click", () => {
   conversation = [];
   pendingClarification = null;
   currentProposal = null;
+  activePlanningContext = null;
+  savePlanningContext();
   saveConversation();
   renderConversation();
   assistantEls.input.focus();
@@ -1078,6 +1260,10 @@ assistantEls.conversation.addEventListener("click", event => {
   if (!proposalEl) return;
   const proposalId = proposalEl.dataset.proposalId;
   if (proposalId !== (currentProposal?.id || "current")) return;
+  if (button.dataset.action === "edit" && currentProposal.plan) {
+    togglePlanEditor(proposalEl, button);
+    return;
+  }
   button.disabled = true;
   if (button.dataset.action === "confirm") confirmProposal();
   if (button.dataset.action === "edit") editProposal();

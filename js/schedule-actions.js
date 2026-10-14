@@ -9,13 +9,19 @@ function scheduleValidateTime(value) {
 }
 
 function scheduleValidateItem(item) {
+  if (!item || !["activity", "task", "routine"].includes(item.type)) return "Item type is invalid";
   if (!item.title || !item.title.trim()) return "Title is required";
   if (!scheduleValidateDate(item.date)) return "Valid date (YYYY-MM-DD) is required";
+  if (item.start && !scheduleValidateTime(item.start)) return "Valid start time (HH:mm) is required";
+  if (item.end && !scheduleValidateTime(item.end)) return "Valid end time (HH:mm) is required";
+  if (item.start && item.end && item.start >= item.end) return "End time must be after start time";
   if (item.type === "activity") {
     if (!scheduleValidateTime(item.start)) return "Valid start time (HH:mm) is required for activities";
     if (!scheduleValidateTime(item.end)) return "Valid end time (HH:mm) is required for activities";
     if (item.start >= item.end) return "End time must be after start time";
   }
+  if (item.category && !saGetAvailableCategories().includes(item.category)) return "Category is invalid";
+  if (item.recurrence && (!(["daily", "weekly", "monthly"].includes(item.recurrence.frequency)) || !Number.isInteger(item.recurrence.interval) || item.recurrence.interval < 1 || !Array.isArray(item.recurrence.days) || item.recurrence.days.some(day => !Number.isInteger(day) || day < 0 || day > 6))) return "Recurrence is invalid";
   return null;
 }
 
@@ -261,6 +267,160 @@ function saGetCompactFacts() {
     if (conflict) conflicts.push({ date: dateStr, items: [conflict[0].title, conflict[1].title] });
   }
   return { dailyMinutes, postponementCounts, conflicts };
+}
+
+function saGetPlanningItems(planningContext = null) {
+  const today = localDateString(new Date());
+  const weekItems = saGetWeekItems(today);
+  const relevantDates = new Set((planningContext?.proposedItems || []).map(item => item.date).filter(Boolean));
+  return [...new Map([...weekItems, ...items.filter(item => relevantDates.has(item.date))].map(item => [item.id, saFormatItemForContext(item)])).values()];
+}
+
+function saGetWeeklyAvailabilityFacts() {
+  const today = parseLocalDate(localDateString(new Date()));
+  const monday = new Date(today);
+  monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+  const weekStart = localDateString(monday);
+  const weekEndDate = new Date(monday);
+  weekEndDate.setDate(weekEndDate.getDate() + 6);
+  const weekEnd = localDateString(weekEndDate);
+  const weekItems = items.filter(item => item.date >= weekStart && item.date <= weekEnd);
+  const days = [];
+
+  for (let offset = 0; offset < 7; offset++) {
+    const date = new Date(monday);
+    date.setDate(date.getDate() + offset);
+    const dateStr = localDateString(date);
+    const dateItems = weekItems.filter(item => item.date === dateStr);
+    const timed = dateItems.filter(item => item.start && item.end && item.status !== "cancelled" && item.status !== "completed")
+      .sort((a, b) => a.start.localeCompare(b.start));
+    const scheduledPeriods = timed.map(item => ({ start: item.start, end: item.end, title: item.title }));
+    const openPeriods = [];
+    for (let i = 1; i < timed.length; i++) {
+      if (timed[i - 1].end < timed[i].start) openPeriods.push({ start: timed[i - 1].end, end: timed[i].start });
+    }
+    const conflicts = [];
+    for (let i = 0; i < timed.length; i++) {
+      for (let j = i + 1; j < timed.length; j++) {
+        if (timed[j].start < timed[i].end) conflicts.push([timed[i].title, timed[j].title]);
+      }
+    }
+    days.push({
+      date: dateStr,
+      scheduledPeriods,
+      openPeriods,
+      untimedTaskCount: dateItems.filter(item => item.type === "task" && !item.start).length,
+      conflicts,
+      earliestScheduledTime: timed[0]?.start || null,
+      latestScheduledTime: timed.length ? timed[timed.length - 1].end : null
+    });
+  }
+  return { weekStart, weekEnd, days };
+}
+
+function saValidatePlanAction(action, scheduleItems = items) {
+  const actionTypes = saGetAllowedActions();
+  if (!action || !actionTypes.includes(action.type)) return "Unsupported plan action";
+  if (action.type === "create_item") {
+    if (action.targetId) return "Create actions cannot target a saved item";
+    if (!action.item) return "Create action is missing its item";
+    return scheduleValidateItem(action.item);
+  }
+  const targetIndex = scheduleItems.findIndex(item => item.id === action.targetId);
+  if (!action.targetId || targetIndex < 0) return "Plan target item no longer exists";
+  const target = scheduleItems[targetIndex];
+  if (action.type === "update_item") {
+    if (!action.changes || typeof action.changes !== "object") return "Update action is missing changes";
+    const changes = Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined));
+    if (action.item) {
+      const itemError = scheduleValidateItem(action.item);
+      if (itemError) return itemError;
+    }
+    return scheduleValidateItem({ ...target, ...changes });
+  }
+  if (action.type === "reschedule_item") {
+    if (target.type !== "activity" || !action.item) return "Reschedule requires an activity and new schedule details";
+    const updated = { ...target, date: action.item.date, start: action.item.start, end: action.item.end };
+    return scheduleValidateItem(updated);
+  }
+  if (action.type === "postpone_item" && (!target.start || !target.end || !Number.isInteger(action.postponeMinutes) || action.postponeMinutes < 1)) return "Postpone requires a timed item and positive whole number of minutes";
+  return null;
+}
+
+function saApplyPlanAtomically(actions) {
+  if (!Array.isArray(actions) || !actions.length || actions.length > 5) return { success: false, error: "A plan must contain between one and five actions." };
+  const original = items;
+  const nextItems = original.map(item => ({ ...item }));
+  const originalConflictKeys = new Set(saScheduleConflictKeys(original));
+
+  for (const action of actions) {
+    const validationError = saValidatePlanAction(action, nextItems);
+    if (validationError) return { success: false, error: validationError };
+    if (action.type === "create_item") {
+      nextItems.push({
+        id: crypto.randomUUID(), title: action.item.title.trim(), date: action.item.date, type: action.item.type,
+        start: action.item.start || "", end: action.item.end || "", category: action.item.category || "Personal",
+        notes: action.item.notes?.trim() || "", status: "upcoming", postponed: 0,
+        ...(action.item.recurrence ? { recurrence: action.item.recurrence } : {})
+      });
+      continue;
+    }
+
+    const index = nextItems.findIndex(item => item.id === action.targetId);
+    const target = nextItems[index];
+    if (action.type === "update_item") {
+      const changes = Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined));
+      nextItems[index] = { ...target, ...changes };
+    }
+    else if (action.type === "reschedule_item") nextItems[index] = { ...target, date: action.item.date, start: action.item.start, end: action.item.end };
+    else if (action.type === "complete_item") nextItems[index] = { ...target, status: "completed" };
+    else if (action.type === "mark_missed") nextItems[index] = { ...target, status: "missed" };
+    else if (action.type === "cancel_item") nextItems[index] = { ...target, status: "cancelled" };
+    else if (action.type === "postpone_item") {
+      const start = parseLocalDate(target.date);
+      const [sh, sm] = target.start.split(":").map(Number);
+      const [eh, em] = target.end.split(":").map(Number);
+      const startDateTime = new Date(start.getFullYear(), start.getMonth(), start.getDate(), sh, sm + action.postponeMinutes);
+      const endDateTime = new Date(start.getFullYear(), start.getMonth(), start.getDate(), eh, em + action.postponeMinutes);
+      const time = value => `${String(value.getHours()).padStart(2, "0")}:${String(value.getMinutes()).padStart(2, "0")}`;
+      nextItems[index] = { ...target, date: localDateString(startDateTime), start: time(startDateTime), end: time(endDateTime), status: "postponed", postponed: (target.postponed || 0) + 1 };
+    }
+  }
+
+  for (const item of nextItems) {
+    const error = scheduleValidateItem(item);
+    if (error) return { success: false, error };
+  }
+  const introducedConflicts = saScheduleConflictKeys(nextItems).filter(key => !originalConflictKeys.has(key));
+  if (introducedConflicts.length) return { success: false, error: "This plan would create a new schedule conflict." };
+
+  try {
+    saveItems(nextItems);
+  } catch {
+    return { success: false, error: "The plan could not be saved. No schedule changes were applied." };
+  }
+  items = nextItems;
+  triggerScheduleRender();
+  return { success: true, items: nextItems };
+}
+
+function saScheduleConflictKeys(scheduleItems) {
+  const grouped = new Map();
+  for (const item of scheduleItems) {
+    if (!item.date || !item.start || !item.end || ["cancelled", "completed"].includes(item.status)) continue;
+    if (!grouped.has(item.date)) grouped.set(item.date, []);
+    grouped.get(item.date).push(item);
+  }
+  const keys = [];
+  for (const [date, timed] of grouped) {
+    timed.sort((a, b) => a.start.localeCompare(b.start));
+    for (let i = 0; i < timed.length; i++) {
+      for (let j = i + 1; j < timed.length; j++) {
+        if (timed[j].start < timed[i].end) keys.push(`${date}|${[timed[i].id, timed[j].id].sort().join("|")}`);
+      }
+    }
+  }
+  return keys;
 }
 
 function saFormatDateForGemini(dateStr) {

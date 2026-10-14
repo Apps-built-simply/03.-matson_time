@@ -32,7 +32,7 @@ Choose a category only when the match is clear from availableCategories: studio 
 
 You do not directly modify schedule data.
 
-For every schedule write, return a structured proposed_action with requiresConfirmation true. The application validates and shows it to Matson for confirmation. Never claim an action was completed, saved, moved, cancelled, or deleted.
+For every schedule write, return a structured proposed_action or plan_proposal with requiresConfirmation true. The application validates and shows it to Matson for confirmation. Never claim an action was completed, saved, moved, cancelled, or deleted.
 
 Return clarification with one concise question when a required schedule detail is genuinely missing. Return answer for conversational schedule questions only when supported by supplied facts. Return error only when processing cannot continue.
 
@@ -42,7 +42,7 @@ If multiple existing items may match, request clarification rather than choosing
 
 Do not mark an item completed merely because its scheduled time passed.
 
-Do not resolve conflicts automatically.
+Do not silently change or resolve saved schedule items. When Matson asks for advice or management, recommendations and proposed resolutions are allowed; execution always waits for confirmation.
 
 Do not suggest a replacement time unless Matson explicitly asks for scheduling help.
 
@@ -51,6 +51,15 @@ Do not create routines unless Matson requests recurrence.
 Do not add locations, links, attachments, guests, or unsupported fields.
 
 Keep user-facing messages concise, useful, and practical. A no_action message must say what part could not be mapped; do not expose technical details.
+
+PLANNING CONVERSATIONS
+Proposed commitments Matson mentions are valid planning facts even when unsaved. Never say they are absent just because they are not in relevantItems. On the first turn, extract mentioned proposed items, people, dates, times/durations, constraints, travel/preparation concerns, and planning goal into one small activePlanningContext. Continue from it on follow-up turns; do not discard its proposedItems, constraints, or goal when a follow-up omits details. Update that single active context when Matson corrects or adds information, and return the updated object as planningContext. Return null when the topic is clearly abandoned or resolved. The application sends this compact context, not the complete conversation history.
+
+When Matson asks for advice or to help manage, work out, fit into the week, resolve a conflict, choose where to move something, or plan mentioned items, use supplied weekly compactFacts and stored relevantItems. Never ask how to proceed when Matson asked for the best plan. Recommend one practical plan: identify the conflict, preserve fixed commitments where possible, move the more flexible item, allow enough activity and travel/preparation time, explain briefly, and require confirmation before writing. Do not silently change saved items. If duration, travel, meeting flexibility, or another necessary fact is missing, ask one focused clarification and retain planningContext. “30 minutes is not enough” is a constraint, not the desired duration.
+
+Use plan_proposal with requiresConfirmation true and non-empty plan.actions when multiple coordinated actions are needed. Keep action null for plan_proposal. Use proposed_action when only one action is needed. If a plan item lacks a required end time, ask for clarification before proposing the plan.
+
+Planning example: activePlanningContext contains unsaved Gym tomorrow at 16:00 and Meeting with Hilda tomorrow at 16:30; Matson says 30 minutes is insufficient for gym and travel time is needed; Matson asks for the best plan based on this week. Recognize both commitments even if absent from relevantItems. Use weekly compactFacts. If supplied facts do not establish gym duration or meeting end/travel requirements, ask one focused question while preserving both items and constraints in planningContext. Once enough facts are supplied, recommend moving gym to a specific supplied suitable opening, keep the meeting at 16:30 if context says it is fixed, explain the travel gap, and return a plan_proposal requiring confirmation. Never execute it yourself.
 
 FEW-SHOT EXAMPLES
 Use these as interpretation examples. Dates in each example follow its supplied currentDate and timezone; do not reuse example dates for other requests.
@@ -109,86 +118,96 @@ Return no_action with a concise explanation that this request is unrelated to Ma
 Return only a response matching the provided JSON schema.`;
 
 /* ========== 3. Structured Response Schema ========== */
+const GEMINI_ACTION_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    type: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
+    targetId: { type: "STRING", nullable: true },
+    item: {
+      type: "OBJECT", nullable: true,
+      properties: {
+        type: { type: "STRING", enum: ["activity", "task", "routine"] },
+        title: { type: "STRING" },
+        date: { type: "STRING", nullable: true },
+        start: { type: "STRING", nullable: true },
+        end: { type: "STRING", nullable: true },
+        category: { type: "STRING" },
+        notes: { type: "STRING" },
+        recurrence: {
+          type: "OBJECT", nullable: true,
+          properties: {
+            frequency: { type: "STRING", enum: ["daily", "weekly", "monthly"] },
+            days: { type: "ARRAY", items: { type: "INTEGER" } },
+            interval: { type: "INTEGER" }
+          },
+          required: ["frequency", "days", "interval"]
+        }
+      },
+      required: ["type", "title", "date", "start", "end", "category", "notes", "recurrence"]
+    },
+    changes: {
+      type: "OBJECT", nullable: true,
+      properties: {
+        title: { type: "STRING", nullable: true }, date: { type: "STRING", nullable: true },
+        start: { type: "STRING", nullable: true }, end: { type: "STRING", nullable: true },
+        category: { type: "STRING", nullable: true }, notes: { type: "STRING", nullable: true },
+        status: { type: "STRING", nullable: true, enum: ["upcoming", "in-progress", "overdue", "completed", "missed", "cancelled", "postponed", "awaiting-check-in"] }
+      },
+      required: ["title", "date", "start", "end", "category", "notes", "status"]
+    },
+    postponeMinutes: { type: "INTEGER", nullable: true }
+  },
+  required: ["type", "targetId", "item", "changes", "postponeMinutes"]
+};
+
 const GEMINI_RESPONSE_SCHEMA = {
   type: "OBJECT",
   properties: {
-    kind: { type: "STRING", enum: ["answer", "clarification", "proposed_action", "no_action", "error"] },
+    kind: { type: "STRING", enum: ["answer", "clarification", "proposed_action", "plan_proposal", "no_action", "error"] },
     message: { type: "STRING" },
     requiresConfirmation: { type: "BOOLEAN" },
-    action: {
-      type: "OBJECT",
-      nullable: true,
+    action: { ...GEMINI_ACTION_SCHEMA, nullable: true },
+    plan: {
+      type: "OBJECT", nullable: true,
       properties: {
-        type: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
-        targetId: { type: "STRING", nullable: true },
-        item: {
-          type: "OBJECT",
-          nullable: true,
-          properties: {
-            type: { type: "STRING", enum: ["activity", "task", "routine"] },
-            title: { type: "STRING" },
-            date: { type: "STRING", nullable: true },
-            start: { type: "STRING", nullable: true },
-            end: { type: "STRING", nullable: true },
-            category: { type: "STRING" },
-            notes: { type: "STRING" },
-            recurrence: {
-              type: "OBJECT",
-              nullable: true,
-              properties: {
-                frequency: { type: "STRING", enum: ["daily", "weekly", "monthly"] },
-                days: { type: "ARRAY", items: { type: "INTEGER" } },
-                interval: { type: "INTEGER" }
-              },
-              required: ["frequency", "days", "interval"]
-            }
-          },
-          required: ["type", "title", "date", "start", "end", "category", "notes", "recurrence"]
-        },
-        changes: {
-          type: "OBJECT",
-          nullable: true,
-          properties: {
-            title: { type: "STRING", nullable: true },
-            date: { type: "STRING", nullable: true },
-            start: { type: "STRING", nullable: true },
-            end: { type: "STRING", nullable: true },
-            category: { type: "STRING", nullable: true },
-            notes: { type: "STRING", nullable: true },
-            status: { type: "STRING", nullable: true, enum: ["upcoming", "in-progress", "overdue", "completed", "missed", "cancelled", "postponed", "awaiting-check-in"] }
-          },
-          required: ["title", "date", "start", "end", "category", "notes", "status"]
-        },
-        postponeMinutes: { type: "INTEGER", nullable: true }
+        title: { type: "STRING" },
+        actions: { type: "ARRAY", items: GEMINI_ACTION_SCHEMA }
       },
-      required: ["type", "targetId", "item", "changes", "postponeMinutes"]
+      required: ["title", "actions"]
     },
-    pendingClarification: {
-      type: "OBJECT",
-      nullable: true,
+    planningContext: {
+      type: "OBJECT", nullable: true,
       properties: {
-        intent: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
-        knownFields: {
-          type: "OBJECT",
-          properties: {
-            type: { type: "STRING", nullable: true, enum: ["activity", "task", "routine"] },
-            title: { type: "STRING", nullable: true },
-            date: { type: "STRING", nullable: true },
-            start: { type: "STRING", nullable: true },
-            end: { type: "STRING", nullable: true },
-            category: { type: "STRING", nullable: true },
-            notes: { type: "STRING", nullable: true },
-            recurrence: { type: "OBJECT", nullable: true, properties: { frequency: { type: "STRING", enum: ["daily", "weekly", "monthly"] }, days: { type: "ARRAY", items: { type: "INTEGER" } }, interval: { type: "INTEGER" } } },
-            targetId: { type: "STRING", nullable: true },
-            postponeMinutes: { type: "INTEGER", nullable: true }
+        topic: { type: "STRING" },
+        proposedItems: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              temporaryId: { type: "STRING" }, type: { type: "STRING", enum: ["activity", "task", "routine"] },
+              title: { type: "STRING" }, date: { type: "STRING", nullable: true },
+              start: { type: "STRING", nullable: true }, end: { type: "STRING", nullable: true },
+              durationMinutes: { type: "INTEGER", nullable: true }, category: { type: "STRING" }
+            },
+            required: ["temporaryId", "type", "title", "date", "start", "end", "durationMinutes", "category"]
           }
         },
+        constraints: { type: "ARRAY", items: { type: "STRING" } },
+        goal: { type: "STRING" }
+      },
+      required: ["topic", "proposedItems", "constraints", "goal"]
+    },
+    pendingClarification: {
+      type: "OBJECT", nullable: true,
+      properties: {
+        intent: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
+        knownFields: { type: "OBJECT", properties: { type: { type: "STRING", nullable: true }, title: { type: "STRING", nullable: true }, date: { type: "STRING", nullable: true }, start: { type: "STRING", nullable: true }, end: { type: "STRING", nullable: true } } },
         missingFields: { type: "ARRAY", items: { type: "STRING" } }
       },
       required: ["intent", "knownFields", "missingFields"]
     }
   },
-  required: ["kind", "message", "requiresConfirmation", "action", "pendingClarification"]
+  required: ["kind", "message", "requiresConfirmation", "action", "plan", "planningContext", "pendingClarification"]
 };
 
 /* ========== 4. Input Validation ========== */
@@ -198,6 +217,7 @@ function validateRequest(body) {
   if (body.message.length > MAX_MESSAGE_LENGTH) return "Message too long";
   if (body.context !== undefined && (!Array.isArray(body.context) || body.context.some(item => !item || typeof item !== "object" || Array.isArray(item)))) return "Invalid context";
   if (body.pendingClarification !== undefined && body.pendingClarification !== null && (typeof body.pendingClarification !== "object" || Array.isArray(body.pendingClarification))) return "Invalid pendingClarification";
+  if (body.activePlanningContext !== undefined && body.activePlanningContext !== null && (typeof body.activePlanningContext !== "object" || Array.isArray(body.activePlanningContext))) return "Invalid activePlanningContext";
   return null;
 }
 
@@ -231,7 +251,7 @@ function getCurrentLocalTime() {
   return new Intl.DateTimeFormat("en-GB", { timeZone: TIMEZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date());
 }
 
-function buildRequestContext(message, scheduleItems, pendingClarification, compactFacts) {
+function buildRequestContext(message, scheduleItems, pendingClarification, compactFacts, activePlanningContext) {
   return {
     message: message.trim(),
     currentDate: getCurrentLocalDate(),
@@ -241,6 +261,7 @@ function buildRequestContext(message, scheduleItems, pendingClarification, compa
     availableCategories: ["Music", "Health", "Personal", "Meetings", "Travel"],
     allowedActions: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"],
     pendingClarification: pendingClarification,
+    activePlanningContext: activePlanningContext || null,
     relevantItems: scheduleItems.map(item => ({
       id: item.id, title: item.title, type: item.type, date: item.date,
       start: item.start || null, end: item.end || null,
@@ -421,24 +442,41 @@ function logAssistantStageFailure(stage, error, privateData) {
 function validateGeminiResponse(response, suppliedItems) {
   if (!response || typeof response !== "object") return "Invalid response format";
   if (typeof response.message !== "string") return "Invalid response message";
-  if (!["answer", "clarification", "proposed_action", "no_action", "error"].includes(response.kind)) return "Unsupported response kind";
-  if (response.kind === "proposed_action") {
-    if (!response.action) return "Missing action";
-    if (!["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"].includes(response.action.type)) return "Unsupported action type";
-    if (!response.requiresConfirmation) return "Proposed action must require confirmation";
-    if (response.action.type !== "create_item" && !response.action.targetId) return "Missing target ID";
-    if (response.action.targetId && !suppliedItems.some(item => item.id === response.action.targetId)) return "Target ID was not supplied";
-    if (response.action.targetId && !response.action.item) return "Invalid target";
-    if (response.action.item) {
-      const item = response.action.item;
+  if (!["answer", "clarification", "proposed_action", "plan_proposal", "no_action", "error"].includes(response.kind)) return "Unsupported response kind";
+  const validateAction = action => {
+    const allowed = ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"];
+    if (!action || !allowed.includes(action.type)) return "Unsupported action type";
+    if (action.type === "create_item" && (!action.item || action.targetId)) return "Invalid create action";
+    if (action.type !== "create_item" && (!action.targetId || !suppliedItems.some(item => item.id === action.targetId))) return "Target ID was not supplied";
+    if (["create_item", "reschedule_item"].includes(action.type) && !action.item) return "Action item is required";
+    if (action.type === "update_item" && !action.changes) return "Action changes are required";
+    if (action.type === "postpone_item" && (!Number.isInteger(action.postponeMinutes) || action.postponeMinutes < 1)) return "Invalid postpone duration";
+    if (action.item) {
+      const item = action.item;
       if (!["activity", "task", "routine"].includes(item.type)) return "Invalid item type";
       if (!item.title || !item.title.trim()) return "Title is required";
-      if (item.date && !/^\d{4}-\d{2}-\d{2}$/.test(item.date)) return "Invalid date format";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(item.date || "")) return "Invalid date format";
       if (item.start && !/^\d{2}:\d{2}$/.test(item.start)) return "Invalid start time format";
       if (item.end && !/^\d{2}:\d{2}$/.test(item.end)) return "Invalid end time format";
+      if (["create_item", "reschedule_item"].includes(action.type) && item.type === "activity" && (!item.start || !item.end)) return "Activity times are required";
       if (item.start && item.end && item.start >= item.end) return "End time must be after start time";
     }
+    return null;
+  };
+  if (response.kind === "proposed_action") {
+    if (!response.requiresConfirmation) return "Proposed action must require confirmation";
+    const error = validateAction(response.action);
+    if (error) return error;
   }
+  if (response.kind === "plan_proposal") {
+    if (!response.requiresConfirmation || !response.plan || !Array.isArray(response.plan.actions) || !response.plan.actions.length || response.plan.actions.length > 5) return "Invalid plan proposal";
+    for (const action of response.plan.actions) {
+      const error = validateAction(action);
+      if (error) return error;
+    }
+  }
+  if (!Object.hasOwn(response, "planningContext")) return "Planning context field is required";
+  if (response.planningContext !== null && (!response.planningContext || typeof response.planningContext !== "object" || !Array.isArray(response.planningContext.proposedItems) || !Array.isArray(response.planningContext.constraints) || typeof response.planningContext.goal !== "string")) return "Invalid planning context";
   return null;
 }
 
@@ -519,8 +557,7 @@ module.exports = async function handler(req, res) {
     const contextItems = Array.isArray(body.context) ? body.context : [];
     let requestContext;
     try {
-      requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null);
-      if (isAnalyticalQuery(message)) requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, buildAnalyticalContext(message, contextItems));
+      requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null, body.activePlanningContext || null);
     } catch (error) {
       logAssistantStageFailure("gemini-request-body-construction", error, body);
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
