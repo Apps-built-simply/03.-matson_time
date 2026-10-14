@@ -1,5 +1,5 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-app.js";
-import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js";
+import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInAnonymously } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js";
 import { getFirestore, collection, doc, getDoc, getDocs, query, orderBy, limit, where, setDoc, updateDoc, writeBatch, serverTimestamp } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-firestore.js";
 import { MATSON_FIREBASE_CONFIG } from "./firebase-config.js";
 
@@ -11,7 +11,7 @@ let conversationMessageCache = new Map();
 
 function userId() {
   const user = auth.currentUser;
-  if (!user) throw new Error("Sign in is required.");
+  if (!user) throw new Error("A user session is required.");
   return user.uid;
 }
 function userDoc(...segments) { return doc(db, "users", userId(), ...segments); }
@@ -78,9 +78,8 @@ function cleanMessage(message) {
   };
 }
 
-export const observeAuthState = callback => { persistenceReady.then(() => onAuthStateChanged(auth, callback)); };
-export const signIn = async (email, password) => { await persistenceReady; return signInWithEmailAndPassword(auth, email, password); };
-export const signOutUser = () => signOut(auth);
+export const observeAuthState = (callback, onError) => { persistenceReady.then(() => onAuthStateChanged(auth, callback)).catch(onError); };
+export const signInAnonymouslyWhenNeeded = async () => { await persistenceReady; if (!auth.currentUser) return signInAnonymously(auth); return auth.currentUser; };
 export const getCurrentUser = () => auth.currentUser;
 
 export async function loadScheduleItems() {
@@ -270,7 +269,7 @@ export function tokenizeKeywords(text) {
 }
 
 export const firebaseStore = {
-  observeAuthState, signIn, signOutUser, getCurrentUser,
+  observeAuthState, signInAnonymouslyWhenNeeded, getCurrentUser,
   loadScheduleItems, createScheduleItem, updateScheduleItem, writeSchedulePlanBatch, loadCategories, createCategory, updateCategory,
   createConversation, listRecentConversations, loadConversation, addConversationMessage, resolveUnresolvedProposals, updateConversationSummary, searchConversationSummaries,
   loadAssistantState, saveAssistantState, clearAssistantState,

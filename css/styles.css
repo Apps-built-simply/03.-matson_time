@@ -42,11 +42,9 @@ h3 { margin: 0; }
 .app-header { border-bottom: 1px solid var(--color-border); padding-block: 22px 18px; }
 .eyebrow { margin: 0 0 4px; color: var(--color-muted); font-size: .82rem; }
 .muted { color: var(--color-muted); font-size: .82rem; }
-.auth-screen, .cloud-loading { min-height: 100dvh; display: grid; place-items: center; padding: 24px; }
-.auth-screen[hidden], .cloud-loading[hidden] { display: none; }
-.auth-form { width: min(100%, 380px); padding: 24px; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-surface); }
-.auth-form h1 { margin-bottom: 20px; }
-.auth-error { color: var(--color-error); font-size: .88rem; }
+.cloud-loading { min-height: 100dvh; display: grid; place-items: center; padding: 24px; }
+.cloud-loading[hidden] { display: none; }
+.connection-error { color: var(--color-error); font-size: .88rem; }
 .cloud-loading { align-content: center; gap: 12px; text-align: center; color: var(--color-text-secondary); }
 .cloud-loading p { margin: 0; }
 .heading-with-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

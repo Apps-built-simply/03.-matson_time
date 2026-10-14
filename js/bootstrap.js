@@ -1,16 +1,13 @@
 import { firebaseStore } from "./firebase-store.js";
 
-const login = document.querySelector("#loginGate");
 const loading = document.querySelector("#cloudLoading");
 const appShell = document.querySelector(".app-shell");
-const loginForm = document.querySelector("#loginForm");
-const loginError = document.querySelector("#loginError");
 const cloudError = document.querySelector("#cloudError");
 const retryButton = document.querySelector("#retryCloudButton");
 let activeUser = null;
-let hasAuthenticated = false;
 let scriptsLoaded = false;
 let cloudLoadInProgress = false;
+let anonymousSignInInProgress = false;
 
 const defaultCategories = [
   { id: "music", name: "Music", color: "#8B5CF6" },
@@ -20,15 +17,18 @@ const defaultCategories = [
   { id: "travel", name: "Travel", color: "#6366F1" }
 ];
 
-function showLogin() {
-  login.hidden = false;
-  loading.hidden = true;
-  appShell.hidden = true;
-}
 function showLoading() {
-  login.hidden = true;
   loading.hidden = false;
   appShell.hidden = true;
+  cloudError.hidden = true;
+  retryButton.hidden = true;
+}
+function showConnectionError() {
+  loading.hidden = false;
+  appShell.hidden = true;
+  cloudError.hidden = false;
+  cloudError.textContent = "Matson Time could not connect. Try again.";
+  retryButton.hidden = false;
 }
 function showCloudError(error) {
   console.error("Cloud startup failed", { name: error?.name || "Error", message: String(error?.message || error) });
@@ -159,7 +159,6 @@ async function loadCloudApp() {
       }
       scriptsLoaded = true;
     }
-    login.hidden = true;
     loading.hidden = true;
     appShell.hidden = false;
   } catch (error) {
@@ -179,33 +178,29 @@ function loadClassicScript(src) {
   });
 }
 
-loginForm.addEventListener("submit", async event => {
-  event.preventDefault();
-  loginError.hidden = true;
-  const submit = loginForm.querySelector("button[type=submit]");
-  submit.disabled = true;
+async function connectAnonymously() {
+  if (anonymousSignInInProgress) return;
+  anonymousSignInInProgress = true;
+  showLoading();
   try {
-    await firebaseStore.signIn(loginForm.elements.email.value.trim(), loginForm.elements.password.value);
-    loginForm.elements.password.value = "";
+    await firebaseStore.signInAnonymouslyWhenNeeded();
   } catch {
-    loginError.textContent = "Sign-in failed. Check your details and try again.";
-    loginError.hidden = false;
+    showConnectionError();
   } finally {
-    submit.disabled = false;
+    anonymousSignInInProgress = false;
   }
+}
+
+retryButton.addEventListener("click", () => {
+  if (activeUser) loadCloudApp();
+  else connectAnonymously();
 });
-retryButton.addEventListener("click", loadCloudApp);
 firebaseStore.observeAuthState(user => {
   if (!user) {
-    if (hasAuthenticated) {
-      window.location.reload();
-      return;
-    }
     activeUser = null;
-    showLogin();
+    connectAnonymously();
     return;
   }
-  hasAuthenticated = true;
   activeUser = user;
   loadCloudApp();
-});
+}, showConnectionError);

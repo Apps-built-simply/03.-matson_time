@@ -8,19 +8,9 @@
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
-  <section id="loginGate" class="auth-screen" hidden aria-labelledby="loginTitle">
-    <form id="loginForm" class="auth-form" autocomplete="on">
-      <h1 id="loginTitle">Connect Matson Time</h1>
-      <p>Connect this device to Matson’s private schedule.</p>
-      <label>Email<input name="email" type="email" autocomplete="username" required></label>
-      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
-      <p id="loginError" class="auth-error" role="alert" hidden></p>
-      <button class="primary-button" type="submit">Connect</button>
-    </form>
-  </section>
-  <section id="cloudLoading" class="cloud-loading" hidden aria-live="polite">
-    <p id="cloudLoadingText">Loading your Matson Time data…</p>
-    <p id="cloudError" class="auth-error" role="alert" hidden></p>
+  <section id="cloudLoading" class="cloud-loading" aria-live="polite">
+    <p id="cloudLoadingText">Loading Matson Time…</p>
+    <p id="cloudError" class="connection-error" role="alert" hidden></p>
     <button id="retryCloudButton" class="secondary-button" type="button" hidden>Retry</button>
   </section>
 
