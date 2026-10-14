@@ -182,55 +182,95 @@ async function callGemini(requestContext) {
   const configError = validateConfig();
   if (configError) return { error: "Configuration error", category: "missing_environment_configuration" };
 
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent?key=" + GEMINI_API_KEY;
-  const payload = {
-    systemInstruction: { parts: [{ text: GEMINI_SYSTEM_INSTRUCTION }] },
-    contents: [{ role: "user", parts: [{ text: JSON.stringify(requestContext) }] }],
-    generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_RESPONSE_SCHEMA, temperature: 0.1, maxOutputTokens: 1024 }
-  };
+  let serializedContext;
+  try {
+    serializedContext = JSON.stringify(requestContext);
+  } catch (error) {
+    logAssistantStageFailure("json-serialization", error, requestContext);
+    return { error: "Request serialization failed", category: "invalid_request" };
+  }
+
+  let url;
+  let payload;
+  try {
+    url = "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(GEMINI_MODEL) + ":generateContent?key=" + GEMINI_API_KEY;
+    payload = {
+      systemInstruction: { parts: [{ text: GEMINI_SYSTEM_INSTRUCTION }] },
+      contents: [{ role: "user", parts: [{ text: serializedContext }] }],
+      generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_RESPONSE_SCHEMA, temperature: 0.1, maxOutputTokens: 1024 }
+    };
+  } catch (error) {
+    logAssistantStageFailure("gemini-request-body-construction", error, requestContext);
+    return { error: "Request construction failed", category: "invalid_request" };
+  }
+
+  let serializedPayload;
+  try {
+    serializedPayload = JSON.stringify(payload);
+  } catch (error) {
+    logAssistantStageFailure("json-serialization", error, requestContext);
+    return { error: "Request serialization failed", category: "invalid_request" };
+  }
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
+  let response;
   try {
-    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: controller.signal });
+    response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: serializedPayload, signal: controller.signal });
+  } catch (error) {
     clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      const rawErrorBody = await response.text();
-      let providerError = {};
-      try { providerError = JSON.parse(rawErrorBody)?.error || {}; } catch { /* Keep only status when the provider body is not JSON. */ }
-      const providerMessage = typeof providerError.message === "string" ? providerError.message : "";
-      const category = classifyGeminiFailure(response.status, providerMessage);
-      const safeErrorMessage = sanitizeGeminiErrorMessage(providerMessage, requestContext);
-      console.error("Gemini request failed", {
-        model: GEMINI_MODEL,
-        status: response.status,
-        errorCode: safeProviderCode(providerError.code),
-        errorStatus: safeProviderStatus(providerError.status),
-        category,
-        message: safeErrorMessage || category
-      });
-      if (response.status === 429) return { error: "Gemini quota exceeded", details: "Rate limit reached. Please try again later.", category };
-      if (response.status === 400) return { error: "Invalid request", details: "The request to the language service was malformed.", category };
-      if (response.status === 401 || response.status === 403) return { error: "Authentication failed", details: "The API key is invalid or lacks permissions.", category };
-      return { error: "Language service error", details: "Service returned " + response.status, category };
-    }
-
-    const data = await response.json();
-    if (!data.candidates || !data.candidates.length) return { error: "Empty response", details: "The language service returned no candidates.", category: "invalid_gemini_response" };
-    const candidate = data.candidates[0];
-    if (candidate.finishReason === "SAFETY") return { error: "Safety refusal", details: "The request was declined by safety filters.", category: "invalid_gemini_response" };
-    const content = candidate.content?.parts?.[0]?.text;
-    if (!content) return { error: "Empty content", details: "The language service returned empty content.", category: "invalid_gemini_response" };
-    let parsed;
-    try { parsed = JSON.parse(content); } catch { return { error: "Invalid JSON", details: "The language service returned malformed JSON.", category: "invalid_gemini_response" }; }
-    return { response: parsed };
-  } catch (err) {
-    clearTimeout(timeoutId);
-    if (err.name === "AbortError") return { error: "Timeout", details: "The language service did not respond in time.", category: "timeout" };
-    return { error: "Network error", details: "Failed to reach the language service.", category: err instanceof SyntaxError ? "invalid_gemini_response" : "invalid_request" };
+    logAssistantStageFailure("gemini-fetch", error, requestContext);
+    return { error: error?.name === "AbortError" ? "Timeout" : "Network error", details: "Failed to reach the language service.", category: error?.name === "AbortError" ? "timeout" : "invalid_request" };
   }
+  clearTimeout(timeoutId);
+
+  let responseBody;
+  try {
+    responseBody = await response.text();
+  } catch (error) {
+    logAssistantStageFailure("gemini-response-body-reading", error, requestContext);
+    return { error: "Response reading failed", category: "invalid_gemini_response" };
+  }
+
+  let data;
+  try {
+    data = JSON.parse(responseBody);
+  } catch (error) {
+    logAssistantStageFailure("gemini-response-parsing", error, requestContext);
+    if (response.ok) return { error: "Invalid response", details: "The language service returned malformed JSON.", category: "invalid_gemini_response" };
+    data = {};
+  }
+
+  if (!response.ok) {
+    const providerError = data?.error || {};
+    const providerMessage = typeof providerError.message === "string" ? providerError.message : "";
+    const category = classifyGeminiFailure(response.status, providerMessage);
+    const safeErrorMessage = sanitizeGeminiErrorMessage(providerMessage, requestContext);
+    console.error("Gemini request failed", {
+      model: GEMINI_MODEL,
+      status: response.status,
+      errorCode: safeProviderCode(providerError.code),
+      errorStatus: safeProviderStatus(providerError.status),
+      category,
+      message: safeErrorMessage || category
+    });
+    if (response.status === 429) return { error: "Gemini quota exceeded", details: "Rate limit reached. Please try again later.", category };
+    if (response.status === 400) return { error: "Invalid request", details: "The request to the language service was malformed.", category };
+    if (response.status === 401 || response.status === 403) return { error: "Authentication failed", details: "The API key is invalid or lacks permissions.", category };
+    return { error: "Language service error", details: "Service returned " + response.status, category };
+  }
+
+  if (!data.candidates || !data.candidates.length) return { error: "Empty response", details: "The language service returned no candidates.", category: "invalid_gemini_response" };
+  const candidate = data.candidates[0];
+  if (candidate.finishReason === "SAFETY") return { error: "Safety refusal", details: "The request was declined by safety filters.", category: "invalid_gemini_response" };
+  const content = candidate.content?.parts?.[0]?.text;
+  if (!content) return { error: "Empty content", details: "The language service returned empty content.", category: "invalid_gemini_response" };
+  let parsed;
+  try { parsed = JSON.parse(content); } catch (error) {
+    logAssistantStageFailure("gemini-response-parsing", error, requestContext);
+    return { error: "Invalid JSON", details: "The language service returned malformed JSON.", category: "invalid_gemini_response" };
+  }
+  return { response: parsed };
 }
 
 function classifyGeminiFailure(status, message) {
@@ -268,6 +308,15 @@ function sanitizeGeminiErrorMessage(message, requestContext) {
   collectPrivateValues(requestContext);
   for (const value of privateValues) safe = safe.split(value).join("[redacted]");
   return safe;
+}
+
+function logAssistantStageFailure(stage, error, privateData) {
+  const privateMessage = sanitizeGeminiErrorMessage(String(error?.message || error), privateData || {});
+  console.error("Assistant stage failed", {
+    stage,
+    name: error?.name || "Error",
+    message: privateMessage || "Unexpected error"
+  });
 }
 
 /* ========== 6. Gemini Response Validation ========== */
@@ -308,15 +357,15 @@ function validateConfig() {
 
 module.exports = async function handler(req, res) {
   console.log("Assistant request reached function", { method: req.method });
-  console.log("Assistant function configuration", {
-    model: GEMINI_MODEL || "missing",
-    hasApiKey: Boolean(GEMINI_API_KEY)
-  });
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     sendJson(res, 405, { kind: "error", message: "Method not allowed." });
     return;
   }
+  console.log("Assistant configuration", {
+    model: process.env.GEMINI_MODEL || "missing",
+    hasApiKey: Boolean(process.env.GEMINI_API_KEY)
+  });
   if (!/^application\/json(?:\s*;|$)/i.test(req.headers["content-type"] || "")) {
     sendJson(res, 415, { kind: "error", message: "Send a JSON request." });
     return;
@@ -327,18 +376,20 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  let body = req.body;
+  let body;
+  try {
+  body = req.body;
   if (Buffer.isBuffer(body)) {
     if (body.length > MAX_BODY_SIZE) { sendJson(res, 413, { kind: "error", message: "Request is too large." }); return; }
-    try { body = JSON.parse(body.toString("utf8")); } catch { body = null; }
+    try { body = JSON.parse(body.toString("utf8")); } catch (error) { logAssistantStageFailure("request-body-validation", error, body.toString("utf8")); body = null; }
   } else if (typeof body === "string") {
     if (Buffer.byteLength(body, "utf8") > MAX_BODY_SIZE) { sendJson(res, 413, { kind: "error", message: "Request is too large." }); return; }
-    try { body = JSON.parse(body); } catch { body = null; }
+    try { body = JSON.parse(body); } catch (error) { logAssistantStageFailure("request-body-validation", error, body); body = null; }
   }
   if (!body && req.rawBody) {
     const raw = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(String(req.rawBody));
     if (raw.length > MAX_BODY_SIZE) { sendJson(res, 413, { kind: "error", message: "Request is too large." }); return; }
-    try { body = JSON.parse(raw.toString("utf8")); } catch { body = null; }
+    try { body = JSON.parse(raw.toString("utf8")); } catch (error) { logAssistantStageFailure("request-body-validation", error, raw.toString("utf8")); body = null; }
   }
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     sendJson(res, 400, { kind: "error", message: "Invalid JSON request." });
@@ -350,6 +401,11 @@ module.exports = async function handler(req, res) {
   }
   const validationError = validateRequest(body);
   if (validationError) { sendJson(res, 400, { kind: "error", message: validationError + "." }); return; }
+  } catch (error) {
+    logAssistantStageFailure("request-body-validation", error, body);
+    sendJson(res, 400, { kind: "error", message: "Invalid JSON request." });
+    return;
+  }
   if (validateConfig()) {
     console.error("Assistant request failed", {
       category: "missing_environment_configuration",
@@ -363,10 +419,24 @@ module.exports = async function handler(req, res) {
   try {
     const message = body.message.trim();
     const contextItems = Array.isArray(body.context) ? body.context : [];
-    let requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null);
-    if (isAnalyticalQuery(message)) requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, buildAnalyticalContext(message, contextItems));
+    let requestContext;
+    try {
+      requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null);
+      if (isAnalyticalQuery(message)) requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, buildAnalyticalContext(message, contextItems));
+    } catch (error) {
+      logAssistantStageFailure("gemini-request-body-construction", error, body);
+      sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
+      return;
+    }
 
-    const result = await callGemini(requestContext);
+    let result;
+    try {
+      result = await callGemini(requestContext);
+    } catch (error) {
+      logAssistantStageFailure("gemini-fetch", error, requestContext);
+      sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
+      return;
+    }
     if (result.error) {
       if (result.category !== "missing_environment_configuration") {
         console.error("Assistant request failed", { category: result.category || "invalid_request" });
@@ -374,15 +444,23 @@ module.exports = async function handler(req, res) {
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
       return;
     }
-    const response = result.response;
-    const responseError = validateGeminiResponse(response, contextItems);
+    let response = result.response;
+    let responseError;
+    try {
+      responseError = validateGeminiResponse(response, contextItems);
+    } catch (error) {
+      logAssistantStageFailure("normalized-response-validation", error, requestContext);
+      sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
+      return;
+    }
     if (responseError) {
       console.error("Assistant request failed", { category: "invalid_gemini_response", reason: responseError });
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
       return;
     }
     sendJson(res, 200, response);
-  } catch {
+  } catch (error) {
+    logAssistantStageFailure("normalized-response-validation", error, body);
     sendJson(res, 500, { kind: "error", message: "Unable to process that request right now." });
   }
 };
