@@ -129,11 +129,49 @@ Return no_action with a concise explanation that this request is unrelated to Ma
 
 Return only a response matching the provided JSON schema.`;
 
-const GEMINI_SYSTEM_INSTRUCTION = `You are Matson Time, a personal schedule assistant. Use only supplied context. Local date/time and calculated facts are authoritative. Application context already contains the matching saved items, valid target IDs, resolved scopes, candidate slots, and recent references; do not invent IDs or recalculate those facts. Ask one focused question when required information is missing or ambiguous.
+const ACTION_REQUIREMENTS = {
+  create_item: { activity: ["item.type", "item.title", "item.date", "item.start", "item.end"], task: ["item.type", "item.title", "item.date"], routine: ["item.type", "item.title", "recurrence", "item.date"] },
+  update_item: ["targetId", "changes"], reschedule_item: ["targetId", "dateOrStartOrEnd"], postpone_item: ["targetId", "postponeMinutes"],
+  complete_item: ["targetId"], mark_missed: ["targetId"], cancel_item: ["targetId"], restore_item: ["cancelledTargetId"], delete_item: ["targetId", "trustedConfirmation"],
+  bulk: ["operation", "scope", "targetIds", "affectedCount", "trustedConfirmation"], plan_proposal: ["twoValidActions"]
+};
 
-Propose every write for confirmation. A plan has 2–20 ordered valid actions; a bulk proposal includes a resolved scope, matching supplied IDs, and exact count. Cancel preserves the item and history and can be restored. Delete permanently removes the item and requires explicit delete/erase/permanent intent plus confirmation. Never guess what “clear” means or broaden “all”; clarify active upcoming items versus all schedule history. Keep replies concise, preserve pending operations and corrections, and return only schema-valid structured output.
+function evaluateActionCompleteness(action, context = {}) {
+  const missingFields = [], invalidFields = [];
+  const addMissing = field => { if (!missingFields.includes(field)) missingFields.push(field); };
+  if (!action || typeof action !== "object") return { complete: false, missingFields: ["action"], invalidFields };
+  if (action.type === "create_item") {
+    const item = action.item || {};
+    const fields = ACTION_REQUIREMENTS.create_item[item.type] || ["item.type", "item.title", "item.date"];
+    for (const field of fields) {
+      if (field === "item.type" && !["activity", "task", "routine"].includes(item.type)) addMissing(field);
+      else if (field === "item.title" && !String(item.title || "").trim()) addMissing(field);
+      else if (field === "item.date" && !isValidLocalDate(item.date)) addMissing(field);
+      else if (field === "item.start" && !item.start) addMissing(field);
+      else if (field === "item.end" && !item.end) addMissing(field);
+      else if (field === "recurrence" && !item.recurrence) addMissing(field);
+    }
+  } else if (["update_item", "reschedule_item"].includes(action.type)) {
+    if (!action.targetId) addMissing("targetId");
+    if (action.type === "update_item" && !Object.values(action.changes || {}).some(value => value !== null && value !== undefined && value !== "")) addMissing("changes");
+    if (action.type === "reschedule_item" && !["date", "start", "end"].some(key => action.changes?.[key] !== null && action.changes?.[key] !== undefined)) addMissing("date or time");
+  } else if (action.type === "postpone_item") {
+    if (!action.targetId) addMissing("targetId");
+    if (!Number.isInteger(action.postponeMinutes) || action.postponeMinutes <= 0) addMissing("postponeMinutes");
+  } else if (Object.hasOwn(ACTION_REQUIREMENTS, action.type)) {
+    if (!action.targetId) addMissing("targetId");
+    if (action.type === "restore_item" && context.items?.find(item => item.id === action.targetId)?.status !== "cancelled") invalidFields.push("targetId");
+  }
+  return { complete: missingFields.length === 0 && invalidFields.length === 0, missingFields, invalidFields };
+}
 
-Rules: “add a studio session tomorrow 2–5 PM” → create one timed activity; “move the supplied call to 4 PM” → modify its real ID and preserve duration; “clear everything planned” → ask scope, then cancellation versus permanent deletion; “remove one exact duplicate and move the remainder” → recommend keeping the oldest, retain both IDs, ask only for missing time, then propose one coordinated plan; “cancel gym and add a walk” → propose both ordered actions together. Use supplied candidate slots for planning; never execute a write.`;
+const GEMINI_SYSTEM_INSTRUCTION = `You are Matson Time, the personal schedule-management assistant for Matson's personal calendar. “Reserve,” “block,” “schedule,” “add,” “set aside,” “put on my calendar,” and “make time for” can create schedule items. Interpret only with supplied context. Use the supplied Africa/Kampala local date for relative dates; never shift dates through UTC. Application-prepared context contains matching items and IDs, resolved scopes, calculated facts, and candidate slots. Do not invent IDs, ask for supplied facts, or recalculate them.
+
+Completeness contract: create activity requires type, title, local date, start, and end; task requires type, title, and date (times optional); routine requires explicit recurrence, title, and date/recurrence start, with time only when time-based. Updates need a real target and a supported change; reschedule needs target and date/start/end; postpone needs a target and positive minutes; status actions need a target; restore needs a cancelled target; deletion and every write require trusted confirmation. A plan needs at least two independently valid actions. Bulk actions need a resolved operation/scope, matching real IDs, exact count, and confirmation. Complete requests produce proposals immediately. Clarify only for genuinely absent required fields, name each missing field in both message and pendingClarification.missingFields, and inspect the current message plus all supplied conversation, entity, schedule, planning, operation, memory, and calculated context first. Never claim an unspecified detail is missing. Ask one focused question; retain known fields. Gemini proposes; trusted application logic validates and executes only after confirmation.
+
+Interpret exact times (2 PM=14:00; noon=12:00; midnight=00:00); a shared meridiem in “from 2 to 5 PM” applies to both. Tasks need no time. Category uncertainty never blocks creation: studio/rehearsal/practice→Music, gym/exercise→Health, meetings/calls→Meetings, otherwise Personal. Generate a concise title from a clear subject. Use supplied candidate slots for planning. Cancel preserves history; delete is permanent; never guess “clear” or broaden “all.” Return schema-valid structured output only.
+
+Compact examples: “Reserve tomorrow 2–5 PM for a studio session” → timed activity proposal, 14:00–17:00, Music, confirmation; “Remind me to send Raymond the files tomorrow” → untimed task proposal; “Move the supplied call to 4 PM” → real target, preserve supplied duration; “Block Friday afternoon for practice” → ask exact start and end; “clear everything planned” → resolve scope then cancel/delete method; “remove an exact duplicate and move the remainder” → recommend oldest to keep, ask only missing time, then one confirmed plan; “cancel gym and add a walk” → one ordered confirmed plan.`;
 
 /* ========== 3. Structured Response Schema ========== */
 const GEMINI_ACTION_SCHEMA = {
@@ -237,7 +275,7 @@ const GEMINI_RESPONSE_SCHEMA = {
     pendingClarification: {
       type: "OBJECT", nullable: true,
       properties: {
-        intent: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
+        intent: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item", "restore_item", "delete_item", "bulk_scope", "destructive_method", "deduplicate_and_reschedule", "unknown"] },
         knownFields: { type: "OBJECT", properties: { type: { type: "STRING", nullable: true }, title: { type: "STRING", nullable: true }, date: { type: "STRING", nullable: true }, start: { type: "STRING", nullable: true }, end: { type: "STRING", nullable: true } } },
         missingFields: { type: "ARRAY", items: { type: "STRING" } }
       },
@@ -569,7 +607,7 @@ function itemMatchesBulkScope(item, scope) {
   return true;
 }
 
-function validateGeminiResponse(response, suppliedItems) {
+function validateGeminiResponse(response, suppliedItems, currentMessage = "") {
   if (!response || typeof response !== "object") return "Invalid response format";
   if (typeof response.message !== "string") return "Invalid response message";
   if (!["answer", "clarification", "proposed_action", "plan_proposal", "bulk_proposal", "no_action", "error"].includes(response.kind)) return "Unsupported response kind";
@@ -609,8 +647,31 @@ function validateGeminiResponse(response, suppliedItems) {
       if (["create_item", "reschedule_item"].includes(action.type) && item.type === "activity" && (!item.start || !item.end)) return "Activity times are required";
       if (item.start && item.end && item.start >= item.end) return "End time must be after start time";
     }
+    const completeness = evaluateActionCompleteness(action, { items: suppliedItems });
+    if (!completeness.complete) return `missing_required_field:${completeness.missingFields.join(",")}`;
+    if (completeness.invalidFields.length) return `invalid_action_shape:${completeness.invalidFields.join(",")}`;
     return null;
   };
+  if (response.kind === "clarification") {
+    const pending = response.pendingClarification;
+    if (response.requiresConfirmation || response.action !== null || response.plan !== null || response.bulkAction !== null || !pending || !Array.isArray(pending.missingFields) || pending.missingFields.length === 0) return "invalid_clarification:missing_fields";
+    const labels = { "item.type": /type/i, "item.title": /title|what (?:is|should .* be called)/i, "item.date": /date|which day/i, date: /date|which day/i, "item.start": /start|begin|from what time/i, start: /start|begin|from what time/i, "item.end": /end|finish|until|to what time/i, end: /end|finish|until|to what time/i, recurrence: /recurr|which days|how often/i, targetId: /which item|what item|which .* (?:move|change|cancel|delete|complete)/i, scope: /scope|which (?:items|date|week)/i, operation: /cancel or delete|which (?:action|method)/i, changes: /what .* change|which change/i, postponeMinutes: /how many minutes|how long/i };
+    const allowedMissing = new Set(["item.type", "item.title", "item.date", "item.start", "item.end", "type", "title", "date", "start", "end", "recurrence", "targetId", "changes", "postponeMinutes", "scope", "operation", "keepId"]);
+    for (const field of pending.missingFields) {
+      if (!allowedMissing.has(field)) return "invalid_clarification:unsupported_field";
+      const key = ({ "item.type": "type", "item.title": "title", "item.date": "date", "item.start": "start", "item.end": "end" })[field] || field;
+      if (pending.knownFields?.[key] !== undefined && pending.knownFields?.[key] !== null && pending.knownFields?.[key] !== "") return "invalid_clarification:field_already_known";
+      if (labels[field] && !labels[field].test(response.message)) return "invalid_clarification:unnamed_missing_field";
+    }
+    const normalizedMessage = String(currentMessage).toLowerCase();
+    const explicitTimes = [...normalizedMessage.matchAll(/\b(\d{1,2})(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?)\b/gi)];
+    const supplied = new Set();
+    if (/\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{4}-\d{2}-\d{2})\b/i.test(normalizedMessage)) supplied.add("date");
+    if (explicitTimes.length >= 1) supplied.add("start");
+    if (explicitTimes.length >= 2 || /\bfrom\s+\d{1,2}\s+to\s+\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?)\b/i.test(normalizedMessage)) supplied.add("end");
+    if (/\b(for|to)\s+(?:a|an|the)\s+[a-z][\w -]{1,50}/i.test(normalizedMessage) || /\b(remind me to|meeting with|gym|studio session|rehearsal|practice|call)\b/i.test(normalizedMessage)) supplied.add("title");
+    if (pending.missingFields.some(field => supplied.has(({ "item.date": "date", "item.start": "start", "item.end": "end", "item.title": "title" })[field] || field))) return "complete_request_misclassified";
+  }
   if (response.kind === "proposed_action") {
     if (!response.requiresConfirmation) return "Proposed action must require confirmation";
     const error = validateAction(response.action);
@@ -752,14 +813,19 @@ module.exports = async function handler(req, res) {
     let response = result.response;
     let responseError;
     try {
-      responseError = validateGeminiResponse(response, contextItems);
+      responseError = validateGeminiResponse(response, contextItems, message);
     } catch (error) {
       logAssistantStageFailure("normalized-response-validation", error, requestContext);
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
       return;
     }
     if (responseError) {
-      console.error("Assistant request failed", { category: "invalid_gemini_response", reason: responseError });
+      const category = responseError.startsWith("invalid_clarification:") ? "invalid_clarification" : responseError === "complete_request_misclassified" ? "complete_request_misclassified" : responseError.startsWith("missing_required_field:") ? "missing_required_field" : "invalid_action_shape";
+      console.error("Assistant request failed", { category, reason: responseError });
+      if (category === "invalid_clarification") {
+        sendJson(res, 200, { kind: "error", message: "I could not identify what information is missing. Please try the request again.", action: null, plan: null, bulkAction: null, planningContext: null, pendingClarification: null, requiresConfirmation: false });
+        return;
+      }
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now.", ...(process.env.NODE_ENV === "production" ? {} : { reason: responseError }) });
       return;
     }

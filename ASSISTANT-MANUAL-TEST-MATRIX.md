@@ -4,6 +4,11 @@ Run each item with a test account and verify the proposal before confirming. Con
 
 | Area | Try | Expected result |
 | --- | --- | --- |
+| Complete creation | “Reserve tomorrow from 2 PM to 5 PM for a studio session”; “Add a meeting with Hilda tomorrow from 4:30 PM to 5:30 PM”; “Remind me to send Raymond the files tomorrow”; “Add gym every Monday, Wednesday and Friday from 7 AM to 8 AM” | Immediate confirmation proposal; correct activity/task/routine fields, Kampala-relative date, exact times, recurrence weekdays, and clear category when available; tasks need no time |
+| Incomplete creation | Missing end time; missing both times; “Reserve tomorrow afternoon for studio”; routine request with no recurrence days | Ask only for genuinely missing fields; vague period asks for exact start and end; preserve all known fields |
+| Complete modification | Reschedule with new start; update title; add note; complete item; cancel item | Proposal targets the correct saved ID and contains a supported change; all writes require confirmation |
+| Incomplete modification | “Move the studio session”; update an ambiguous item; “Delete the duplicate” when multiple duplicates exist | Ask for destination, target, or which duplicate to preserve; never repeat known information |
+| Clarification quality | Inspect every clarification across creation, modification, bulk, and destructive actions | Each names its exact non-empty missingFields; no resolved field is requested again; no generic “one more detail” text |
 | Creation | “Add a studio session tomorrow from 2 to 5 PM”; add a task; add a weekly routine; vague “in the afternoon” | Correct item type/date; ask for an exact missing time; routine only when recurrence is explicit |
 | Reading | Ask what is scheduled today, tomorrow, this week, next, overdue, progress, or conflicts; search title/category | Answers use current saved schedule and calculated facts |
 | References | With two matching items, say “it”, “the other one”, “both”, “all of them”, “the remainder”, “everything except gym” | Resolve only from current conversation entities/sets; ask which item if ambiguous |

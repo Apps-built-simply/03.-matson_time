@@ -951,6 +951,38 @@ function getDirectActionTarget() {
   return null;
 }
 
+const ASSISTANT_ACTION_REQUIREMENTS = {
+  create_item: { activity: ["item.type", "item.title", "item.date", "item.start", "item.end"], task: ["item.type", "item.title", "item.date"], routine: ["item.type", "item.title", "recurrence", "item.date"] },
+  update_item: ["targetId", "changes"], reschedule_item: ["targetId", "dateOrStartOrEnd"], postpone_item: ["targetId", "postponeMinutes"],
+  complete_item: ["targetId"], mark_missed: ["targetId"], cancel_item: ["targetId"], restore_item: ["cancelledTargetId"], delete_item: ["targetId", "trustedConfirmation"],
+  bulk: ["operation", "scope", "targetIds", "affectedCount", "trustedConfirmation"], plan_proposal: ["twoValidActions"]
+};
+
+function evaluateActionCompleteness(action) {
+  const missingFields = [], invalidFields = [];
+  const missing = field => { if (!missingFields.includes(field)) missingFields.push(field); };
+  if (!action || typeof action !== "object") return { complete: false, missingFields: ["action"], invalidFields };
+  if (action.type === "create_item") {
+    const item = action.item || {};
+    for (const field of ASSISTANT_ACTION_REQUIREMENTS.create_item[item.type] || ["item.type", "item.title", "item.date"]) {
+      if (field === "item.type" && !["activity", "task", "routine"].includes(item.type)) missing(field);
+      if (field === "item.title" && !String(item.title || "").trim()) missing(field);
+      if (field === "item.date" && !/^\d{4}-\d{2}-\d{2}$/.test(item.date || "")) missing(field);
+      if (field === "item.start" && !item.start) missing(field);
+      if (field === "item.end" && !item.end) missing(field);
+      if (field === "recurrence" && !item.recurrence) missing(field);
+    }
+  } else if (["update_item", "reschedule_item"].includes(action.type)) {
+    if (!action.targetId) missing("targetId");
+    if (action.type === "update_item" && !Object.values(action.changes || {}).some(value => value !== null && value !== undefined && value !== "")) missing("changes");
+    if (action.type === "reschedule_item" && !["date", "start", "end"].some(key => action.changes?.[key] !== null && action.changes?.[key] !== undefined)) missing("date or time");
+  } else if (Object.hasOwn(ASSISTANT_ACTION_REQUIREMENTS, action.type)) {
+    if (!action.targetId) missing("targetId");
+    if (action.type === "postpone_item" && (!Number.isInteger(action.postponeMinutes) || action.postponeMinutes <= 0)) missing("postponeMinutes");
+  }
+  return { complete: !missingFields.length && !invalidFields.length, missingFields, invalidFields };
+}
+
 function validateGeminiResponse(response) {
   if (!response || typeof response !== "object") return "Invalid response format";
   if (!["answer", "clarification", "proposed_action", "plan_proposal", "bulk_proposal", "no_action", "error"].includes(response.kind)) {
@@ -958,12 +990,35 @@ function validateGeminiResponse(response) {
   }
   if (!Object.prototype.hasOwnProperty.call(response, "planningContext")) return "Missing planning context";
   if (response.planningContext !== null && (!response.planningContext || typeof response.planningContext !== "object" || !Array.isArray(response.planningContext.proposedItems) || !Array.isArray(response.planningContext.constraints) || typeof response.planningContext.goal !== "string")) return "Invalid planning context";
+  if (response.kind === "clarification") {
+    const pending = response.pendingClarification;
+    if (response.requiresConfirmation || response.action !== null || response.plan !== null || response.bulkAction !== null || !pending || !Array.isArray(pending.missingFields) || pending.missingFields.length === 0) return "invalid_clarification:missing_fields";
+    const labels = { "item.type": /type/i, "item.title": /title|what (?:is|should .* be called)/i, "item.date": /date|which day/i, date: /date|which day/i, "item.start": /start|begin|from what time/i, start: /start|begin|from what time/i, "item.end": /end|finish|until|to what time/i, end: /end|finish|until|to what time/i, recurrence: /recurr|which days|how often/i, targetId: /which item|what item|which .* (?:move|change|cancel|delete|complete)/i, scope: /scope|which (?:items|date|week)/i, operation: /cancel or delete|which (?:action|method)/i, changes: /what .* change|which change/i, postponeMinutes: /how many minutes|how long/i };
+    const allowedMissing = new Set(["item.type", "item.title", "item.date", "item.start", "item.end", "type", "title", "date", "start", "end", "recurrence", "targetId", "changes", "postponeMinutes", "scope", "operation", "keepId"]);
+    for (const field of pending.missingFields) {
+      if (!allowedMissing.has(field)) return "invalid_clarification:unsupported_field";
+      const key = ({ "item.type": "type", "item.title": "title", "item.date": "date", "item.start": "start", "item.end": "end" })[field] || field;
+      if (pending.knownFields?.[key] !== undefined && pending.knownFields?.[key] !== null && pending.knownFields?.[key] !== "") return "invalid_clarification:field_already_known";
+      if (labels[field] && !labels[field].test(response.message || "")) return "invalid_clarification:unnamed_missing_field";
+    }
+    const currentMessage = [...conversation].reverse().find(entry => entry.role === "user")?.text || "";
+    const normalized = currentMessage.toLowerCase();
+    const times = [...normalized.matchAll(/\b(\d{1,2})(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?)\b/gi)];
+    const supplied = new Set();
+    if (/\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{4}-\d{2}-\d{2})\b/i.test(normalized)) supplied.add("date");
+    if (times.length) supplied.add("start");
+    if (times.length > 1 || /\bfrom\s+\d{1,2}\s+to\s+\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?)\b/i.test(normalized)) supplied.add("end");
+    if (/\b(for|to)\s+(?:a|an|the)\s+[a-z][\w -]{1,50}/i.test(normalized) || /\b(remind me to|meeting with|gym|studio session|rehearsal|practice|call)\b/i.test(normalized)) supplied.add("title");
+    if (pending.missingFields.some(field => supplied.has(({ "item.date": "date", "item.start": "start", "item.end": "end", "item.title": "title" })[field] || field))) return "complete_request_misclassified";
+  }
   const validateAction = action => {
     if (!action || !saGetAllowedActions().includes(action.type)) return "Unsupported action type";
     if (action.type === "create_item" && (!action.item || action.targetId || action.changes)) return "create_item requires item and forbids targetId and changes";
     if (action.type !== "create_item" && !action.targetId) return `${action.type} requires targetId`;
     if (action.type !== "create_item" && !saFindItemById(action.targetId)) return "Target item not found";
     if (action.type === "restore_item" && saFindItemById(action.targetId)?.status !== "cancelled") return "restore_item requires a cancelled item";
+    const completeness = evaluateActionCompleteness(action);
+    if (!completeness.complete) return `missing_required_field:${completeness.missingFields.join(",")}`;
     return saValidatePlanAction(action);
   };
   if (response.kind === "proposed_action") {
@@ -1094,6 +1149,12 @@ async function callGeminiEndpoint(message, planningRequest = false, priorContext
 function processGeminiResponse(response) {
   const validationError = validateGeminiResponse(response);
   if (validationError) {
+    if (response?.kind === "clarification") {
+      pendingClarification = null;
+      savePlanningContext();
+      if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") console.warn("Assistant clarification rejected", { reason: validationError });
+      return { message: "I could not identify what information is missing. Please try the request again.", items: [] };
+    }
     return {
       message: friendlyValidationMessage(validationError),
       items: []
@@ -1179,10 +1240,7 @@ function processGeminiResponse(response) {
 }
 
 function friendlyValidationMessage(reason) {
-  if (/target item not found|targetid/i.test(reason)) return "I understood that you want to change the schedule, but I could not safely identify a current item. Which item do you mean?";
-  if (/scope|bulk target/i.test(reason)) return "I could not safely resolve which schedule items are included. What date range or items should I use?";
-  if (/cancelled item/i.test(reason)) return "I can restore an item only after it has been cancelled. Which cancelled item should I bring back?";
-  return "I understood the schedule request, but need one more detail before I can prepare a safe proposal.";
+  return "I couldn't safely validate that schedule response. Please try the request again.";
 }
 
 function buildBulkProposalFromGeminiResponse(response) {
