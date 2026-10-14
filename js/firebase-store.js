@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-app.js";
 import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInAnonymously } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-auth.js";
-import { getFirestore, collection, doc, getDoc, getDocs, query, orderBy, limit, where, setDoc, updateDoc, writeBatch, serverTimestamp } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-firestore.js";
+import { getFirestore, collection, doc, getDoc, getDocs, query, orderBy, limit, where, setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp, arrayUnion } from "https://www.gstatic.com/firebasejs/13.0.0/firebase-firestore.js";
 import { MATSON_FIREBASE_CONFIG } from "./firebase-config.js";
 
 const app = initializeApp(MATSON_FIREBASE_CONFIG);
@@ -72,6 +72,7 @@ function cleanMessage(message) {
     text: String(message.text || ""),
     kind: message.kind || (message.role === "user" ? "user_message" : "assistant_message"),
     referencedItemIds: Array.isArray(message.referencedItemIds) ? [...new Set(message.referencedItemIds.filter(id => typeof id === "string"))] : [],
+    deletedItemIds: Array.isArray(message.deletedItemIds) ? [...new Set(message.deletedItemIds.filter(id => typeof id === "string"))] : [],
     proposalSummary: message.proposalSummary || null,
     resolved: message.resolved !== false,
     createdAt: message.createdAt || serverTimestamp()
@@ -97,13 +98,15 @@ export async function updateScheduleItem(id, changes) {
   const safeChanges = Object.fromEntries(Object.entries(changes).filter(([key]) => allowed.includes(key)));
   await updateDoc(ref, { ...safeChanges, id, updatedAt: serverTimestamp() });
 }
-export async function writeSchedulePlanBatch(nextItems, changedIds = nextItems.map(item => item.id)) {
-  if (changedIds.length > 450) throw new Error("Schedule plan exceeds the Firestore batch limit.");
+export async function deleteScheduleItem(id) { await deleteDoc(userDoc("scheduleItems", id)); }
+export async function writeSchedulePlanBatch(nextItems, changedIds = nextItems.map(item => item.id), deletedIds = []) {
+  if (changedIds.length + deletedIds.length > 450) throw new Error("Schedule operation exceeds the Firestore batch limit.");
   const batch = writeBatch(db);
   for (const id of changedIds) {
     const item = nextItems.find(candidate => candidate.id === id);
     if (item) batch.set(userDoc("scheduleItems", item.id), itemPayload(item, !item.createdAt), { merge: true });
   }
+  for (const id of deletedIds) batch.delete(userDoc("scheduleItems", id));
   await batch.commit();
 }
 export async function loadCategories() {
@@ -152,6 +155,7 @@ export async function loadConversation(id, max = 50) {
       text: typeof value.text === "string" ? value.text.slice(0, 4000) : "",
       kind: typeof value.kind === "string" ? value.kind.slice(0, 40) : "assistant_message",
       referencedItemIds: Array.isArray(value.referencedItemIds) ? value.referencedItemIds.filter(id => typeof id === "string").slice(0, 20) : [],
+      deletedItemIds: Array.isArray(value.deletedItemIds) ? value.deletedItemIds.filter(id => typeof id === "string").slice(0, 20) : [],
       proposalSummary: typeof value.proposalSummary === "string" ? value.proposalSummary.slice(0, 300) : null,
       resolved: value.resolved !== false, createdAt: value.createdAt || null
     };
@@ -182,6 +186,28 @@ export async function resolveUnresolvedProposals(conversationId) {
   messages.docs.forEach(entry => batch.update(entry.ref, { resolved: true }));
   await batch.commit();
 }
+export async function markConversationItemDeleted(conversationId, itemId) {
+  if (!conversationId || !itemId) return;
+  const messages = await getDocs(query(collection(userDoc("conversations", conversationId), "messages"), where("referencedItemIds", "array-contains", itemId), limit(450)));
+  if (messages.empty) return;
+  const batch = writeBatch(db);
+  messages.docs.forEach(entry => batch.update(entry.ref, { deletedItemIds: arrayUnion(itemId) }));
+  await batch.commit();
+}
+export async function markConversationItemsDeleted(conversationId, itemIds) {
+  const ids = [...new Set((itemIds || []).filter(id => typeof id === "string" && id))];
+  if (!conversationId || !ids.length) return;
+  const snapshots = await Promise.all(ids.map(id => getDocs(query(collection(userDoc("conversations", conversationId), "messages"), where("referencedItemIds", "array-contains", id), limit(450)))));
+  const refs = new Map();
+  snapshots.forEach((snapshot, index) => snapshot.docs.forEach(entry => {
+    if (!refs.has(entry.id)) refs.set(entry.id, []);
+    refs.get(entry.id).push(ids[index]);
+  }));
+  if (!refs.size || refs.size > 450) return;
+  const batch = writeBatch(db);
+  for (const [messageId, deletedIds] of refs) batch.update(doc(userDoc("conversations", conversationId), "messages", messageId), { deletedItemIds: arrayUnion(...deletedIds) });
+  await batch.commit();
+}
 export async function updateConversationSummary(id, { title, summary, keywords, status } = {}) {
   await updateDoc(userDoc("conversations", id), {
     ...(title !== undefined ? { title } : {}), ...(summary !== undefined ? { summary } : {}),
@@ -198,7 +224,7 @@ export async function searchConversationSummaries(keywords, max = 5) {
 
 export async function loadAssistantState() {
   const snapshot = await getDoc(userDoc("assistantState", "current"));
-  return snapshot.exists() ? snapshot.data() : { activeConversationId: null, pendingClarification: null, planningContext: null, entityRegistry: [] };
+  return snapshot.exists() ? snapshot.data() : { activeConversationId: null, pendingClarification: null, planningContext: null, entityRegistry: [], pendingOperation: null, referencedSets: [] };
 }
 export async function saveAssistantState(state) {
   const context = state.planningContext;
@@ -227,13 +253,32 @@ export async function saveAssistantState(state) {
     end: entity.end ? String(entity.end).slice(0, 5) : null, status: String(entity.status || "upcoming").slice(0, 30),
     lastAction: String(entity.lastAction || "updated").slice(0, 30),
     mentionedAs: Array.isArray(entity.mentionedAs) ? [...new Set(entity.mentionedAs.filter(value => typeof value === "string").map(value => value.slice(0, 120)))].slice(-8) : [],
-    updatedAt: String(entity.updatedAt || new Date().toISOString()).slice(0, 40)
+    updatedAt: String(entity.updatedAt || new Date().toISOString()).slice(0, 40),
+    ...(entity.deleted ? { deleted: true, deletedAt: String(entity.deletedAt || new Date().toISOString()).slice(0, 40) } : {}),
+    saved: entity.saved !== false, lastMentionedOrder: Number.isInteger(entity.lastMentionedOrder) ? entity.lastMentionedOrder : 0
+  })) : [];
+  const pendingOperation = state.pendingOperation && typeof state.pendingOperation === "object" ? {
+    intent: String(state.pendingOperation.intent || "").slice(0, 60),
+    targetIds: Array.isArray(state.pendingOperation.targetIds) ? [...new Set(state.pendingOperation.targetIds.filter(id => typeof id === "string"))].slice(0, 20) : [],
+    knownFields: state.pendingOperation.knownFields && typeof state.pendingOperation.knownFields === "object" ? Object.fromEntries(Object.entries(state.pendingOperation.knownFields).filter(([, value]) => ["string", "number", "boolean"].includes(typeof value)).slice(0, 12).map(([key, value]) => [key.slice(0, 40), String(value).slice(0, 160)])) : {},
+    missingFields: Array.isArray(state.pendingOperation.missingFields) ? state.pendingOperation.missingFields.slice(0, 8).map(value => String(value).slice(0, 40)) : [],
+    decisions: state.pendingOperation.decisions && typeof state.pendingOperation.decisions === "object" ? state.pendingOperation.decisions : {},
+    scope: state.pendingOperation.scope && typeof state.pendingOperation.scope === "object" ? state.pendingOperation.scope : null
+  } : null;
+  const referencedSets = Array.isArray(state.referencedSets) ? state.referencedSets.slice(-5).map(set => ({
+    alias: String(set.alias || "").slice(0, 100), targetIds: Array.isArray(set.targetIds) ? [...new Set(set.targetIds.filter(id => typeof id === "string"))].slice(0, 20) : [],
+    updatedAt: String(set.updatedAt || new Date().toISOString()).slice(0, 40)
   })) : [];
   await setDoc(userDoc("assistantState", "current"), {
     activeConversationId: state.activeConversationId || null,
     pendingClarification,
     planningContext,
     entityRegistry,
+    recentEntities: entityRegistry,
+    currentTopic: String(state.currentTopic || planningContext?.topic || "").slice(0, 160) || null,
+    referencedSets,
+    pendingOperation,
+    lastConfirmedAction: state.lastConfirmedAction && typeof state.lastConfirmedAction === "object" ? state.lastConfirmedAction : null,
     updatedAt: serverTimestamp()
   }, { merge: true });
 }
@@ -280,8 +325,8 @@ export function tokenizeKeywords(text) {
 
 export const firebaseStore = {
   observeAuthState, signInAnonymouslyWhenNeeded, getCurrentUser,
-  loadScheduleItems, createScheduleItem, updateScheduleItem, writeSchedulePlanBatch, loadCategories, createCategory, updateCategory,
-  createConversation, listRecentConversations, loadConversation, addConversationMessage, resolveUnresolvedProposals, updateConversationSummary, searchConversationSummaries,
+  loadScheduleItems, createScheduleItem, updateScheduleItem, deleteScheduleItem, writeSchedulePlanBatch, loadCategories, createCategory, updateCategory,
+  createConversation, listRecentConversations, loadConversation, addConversationMessage, resolveUnresolvedProposals, markConversationItemDeleted, markConversationItemsDeleted, updateConversationSummary, searchConversationSummaries,
   loadAssistantState, saveAssistantState, clearAssistantState,
   createMemory, updateMemory, listActiveMemories, searchMemories, tokenizeKeywords
 };

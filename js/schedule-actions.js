@@ -165,6 +165,28 @@ async function saCancelItem(id) {
   return { success: true, item: items[index] };
 }
 
+async function saRestoreItem(id) {
+  const index = items.findIndex(item => item.id === id);
+  if (index < 0 || items[index].status !== "cancelled") return { success: false, error: "Only a cancelled item can be restored." };
+  const restored = { ...items[index], status: "upcoming" };
+  try { await firebaseStore.updateScheduleItem(id, { status: "upcoming" }); }
+  catch { return { success: false, error: "Could not restore this item. Check your connection and retry." }; }
+  items[index] = restored;
+  triggerScheduleRender();
+  return { success: true, item: restored };
+}
+
+async function saDeleteItem(id) {
+  const index = items.findIndex(item => item.id === id);
+  if (index < 0) return { success: false, error: "Item no longer exists." };
+  const deleted = items[index];
+  try { await firebaseStore.deleteScheduleItem(id); }
+  catch { return { success: false, error: "Could not permanently delete this item. Check your connection and retry." }; }
+  items.splice(index, 1);
+  triggerScheduleRender();
+  return { success: true, item: deleted };
+}
+
 function saGetItemsForDate(dateStr) {
   return items.filter(item => item.date === dateStr);
 }
@@ -243,7 +265,59 @@ function saGetAvailableItemTypes() {
 }
 
 function saGetAllowedActions() {
-  return ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"];
+  return ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item", "restore_item", "delete_item"];
+}
+
+function saNormalizeTitle(title) { return String(title || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim(); }
+function saFindDuplicateGroups(scheduleItems = items) {
+  const groups = new Map();
+  for (const item of scheduleItems) {
+    const key = [saNormalizeTitle(item.title), item.date, item.start || "", item.end || "", item.type].join("|");
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  return [...groups.values()].filter(group => group.length > 1).map(group => ({
+    classification: "exact_duplicate",
+    items: group.sort((a, b) => {
+      const created = value => value?.toMillis?.() ?? (value ? new Date(value).getTime() : 0);
+      return created(a.createdAt) - created(b.createdAt);
+    })
+  }));
+}
+
+function saItemMatchesScope(item, scope) {
+  if (!scope || typeof scope !== "object") return false;
+  const type = scope.scopeType;
+  const today = localDateString(new Date());
+  const monday = parseLocalDate(today); monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+  const weekStart = localDateString(monday);
+  const weekEndDate = new Date(monday); weekEndDate.setDate(weekEndDate.getDate() + 6);
+  const weekEnd = localDateString(weekEndDate);
+  let start = scope.startDate || null;
+  let end = scope.endDate || start;
+  if (type === "today") start = end = today;
+  if (type === "tomorrow") { const date = parseLocalDate(today); date.setDate(date.getDate() + 1); start = end = localDateString(date); }
+  if (type === "current_week") { start = weekStart; end = weekEnd; }
+  if (type === "next_week") { const date = parseLocalDate(weekStart); date.setDate(date.getDate() + 7); start = localDateString(date); date.setDate(date.getDate() + 6); end = localDateString(date); }
+  if (type === "future") start = today;
+  if (type === "current_month") { start = `${today.slice(0, 7)}-01`; const date = parseLocalDate(start); date.setMonth(date.getMonth() + 1); date.setDate(0); end = localDateString(date); }
+  if (type === "absolutely_all") return true;
+  if (type === "all_active") return ["upcoming", "in-progress", "postponed", "overdue", "awaiting-check-in"].includes(item.status);
+  if (["completed", "missed", "cancelled"].includes(type) && item.status !== type) return false;
+  if (type === "overdue" && item.status !== "overdue") return false;
+  if (type === "future" && item.date < today) return false;
+  if (type === "routines" && item.type !== "routine") return false;
+  if (type === "tasks" && item.type !== "task") return false;
+  if (type === "activities" && item.type !== "activity") return false;
+  if (scope.statuses?.length && !scope.statuses.includes(item.status)) return false;
+  if (scope.itemTypes?.length && !scope.itemTypes.includes(item.type)) return false;
+  if (scope.categories?.length && !scope.categories.includes(item.category)) return false;
+  if (scope.titleQuery && !saNormalizeTitle(item.title).includes(saNormalizeTitle(scope.titleQuery))) return false;
+  if (start && item.date < start) return false;
+  if (end && item.date > end) return false;
+  if (!scope.includeCompleted && item.status === "completed") return false;
+  if (!scope.includeCancelled && item.status === "cancelled") return false;
+  return true;
 }
 
 function saGetRelevantItemsForContext(message, maxItems = 30) {
@@ -364,6 +438,8 @@ function saValidatePlanAction(action, scheduleItems = items) {
   const targetIndex = scheduleItems.findIndex(item => item.id === action.targetId);
   if (!action.targetId || targetIndex < 0) return "Plan target item no longer exists";
   const target = scheduleItems[targetIndex];
+  if (action.type === "restore_item") return target.status === "cancelled" ? null : "Only cancelled items can be restored";
+  if (action.type === "delete_item") return null;
   if (action.type === "update_item") {
     if (!action.changes || typeof action.changes !== "object") return "Update action is missing changes";
     const changes = Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined));
@@ -395,10 +471,12 @@ function saValidatePlanAction(action, scheduleItems = items) {
 }
 
 async function saApplyPlanAtomically(actions) {
-  if (!Array.isArray(actions) || !actions.length || actions.length > 5) return { success: false, error: "A plan must contain between one and five actions." };
+  if (!Array.isArray(actions) || !actions.length || actions.length > 20) return { success: false, error: "A plan must contain between one and twenty actions." };
   const original = items;
   const nextItems = original.map(item => ({ ...item }));
   const changedIds = new Set();
+  const deletedIds = new Set();
+  const deletedItems = [];
   const originalConflictKeys = new Set(saScheduleConflictKeys(original));
 
   for (const action of actions) {
@@ -417,6 +495,7 @@ async function saApplyPlanAtomically(actions) {
 
     const index = nextItems.findIndex(item => item.id === action.targetId);
     const target = nextItems[index];
+    if (action.type === "delete_item") { deletedIds.add(target.id); deletedItems.push({ ...target }); nextItems.splice(index, 1); continue; }
     if (action.type === "update_item") {
       const changes = Object.fromEntries(Object.entries(action.changes).filter(([, value]) => value !== null && value !== undefined));
       nextItems[index] = { ...target, ...changes };
@@ -425,6 +504,7 @@ async function saApplyPlanAtomically(actions) {
     else if (action.type === "complete_item") nextItems[index] = { ...target, status: "completed" };
     else if (action.type === "mark_missed") nextItems[index] = { ...target, status: "missed" };
     else if (action.type === "cancel_item") nextItems[index] = { ...target, status: "cancelled" };
+    else if (action.type === "restore_item") nextItems[index] = { ...target, status: "upcoming" };
     else if (action.type === "postpone_item") {
       const start = parseLocalDate(target.date);
       const [sh, sm] = target.start.split(":").map(Number);
@@ -445,13 +525,49 @@ async function saApplyPlanAtomically(actions) {
   if (introducedConflicts.length) return { success: false, error: "This plan would create a new schedule conflict." };
 
   try {
-    await firebaseStore.writeSchedulePlanBatch(nextItems, [...changedIds]);
+    await firebaseStore.writeSchedulePlanBatch(nextItems, [...changedIds], [...deletedIds]);
   } catch {
     return { success: false, error: "The plan could not be saved. No schedule changes were applied." };
   }
   items = nextItems;
   triggerScheduleRender();
-  return { success: true, items: nextItems, changedItems: nextItems.filter(item => changedIds.has(item.id)) };
+  return { success: true, items: nextItems, changedItems: nextItems.filter(item => changedIds.has(item.id)), deletedIds: [...deletedIds], deletedItems };
+}
+
+async function saApplyBulkAtomically(bulkAction) {
+  if (!bulkAction || !Array.isArray(bulkAction.targetIds) || !bulkAction.targetIds.length || bulkAction.targetIds.length > 450) return { success: false, error: "The bulk operation has no valid targets or exceeds the batch limit." };
+  const freshItems = await firebaseStore.loadScheduleItems().catch(() => null);
+  if (!freshItems) return { success: false, error: "Could not revalidate the current schedule." };
+  const ids = [...new Set(bulkAction.targetIds)];
+  const selected = ids.map(id => freshItems.find(item => item.id === id));
+  if (selected.some(item => !item) || ids.length !== bulkAction.affectedCount) return { success: false, error: "The schedule changed after this proposal. Review it again." };
+  if (selected.some(item => !saItemMatchesScope(item, bulkAction.scope))) return { success: false, error: "One or more items no longer match this scope." };
+  const action = bulkAction.type;
+  const normalizedAction = action === "deduplicate_items" ? "delete_items" : action;
+  if (!["cancel_items", "delete_items", "complete_items", "reschedule_items", "update_items"].includes(normalizedAction)) return { success: false, error: "This bulk operation is not supported." };
+  if (normalizedAction === "cancel_items" && selected.some(item => ["cancelled", "completed"].includes(item.status))) return { success: false, error: "A selected item cannot be cancelled in its current state." };
+  if (normalizedAction === "complete_items" && selected.some(item => ["completed", "cancelled"].includes(item.status))) return { success: false, error: "A selected item cannot be completed in its current state." };
+  if (normalizedAction === "reschedule_items" && selected.some(item => item.type !== "activity")) return { success: false, error: "All selected items must be activities to reschedule them together." };
+  const targetIds = new Set(ids);
+  const nextItems = freshItems.map(item => {
+    if (!targetIds.has(item.id)) return item;
+    if (normalizedAction === "cancel_items") return { ...item, status: "cancelled" };
+    if (normalizedAction === "complete_items") return { ...item, status: "completed" };
+    if (["update_items", "reschedule_items"].includes(normalizedAction)) return { ...item, ...(bulkAction.changes || {}) };
+    return item;
+  });
+  const deletedIds = normalizedAction === "delete_items" ? ids : [];
+  const keptItems = normalizedAction === "delete_items" ? nextItems.filter(item => !targetIds.has(item.id)) : nextItems;
+  for (const item of selected) if (normalizedAction === "reschedule_items" || normalizedAction === "update_items") {
+    const updated = keptItems.find(candidate => candidate.id === item.id);
+    const validationError = scheduleValidateItem(updated);
+    if (validationError) return { success: false, error: validationError };
+  }
+  try { await firebaseStore.writeSchedulePlanBatch(keptItems, normalizedAction === "delete_items" ? [] : ids, deletedIds); }
+  catch { return { success: false, error: "The bulk change could not be saved. No items were changed." }; }
+  items = keptItems;
+  triggerScheduleRender();
+  return { success: true, items: selected, changedItems: keptItems.filter(item => targetIds.has(item.id)), deletedIds };
 }
 
 function saScheduleConflictKeys(scheduleItems) {

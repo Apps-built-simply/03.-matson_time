@@ -22,10 +22,13 @@ const assistantEls = {
 };
 
 let voiceNoticeTimer = null;
-let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ role: message.role, text: message.text, kind: message.kind, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [] })) : [];
+let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ role: message.role, text: message.text, kind: message.kind, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [], deletedItemIds: message.deletedItemIds || [] })) : [];
 let activeConversationId = window.initialConversation?.id || window.initialAssistantState?.activeConversationId || null;
 let pendingClarification = window.initialAssistantState?.pendingClarification || null;
 let entityRegistry = Array.isArray(window.initialAssistantState?.entityRegistry) ? window.initialAssistantState.entityRegistry.slice(-10) : [];
+let pendingOperation = window.initialAssistantState?.pendingOperation || null;
+let referencedSets = Array.isArray(window.initialAssistantState?.referencedSets) ? window.initialAssistantState.referencedSets.slice(-5) : [];
+let lastConfirmedAction = window.initialAssistantState?.lastConfirmedAction || null;
 let currentProposal = null;
 let activePlanningContext = window.initialAssistantState?.planningContext || null;
 let planningTopicResolved = false;
@@ -37,7 +40,7 @@ function loadPendingMessageWrites() {
   catch { return []; }
 }
 function savePlanningContext() {
-  firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry }).catch(showPersistenceFailure);
+  firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction, currentTopic: activePlanningContext?.topic || pendingOperation?.intent || null }).catch(showPersistenceFailure);
 }
 function rememberScheduleEntity(item, lastAction = "updated", mentions = []) {
   if (!item?.id) return;
@@ -46,7 +49,9 @@ function rememberScheduleEntity(item, lastAction = "updated", mentions = []) {
   entityRegistry = [...entityRegistry.filter(entry => entry.id !== item.id), {
     entityType: "schedule_item", id: item.id, title: item.title, type: item.type,
     date: item.date || null, start: item.start || null, end: item.end || null,
-    status: item.status || "upcoming", lastAction, mentionedAs, updatedAt: new Date().toISOString()
+    status: item.status || "upcoming", lastAction, mentionedAs, updatedAt: new Date().toISOString(),
+    saved: true, deleted: lastAction === "deleted", ...(lastAction === "deleted" ? { deletedAt: new Date().toISOString() } : {}),
+    lastMentionedOrder: conversation.length
   }].slice(-10);
 }
 function saveConversation() { /* Conversation writes are queued by appendEntry. */ }
@@ -54,7 +59,7 @@ function saveConversation() { /* Conversation writes are queued by appendEntry. 
 async function ensureConversation() {
   if (activeConversationId) return activeConversationId;
   activeConversationId = await firebaseStore.createConversation({ title: "New conversation", status: "active" });
-  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext });
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
   await refreshRecentConversationList();
   return activeConversationId;
 }
@@ -91,20 +96,20 @@ async function getRecallContext(text) {
   try {
     const [matches, memories] = await Promise.all([
       firebaseStore.searchConversationSummaries(keywords, 5),
-      firebaseStore.searchMemories(keywords, 5)
+      firebaseStore.searchMemories(keywords, 10)
     ]);
     const conversations = [];
-    for (const match of matches.slice(0, 3)) {
+    for (const match of matches.slice(0, 5)) {
       const loaded = await firebaseStore.loadConversation(match.id, 8);
       const relevant = loaded.messages.filter(message => {
         const words = new Set(firebaseStore.tokenizeKeywords(message.text));
         return keywords.some(word => words.has(word));
-      }).slice(-3).map(message => ({ role: message.role, text: String(message.text).slice(0, 220) }));
-      conversations.push({ title: String(match.title || "").slice(0, 80), summary: String(match.summary || "").slice(0, 300), messages: relevant });
+      }).slice(-2).map(message => ({ role: message.role, text: String(message.text).slice(0, 140) }));
+      conversations.push({ title: String(match.title || "").slice(0, 80), summary: String(match.summary || "").slice(0, 180), messages: relevant });
     }
     return {
       conversations,
-      memories: memories.map(memory => ({ type: String(memory.type || ""), text: String(memory.text || "").slice(0, 240) }))
+      memories: memories.slice(0, 10).map(memory => ({ type: String(memory.type || "").slice(0, 50), text: String(memory.text || "").slice(0, 180) }))
     };
   } catch (error) {
     console.error("Conversation recall failed", { name: error?.name || "Error", message: String(error?.message || error) });
@@ -122,6 +127,9 @@ async function startNewConversation() {
   pendingClarification = null;
   currentProposal = null;
   activePlanningContext = null;
+  pendingOperation = null;
+  referencedSets = [];
+  entityRegistry = [];
   await firebaseStore.clearAssistantState();
   renderConversation();
   await refreshRecentConversationList();
@@ -147,7 +155,8 @@ async function openConversation(id) {
       text: message.text,
       kind: message.kind,
       resolved: message.resolved !== false,
-      referencedItemIds: message.referencedItemIds || []
+      referencedItemIds: message.referencedItemIds || [],
+      deletedItemIds: message.deletedItemIds || []
     }));
     currentProposal = null;
     const state = await firebaseStore.loadAssistantState();
@@ -155,7 +164,10 @@ async function openConversation(id) {
     pendingClarification = isActive ? state.pendingClarification : null;
     activePlanningContext = isActive ? state.planningContext : null;
     entityRegistry = isActive && Array.isArray(state.entityRegistry) ? state.entityRegistry.slice(-10) : [];
-    await firebaseStore.saveAssistantState({ activeConversationId: id, pendingClarification, planningContext: activePlanningContext, entityRegistry });
+    pendingOperation = isActive ? state.pendingOperation || null : null;
+    referencedSets = isActive && Array.isArray(state.referencedSets) ? state.referencedSets.slice(-5) : [];
+    lastConfirmedAction = isActive ? state.lastConfirmedAction || null : null;
+    await firebaseStore.saveAssistantState({ activeConversationId: id, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
     renderConversation();
   } catch (error) {
     showPersistenceFailure();
@@ -194,7 +206,9 @@ function appendEntry(entry) {
   const message = {
     id: crypto.randomUUID(),
     role: entry.role, text: entry.text, kind: entry.kind || (entry.role === "user" ? "user_message" : "assistant_message"),
-    referencedItemIds: entry.referencedItemIds || [], proposalSummary: entry.proposalSummary || null,
+    referencedItemIds: entry.referencedItemIds || [],
+    deletedItemIds: entityRegistry.filter(entity => entity.deleted && (entry.referencedItemIds || []).includes(entity.id)).map(entity => entity.id),
+    proposalSummary: entry.proposalSummary || null,
     resolved: entry.resolved !== false
   };
   pendingMessageWrites.push({ conversationId: activeConversationId, message });
@@ -263,7 +277,31 @@ function renderProposal(proposal) {
   const details = document.createElement("div");
   details.className = "proposal-details";
 
-  if (proposal.plan) {
+  if (proposal.bulkAction) {
+    const bulk = proposal.bulkAction;
+    const scope = bulk.scope || {};
+    addDetailRow(details, "Scope", `${scopeLabel(scope)} · ${bulk.affectedCount} item${bulk.affectedCount === 1 ? "" : "s"}`);
+    addDetailRow(details, "Operation", bulkOperationLabel(bulk.type));
+    const list = document.createElement("ul");
+    if (bulk.items?.length > 10) {
+      const disclosure = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = `Previewing 5 of ${bulk.items.length}; inspect full list`;
+      disclosure.appendChild(summary);
+      for (const item of bulk.items.slice(0, 5)) { const row = document.createElement("p"); row.textContent = `${item.title} · ${formatDateLabel(item.date)}${item.start ? ` · ${formatTime(item.start)}${item.end ? `–${formatTime(item.end)}` : ""}` : ""}`; disclosure.appendChild(row); }
+      const fullList = document.createElement("ul");
+      for (const item of bulk.items) { const row = document.createElement("li"); row.textContent = `${item.title} · ${formatDateLabel(item.date)}${item.start ? ` · ${formatTime(item.start)}${item.end ? `–${formatTime(item.end)}` : ""}` : ""}${item.type === "routine" ? " · Routine" : ""}`; fullList.appendChild(row); }
+      disclosure.appendChild(fullList);
+      details.appendChild(disclosure);
+    }
+    const visibleItems = bulk.items?.length > 10 ? bulk.items.slice(0, 5) : (bulk.items || []);
+    for (const item of visibleItems) {
+      const row = document.createElement("li");
+      row.textContent = `${item.title} · ${formatDateLabel(item.date)}${item.start ? ` · ${formatTime(item.start)}${item.end ? `–${formatTime(item.end)}` : ""}` : ""}${item.type === "routine" ? " · Routine" : ""}`;
+      list.appendChild(row);
+    }
+    if (bulk.items?.length <= 10) details.appendChild(list);
+  } else if (proposal.plan) {
     renderPlanDetails(details, proposal);
   } else if (proposal.action?.item) {
     const item = proposal.action.item;
@@ -272,16 +310,24 @@ function renderProposal(proposal) {
     if (item.start) addDetailRow(details, "Start", item.start);
     if (item.end) addDetailRow(details, "End", item.end);
     addDetailRow(details, "Category", item.category);
-    if (proposal.conflict) {
-      const conflictRow = document.createElement("div");
-      conflictRow.className = "conflict";
-      conflictEl = document.createElement("strong");
-      conflictEl.textContent = "Schedule conflict:";
-      conflictRow.appendChild(conflictEl);
-      const conflictText = document.createTextNode(` ${proposal.conflict.items.join(" and ")} overlap.`);
-      conflictRow.appendChild(conflictText);
-      details.appendChild(conflictRow);
+  } else if (proposal.action?.targetId) {
+    const target = saFindItemById(proposal.action.targetId) || proposal.originalItem;
+    if (target) {
+      addDetailRow(details, "Item", target.title);
+      addDetailRow(details, "Date", formatDateLabel(target.date));
+      if (target.start) addDetailRow(details, "Current time", `${formatTime(target.start)}${target.end ? `–${formatTime(target.end)}` : ""}`);
     }
+    if (proposal.action.type === "delete_item") addDetailRow(details, "Warning", "Permanent deletion cannot be undone through normal app controls.");
+  }
+
+  if (proposal.conflict) {
+    const conflictRow = document.createElement("div");
+    conflictRow.className = "conflict";
+    const conflictTitle = document.createElement("strong");
+    conflictTitle.textContent = "Schedule conflict:";
+    conflictRow.appendChild(conflictTitle);
+    conflictRow.appendChild(document.createTextNode(` ${proposal.conflict.items.join(" and ")} overlap.`));
+    details.appendChild(conflictRow);
   }
 
   if (proposal.action?.changes) {
@@ -292,21 +338,9 @@ function renderProposal(proposal) {
       const nextEnd = proposal.action.changes.end || proposal.originalItem.end;
       addDetailRow(details, "Proposed", `${formatDateLabel(nextDate)} · ${formatTime(nextStart)}–${formatTime(nextEnd)}`);
     }
-    const changesEl = document.createElement("div");
-    changesEl.className = "proposal-changes";
-    const changesTitle = document.createElement("strong");
-    changesTitle.textContent = "Changed fields:";
-    changesEl.appendChild(changesTitle);
-    const list = document.createElement("ul");
-    list.className = "change-list";
-    for (const [field, value] of Object.entries(proposal.action.changes)) {
-      if (value === null || value === undefined) continue;
-      const li = document.createElement("li");
-      li.textContent = `${field}: ${value}`;
-      list.appendChild(li);
-    }
-    changesEl.appendChild(list);
-    details.appendChild(changesEl);
+    const changes = proposal.action.changes;
+    const labels = { title: "New title", date: "New date", start: "New start", end: "New end", category: "Category", notes: "Notes", status: "Status" };
+    for (const [field, label] of Object.entries(labels)) if (changes[field] != null && !(field === "date" && (changes.start || changes.end))) addDetailRow(details, label, field === "date" ? formatDateLabel(changes[field]) : changes[field]);
   }
 
   if (proposal.action?.postponeMinutes) {
@@ -319,11 +353,12 @@ function renderProposal(proposal) {
   actionsEl.className = "proposal-actions";
   const confirmBtn = document.createElement("button");
   confirmBtn.className = "primary-button";
-  confirmBtn.textContent = proposal.plan ? "Confirm plan" : "Confirm";
+  const planDeletes = proposal.plan?.actions?.some(action => action.type === "delete_item");
+  confirmBtn.textContent = proposal.bulkAction?.type === "delete_items" || proposal.bulkAction?.type === "deduplicate_items" || proposal.action?.type === "delete_item" ? "Delete permanently" : planDeletes ? "Confirm plan with permanent deletion" : proposal.plan ? "Confirm plan" : "Confirm";
   confirmBtn.dataset.action = "confirm";
   const editBtn = document.createElement("button");
   editBtn.className = "secondary-button";
-  editBtn.textContent = "Edit";
+  editBtn.textContent = proposal.bulkAction ? "Edit scope" : "Edit";
   editBtn.dataset.action = "edit";
   const cancelBtn = document.createElement("button");
   cancelBtn.className = "secondary-button";
@@ -349,11 +384,12 @@ function renderPlanDetails(container, proposal) {
     const entry = document.createElement("li");
     entry.className = "plan-action-item";
     const title = document.createElement("strong");
-    title.textContent = item.title || action.changes?.title || action.type.replaceAll("_", " ");
+    title.textContent = item.title || action.changes?.title || actionLabel(action.type);
     entry.appendChild(title);
     const details = document.createElement("p");
     details.textContent = `${item.date ? formatDateLabel(item.date) : "Date not specified"}${item.start ? ` · ${formatTime(item.start)}${item.end ? `–${formatTime(item.end)}` : ""}` : " · Anytime"}${item.category ? ` · ${item.category}` : ""}`;
     entry.appendChild(details);
+    if (action.type === "delete_item") { const warning = document.createElement("small"); warning.textContent = "Permanent deletion cannot be undone through normal app controls."; entry.appendChild(warning); }
     const editor = document.createElement("div");
     editor.className = "plan-editor";
     editor.hidden = true;
@@ -412,7 +448,26 @@ function addDetailRow(container, label, value) {
   container.appendChild(row);
 }
 
+function scopeLabel(scope) {
+  const labels = { today: "Today", tomorrow: "Tomorrow", current_week: "This week", next_week: "Next week", current_month: "This month", future: "Upcoming", overdue: "Overdue", completed: "Completed items", missed: "Missed items", cancelled: "Cancelled items", routines: "Routines", tasks: "Tasks", activities: "Activities", all_active: "All active upcoming items", absolutely_all: "All schedule history", specific_date: scope.startDate || "Selected date", date_range: `${scope.startDate || "Start"}–${scope.endDate || "End"}`, category: scope.categories?.join(", ") || "Selected category", title_match: scope.titleQuery || "Title match", referenced_items: "Referenced items", selected_item: "Selected items", current_item: "Current item" };
+  return labels[scope.scopeType] || "Selected schedule scope";
+}
+
+function bulkOperationLabel(type) {
+  if (type === "delete_items" || type === "deduplicate_items") return "Permanently delete selected items. This cannot be undone through normal app controls.";
+  if (type === "cancel_items") return "Cancel selected items and keep their history.";
+  if (type === "complete_items") return "Mark selected items completed.";
+  if (type === "reschedule_items") return "Reschedule selected items.";
+  if (type === "update_items") return "Update selected items.";
+  return "Change selected schedule items.";
+}
+
+function actionLabel(type) {
+  return ({ create_item: "Create an item", update_item: "Update an item", reschedule_item: "Reschedule an item", postpone_item: "Postpone an item", complete_item: "Complete an item", mark_missed: "Mark an item missed", cancel_item: "Cancel an item", restore_item: "Restore an item", delete_item: "Permanently delete an item" })[type] || "Schedule change";
+}
+
 function getProposalTitle(proposal) {
+  if (proposal.bulkAction) return proposal.bulkAction.type === "delete_items" || proposal.bulkAction.type === "deduplicate_items" ? "Permanent schedule deletion" : "Bulk schedule change";
   if (proposal.plan) return proposal.plan.title || "Proposed plan";
   const actionType = proposal.action?.type;
   switch (actionType) {
@@ -423,6 +478,8 @@ function getProposalTitle(proposal) {
     case "complete_item": return "Propose complete";
     case "mark_missed": return "Propose mark missed";
     case "cancel_item": return "Propose cancel";
+    case "restore_item": return "Restore cancelled item";
+    case "delete_item": return "Permanently delete item";
     default: return "Proposed action";
   }
 }
@@ -879,7 +936,7 @@ function getDirectActionTarget() {
 
 function validateGeminiResponse(response) {
   if (!response || typeof response !== "object") return "Invalid response format";
-  if (!["answer", "clarification", "proposed_action", "plan_proposal", "no_action", "error"].includes(response.kind)) {
+  if (!["answer", "clarification", "proposed_action", "plan_proposal", "bulk_proposal", "no_action", "error"].includes(response.kind)) {
     return "Unsupported response kind";
   }
   if (!Object.prototype.hasOwnProperty.call(response, "planningContext")) return "Missing planning context";
@@ -889,6 +946,7 @@ function validateGeminiResponse(response) {
     if (action.type === "create_item" && (!action.item || action.targetId || action.changes)) return "create_item requires item and forbids targetId and changes";
     if (action.type !== "create_item" && !action.targetId) return `${action.type} requires targetId`;
     if (action.type !== "create_item" && !saFindItemById(action.targetId)) return "Target item not found";
+    if (action.type === "restore_item" && saFindItemById(action.targetId)?.status !== "cancelled") return "restore_item requires a cancelled item";
     return saValidatePlanAction(action);
   };
   if (response.kind === "proposed_action") {
@@ -897,7 +955,7 @@ function validateGeminiResponse(response) {
     if (error) return error;
   }
   if (response.kind === "plan_proposal") {
-    if (!response.requiresConfirmation || response.action !== null || !response.plan || typeof response.plan.title !== "string" || !Array.isArray(response.plan.actions) || response.plan.actions.length < 2 || response.plan.actions.length > 5) return "Invalid plan proposal";
+    if (!response.requiresConfirmation || response.action !== null || !response.plan || typeof response.plan.title !== "string" || !Array.isArray(response.plan.actions) || response.plan.actions.length < 2 || response.plan.actions.length > 20) return "Invalid plan proposal";
     const duplicateKeys = new Set();
     for (const action of response.plan.actions) {
       const error = validateAction(action);
@@ -906,6 +964,13 @@ function validateGeminiResponse(response) {
       if (duplicateKeys.has(key)) return "Plan contains duplicate actions";
       duplicateKeys.add(key);
     }
+  }
+  if (response.kind === "bulk_proposal") {
+    const bulk = response.bulkAction;
+    if (!response.requiresConfirmation || response.action !== null || response.plan !== null || !bulk || !Array.isArray(bulk.targetIds) || !bulk.targetIds.length || new Set(bulk.targetIds).size !== bulk.targetIds.length || bulk.affectedCount !== bulk.targetIds.length) return "Invalid bulk proposal";
+    if (!bulk.scope || !["cancel_items", "delete_items", "complete_items", "reschedule_items", "update_items", "deduplicate_items"].includes(bulk.type)) return "Bulk operation and scope are required";
+    const targets = bulk.targetIds.map(id => saFindItemById(id));
+    if (targets.some(item => !item || !saItemMatchesScope(item, bulk.scope))) return "Bulk targets no longer match the requested scope";
   }
   return null;
 }
@@ -933,20 +998,42 @@ async function callGeminiEndpoint(message, planningRequest = false, priorContext
     durations: scheduled.map(item => ({ id: item.id, minutes: toMinutes(item.end) - toMinutes(item.start) })),
     gaps: scheduled.slice(1).filter((item, index) => item.date === scheduled[index].date).map((item, index) => ({ afterId: scheduled[index].id, beforeId: item.id, minutes: toMinutes(item.start) - toMinutes(scheduled[index].end) })),
     conflicts: scheduled.flatMap((item, index) => scheduled.slice(index + 1).filter(next => next.date === item.date && next.start < item.end).map(next => ({ date: item.date, itemIds: [item.id, next.id] }))),
-    postponementHistory: relevantItems.filter(item => item.postponed > 0).map(item => ({ id: item.id, count: item.postponed }))
+    postponementHistory: relevantItems.filter(item => item.postponed > 0).map(item => ({ id: item.id, count: item.postponed })),
+    candidateTimeSlots: (() => {
+      const byDate = new Map();
+      for (const item of scheduled) { if (!byDate.has(item.date)) byDate.set(item.date, []); byDate.get(item.date).push(item); }
+      const slots = [];
+      for (const [date, dayItems] of byDate) {
+        let cursor = date === today && currentTime > "08:00" ? currentTime : "08:00";
+        for (const item of dayItems) {
+          if (item.start > cursor) {
+            const minutes = toMinutes(item.start) - toMinutes(cursor);
+            if (minutes >= 30) slots.push({ date, start: cursor, end: item.start, minutes });
+          }
+          if (item.end > cursor) cursor = item.end;
+        }
+        if (cursor < "20:00") {
+          const minutes = toMinutes("20:00") - toMinutes(cursor);
+          if (minutes >= 30) slots.push({ date, start: cursor, end: "20:00", minutes });
+        }
+      }
+      return slots.slice(0, 10);
+    })()
   };
 
   const requestBody = {
-    message: message.trim(),
+    message: message.trim().slice(0, 1200),
     context: relevantItems,
     conversationContext: {
       conversationId: activeConversationId,
-      summary: conversation.slice(-8).map(entry => `${entry.role}: ${String(entry.text || "").slice(0, 160)}`).join(" ").slice(-700),
+      summary: "",
       latestMessages,
       currentTopic: activePlanningContext?.topic || null,
       continuesPreviousTopic: conversation.length > 1 && conversation[conversation.length - 2]?.role === "assistant",
       recentEntities: entityRegistry.slice(-10)
     },
+    pendingOperation,
+    referencedSets,
     pendingClarification: pendingClarification,
     compactFacts: compactFacts,
     calculatedFacts,
@@ -954,11 +1041,14 @@ async function callGeminiEndpoint(message, planningRequest = false, priorContext
     priorContext
   };
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), MATSON_CONFIG.assistantTimeoutMs);
   try {
     const response = await fetch(MATSON_CONFIG.assistantEndpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody)
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
     });
 
     if (!response.ok) {
@@ -971,7 +1061,10 @@ async function callGeminiEndpoint(message, planningRequest = false, priorContext
 
     return await response.json();
   } catch {
+    if (controller.signal.aborted) return { kind: "error", message: "The schedule assistant took too long to respond. Please try again." };
     return { kind: "error", message: "The schedule language service is not connected in this preview." };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -979,7 +1072,7 @@ function processGeminiResponse(response) {
   const validationError = validateGeminiResponse(response);
   if (validationError) {
     return {
-      message: "I had trouble understanding that request.",
+      message: friendlyValidationMessage(validationError),
       items: []
     };
   }
@@ -1034,6 +1127,11 @@ function processGeminiResponse(response) {
         proposal: buildPlanProposalFromGeminiResponse(response)
       };
 
+    case "bulk_proposal":
+      pendingClarification = null;
+      persistResponseState();
+      return { message: response.message || "Review the selected schedule items.", items: [], proposal: buildBulkProposalFromGeminiResponse(response) };
+
     case "no_action":
       pendingClarification = null;
       persistResponseState();
@@ -1055,6 +1153,19 @@ function processGeminiResponse(response) {
         items: []
       };
   }
+}
+
+function friendlyValidationMessage(reason) {
+  if (/target item not found|targetid/i.test(reason)) return "I understood that you want to change the schedule, but I could not safely identify a current item. Which item do you mean?";
+  if (/scope|bulk target/i.test(reason)) return "I could not safely resolve which schedule items are included. What date range or items should I use?";
+  if (/cancelled item/i.test(reason)) return "I can restore an item only after it has been cancelled. Which cancelled item should I bring back?";
+  return "I understood the schedule request, but need one more detail before I can prepare a safe proposal.";
+}
+
+function buildBulkProposalFromGeminiResponse(response) {
+  const bulkAction = response.bulkAction;
+  const items = bulkAction.targetIds.map(id => saFindItemById(id)).filter(Boolean).map(item => ({ ...item }));
+  return { id: crypto.randomUUID(), bulkAction: { ...bulkAction, items }, message: response.message || "Review these schedule changes before confirming.", source: "gemini" };
 }
 
 function buildProposalFromGeminiResponse(response) {
@@ -1108,6 +1219,174 @@ function renderProposalMessage(text) {
   assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
 }
 
+function parseCommandTime(text) {
+  const match = /\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b/i.exec(text);
+  if (!match) return null;
+  let hour = Number(match[1]) % 12;
+  if (match[3].toLowerCase() === "pm") hour += 12;
+  return String(hour).padStart(2, "0") + ":" + (match[2] || "00");
+}
+
+function makeScope(scopeType, extra = {}) {
+  const today = localDateString(new Date());
+  const scope = { scopeType, startDate: null, endDate: null, statuses: ["upcoming", "in-progress", "postponed", "overdue", "awaiting-check-in"], itemTypes: [], categories: [], titleQuery: null, includeCompleted: false, includeCancelled: false, ...extra };
+  if (scopeType === "today") scope.startDate = scope.endDate = today;
+  if (scopeType === "tomorrow") { const date = parseLocalDate(today); date.setDate(date.getDate() + 1); scope.startDate = scope.endDate = localDateString(date); }
+  if (scopeType === "specific_date" && scope.startDate) scope.endDate = scope.startDate;
+  if (scopeType === "current_week" || scopeType === "next_week") {
+    const start = parseLocalDate(today); start.setDate(start.getDate() - ((start.getDay() + 6) % 7) + (scopeType === "next_week" ? 7 : 0));
+    const end = new Date(start); end.setDate(end.getDate() + 6); scope.startDate = localDateString(start); scope.endDate = localDateString(end);
+  }
+  if (scopeType === "current_month") { scope.startDate = today.slice(0, 7) + "-01"; const end = parseLocalDate(scope.startDate); end.setMonth(end.getMonth() + 1); end.setDate(0); scope.endDate = localDateString(end); }
+  if (["completed", "missed", "cancelled", "overdue"].includes(scopeType)) { scope.statuses = [scopeType]; scope.includeCompleted = scopeType === "completed"; scope.includeCancelled = scopeType === "cancelled"; }
+  if (scopeType === "all_active") scope.statuses = ["upcoming", "in-progress", "postponed", "overdue", "awaiting-check-in"];
+  if (scopeType === "absolutely_all") { scope.statuses = []; scope.includeCompleted = true; scope.includeCancelled = true; }
+  return scope;
+}
+
+function inferBulkScope(text) {
+  const lower = text.toLowerCase();
+  const explicitDate = /\b(\d{4}-\d{2}-\d{2})\b/.exec(lower)?.[1];
+  let scopeType = null;
+  if (/\b(today|this day|the day)\b/.test(lower)) scopeType = "today";
+  else if (/\btomorrow\b/.test(lower)) scopeType = "tomorrow";
+  else if (/\bnext week\b/.test(lower)) scopeType = "next_week";
+  else if (/\b(this week|the week)\b/.test(lower)) scopeType = "current_week";
+  else if (/\bthis month\b/.test(lower)) scopeType = "current_month";
+  else if (explicitDate) scopeType = "specific_date";
+  else if (/\boverdue\b/.test(lower)) scopeType = "overdue";
+  else if (/\bcompleted|done\b/.test(lower)) scopeType = "completed";
+  else if (/\bmissed|skipped\b/.test(lower)) scopeType = "missed";
+  else if (/\bcancelled|canceled\b/.test(lower)) scopeType = "cancelled";
+  else if (/\broutines?\b/.test(lower)) scopeType = "routines";
+  else if (/\btasks?\b/.test(lower)) scopeType = "tasks";
+  else if (/\bactivities\b/.test(lower)) scopeType = "activities";
+  else if (/\b(future|upcoming|active)\b/.test(lower)) scopeType = "all_active";
+  else if (/\b(all|everything|every)\b/.test(lower)) scopeType = "absolutely_all";
+  if (!scopeType) return null;
+  const scope = makeScope(scopeType, explicitDate ? { startDate: explicitDate, endDate: explicitDate } : {});
+  if (/\bcompleted\b/.test(lower) && scopeType !== "completed") { scope.statuses = ["completed"]; scope.includeCompleted = true; }
+  if (/\bcancelled|canceled\b/.test(lower) && scopeType !== "cancelled") { scope.statuses = ["cancelled"]; scope.includeCancelled = true; }
+  if (/\broutines?\b/.test(lower)) scope.itemTypes = ["routine"];
+  else if (/\btasks?\b/.test(lower)) scope.itemTypes = ["task"];
+  else if (/\bactivities\b/.test(lower)) scope.itemTypes = ["activity"];
+  const title = /\b(gym|studio|meeting|practice|rehearsal)\b/.exec(lower)?.[1];
+  if (title) scope.titleQuery = title;
+  return scope;
+}
+
+function presentBulkProposal(type, scope, selected, message) {
+  if (!selected.length) { appendEntry({ role: "assistant", text: "I couldn't find items in that scope." }); return; }
+  if (selected.length > 450) { appendEntry({ role: "assistant", text: "That scope is too large for one safe batch. Narrow the date range or item type first." }); return; }
+  currentProposal = { id: crypto.randomUUID(), bulkAction: { type, scope, targetIds: selected.map(item => item.id), affectedCount: selected.length, items: selected.map(item => ({ ...item })) }, message, source: "local" };
+  renderProposalMessage(message); renderProposal(currentProposal);
+  appendEntry({ role: "assistant", text: message, kind: "proposal_summary", proposalSummary: message, resolved: false, referencedItemIds: selected.map(item => item.id) });
+}
+
+function askOperationClarification(question, operation) {
+  pendingOperation = operation;
+  pendingClarification = { intent: operation.intent, knownFields: operation.knownFields || {}, missingFields: operation.missingFields || [] };
+  savePlanningContext();
+  appendEntry({ role: "assistant", text: question });
+}
+
+function detectDuplicatePair(text) {
+  const normalized = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const groups = saFindDuplicateGroups().filter(group => {
+    const title = group.items[0].title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    return group.classification === "exact_duplicate" && normalized.includes(title);
+  });
+  return groups.length === 1 && groups[0].items.length === 2 ? groups[0].items : null;
+}
+
+function proposeDuplicateCleanup(pair, newStart) {
+  const sorted = [...pair].sort((a, b) => (a.createdAt?.toMillis?.() ?? new Date(a.createdAt || 0).getTime()) - (b.createdAt?.toMillis?.() ?? new Date(b.createdAt || 0).getTime()));
+  const keep = sorted[0], remove = sorted[1];
+  const duration = Number(keep.end.slice(0, 2)) * 60 + Number(keep.end.slice(3)) - Number(keep.start.slice(0, 2)) * 60 - Number(keep.start.slice(3));
+  const endMinutes = newStart ? Number(newStart.slice(0, 2)) * 60 + Number(newStart.slice(3)) + duration : 0;
+  const end = newStart ? String(Math.floor(endMinutes / 60)).padStart(2, "0") + ":" + String(endMinutes % 60).padStart(2, "0") : null;
+  currentProposal = { id: crypto.randomUUID(), plan: { title: "Clean up duplicate " + keep.title, actions: [
+    { type: "delete_item", targetId: remove.id, item: null, changes: null, postponeMinutes: null },
+    { type: "reschedule_item", targetId: keep.id, item: null, changes: { start: newStart, end }, postponeMinutes: null }
+  ] }, message: "I recommend keeping the older " + keep.title + ", permanently deleting the newer duplicate, and moving the remaining session" + (newStart ? " to " + formatTime(newStart) + " while preserving its duration." : ". Permanent deletion cannot be undone through normal app controls."), source: "local" };
+  renderProposalMessage(currentProposal.message); renderProposal(currentProposal);
+  appendEntry({ role: "assistant", text: currentProposal.message, kind: "proposal_summary", proposalSummary: currentProposal.message, resolved: false, referencedItemIds: [remove.id, keep.id] });
+}
+
+function routePendingOperation(text) {
+  if (!pendingOperation) return false;
+  const lower = text.toLowerCase();
+  if (pendingOperation.intent === "clear_scope") {
+    let scopeType = null;
+    if (/\b(active|upcoming|future|planned)\b/.test(lower)) scopeType = "all_active";
+    else if (/\b(everything|all|every).*(history|stored|completed|cancelled|canceled)|\b(include|including).*(history|completed|cancelled|canceled)/.test(lower)) scopeType = "absolutely_all";
+    if (!scopeType) { appendEntry({ role: "assistant", text: "Should I clear only active upcoming items, or every schedule item including completed and cancelled history?" }); return true; }
+    const method = pendingOperation.method || pendingOperation.knownFields?.method || null;
+    pendingOperation = { intent: "clear_method", scope: makeScope(scopeType), knownFields: { method } };
+    if (method) return routePendingOperation(method);
+    askOperationClarification("Should I cancel those items and keep their history, or delete them permanently?", pendingOperation);
+    return true;
+  }
+  if (pendingOperation.intent === "clear_method") {
+    const explicitDelete = /\b(delete|erase|permanently|remove permanently|get rid of completely)\b/.test(lower) || /\bdelete\b/.test(lower);
+    const explicitCancel = /\b(cancel|keep their history)\b/.test(lower);
+    if (!explicitDelete && !explicitCancel) { appendEntry({ role: "assistant", text: "Should I cancel those items and keep their history, or delete them permanently?" }); return true; }
+    const scope = pendingOperation.scope;
+    const selected = items.filter(item => saItemMatchesScope(item, scope));
+    pendingOperation = null; pendingClarification = null; savePlanningContext();
+    presentBulkProposal(explicitDelete ? "delete_items" : "cancel_items", scope, selected, `${explicitDelete ? "Permanently delete" : "Cancel"} ${selected.length} item${selected.length === 1 ? "" : "s"} in ${scopeLabel(scope)}?`);
+    return true;
+  }
+  if (pendingOperation.intent === "deduplicate_and_reschedule") {
+    const time = parseCommandTime(text);
+    if (!time) { appendEntry({ role: "assistant", text: "What time should I move the remaining " + (pendingOperation.title || pendingOperation.knownFields?.title || "item") + " to?" }); return true; }
+    const pair = (pendingOperation.targetIds || []).map(id => saFindItemById(id)).filter(Boolean);
+    if (pair.length !== 2) { pendingOperation = null; pendingClarification = null; appendEntry({ role: "assistant", text: "Those schedule items have changed. Please describe the duplicate cleanup again." }); savePlanningContext(); return true; }
+    pendingOperation = null; pendingClarification = null; savePlanningContext();
+    proposeDuplicateCleanup(pair, time);
+    return true;
+  }
+  return false;
+}
+
+function routeBulkCommand(text) {
+  const lower = text.toLowerCase();
+  if (/\bduplicate|repeated|repetition\b/.test(lower) && /\b(move|reschedule|postpone|remainder|remaining|rest)\b/.test(lower)) {
+    const pair = detectDuplicatePair(text);
+    if (!pair) { appendEntry({ role: "assistant", text: "I understood the duplicate cleanup, but I could not identify one exact pair. Which item and date do you mean?" }); return true; }
+    pair.forEach(item => rememberScheduleEntity(item, "referenced", ["duplicate", "remaining"]));
+    referencedSets = [...referencedSets, { title: pair[0].title, ids: pair.map(item => item.id), date: pair[0].date, createdAt: new Date().toISOString() }].slice(-5);
+    const time = parseCommandTime(text);
+    if (!time) { const sorted = [...pair].sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0)); pendingOperation = { intent: "deduplicate_and_reschedule", targetIds: sorted.map(item => item.id), knownFields: { title: sorted[0].title, date: sorted[0].date, currentStart: sorted[0].start, currentEnd: sorted[0].end, keepId: sorted[0].id, deleteId: sorted[1].id } }; pendingClarification = { intent: pendingOperation.intent, knownFields: pendingOperation.knownFields, missingFields: ["start"] }; savePlanningContext(); appendEntry({ role: "assistant", text: `What time should I move the remaining ${sorted[0].title} to?` }); return true; }
+    proposeDuplicateCleanup(pair, time); return true;
+  }
+  if (/\bduplicate|repeated|repetition\b/.test(lower) && /\b(delete|remove|clean|deduplicate)\b/.test(lower)) {
+    const groups = saFindDuplicateGroups().filter(group => group.classification === "exact_duplicate");
+    const titleText = lower.replace(/[^\p{L}\p{N}]+/gu, " ");
+    const groupsForTitle = groups.filter(group => titleText.includes(saNormalizeTitle(group.items[0].title)));
+    const chosen = groupsForTitle.length ? groupsForTitle : groups;
+    const remove = chosen.flatMap(group => group.items.slice(1));
+    if (!remove.length) { appendEntry({ role: "assistant", text: "I couldn't find exact duplicate schedule items to remove." }); return true; }
+    const scope = makeScope("referenced_items", { statuses: [], includeCompleted: true, includeCancelled: true });
+    presentBulkProposal("deduplicate_items", scope, remove, `Keep the oldest item in each exact duplicate group and permanently delete ${remove.length} newer duplicate${remove.length === 1 ? "" : "s"}?`); return true;
+  }
+  const bulkIntent = /\b(clear|wipe|empty|free|remove|delete|cancel|complete|mark).*(\ball\b|\bevery\b|\beverything\b|\brest\b|\bremainder\b|\bduplicates?\b)|\b(cancel|delete) the week\b/.test(lower);
+  if (!bulkIntent) return false;
+  let scope = inferBulkScope(text);
+  const explicitDelete = /\b(delete|erase|permanently|remove permanently|get rid of completely)\b/.test(lower);
+  const explicitCancel = /\bcancel\b/.test(lower);
+  const op = /\bcomplete|mark .*done\b/.test(lower) ? "complete_items" : explicitDelete ? "delete_items" : explicitCancel ? "cancel_items" : null;
+  if (!scope || (scope.scopeType === "absolutely_all" && !/\b(today|tomorrow|week|month|completed|missed|cancelled|canceled|routine|task|activity|gym|studio|meeting|practice)\b/.test(lower))) {
+    pendingOperation = { intent: "clear_scope", method: op === "delete_items" ? "delete permanently" : op === "cancel_items" ? "cancel" : null };
+    pendingClarification = { intent: "clear_scope", knownFields: pendingOperation, missingFields: ["scope"] }; savePlanningContext();
+    appendEntry({ role: "assistant", text: "Do you mean all active upcoming items, or every schedule item including completed and cancelled history?" }); return true;
+  }
+  if (!op) { askOperationClarification("Should I cancel those items and preserve their history, or delete them permanently?", { intent: "clear_method", scope }); return true; }
+  const selected = items.filter(item => saItemMatchesScope(item, scope));
+  presentBulkProposal(op, scope, selected, `${op === "delete_items" ? "Permanently delete" : op === "cancel_items" ? "Cancel" : "Mark completed"} ${selected.length} item${selected.length === 1 ? "" : "s"} in ${scopeLabel(scope)}?`);
+  return true;
+}
+
 async function sendMessage(rawText) {
   const text = rawText.trim();
   if (!text) return;
@@ -1119,6 +1398,7 @@ async function sendMessage(rawText) {
   if (/^(?:never mind|forget (?:it|that|the plan)|drop the plan|cancel (?:this|the) plan|abandon (?:this|the) plan)$/i.test(text.trim())) {
     activePlanningContext = null;
     pendingClarification = null;
+    pendingOperation = null;
     currentProposal = null;
     savePlanningContext();
     appendEntry({ role: "assistant", text: "Okay, I’ve cleared that planning topic." });
@@ -1127,12 +1407,15 @@ async function sendMessage(rawText) {
     return;
   }
 
+  if (routePendingOperation(text)) { saveConversation(); return; }
+  if (routeBulkCommand(text)) { saveConversation(); return; }
+
   const recallContext = await getRecallContext(text);
   if (recallContext) {
     const normalizedRecallText = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
     const recallItems = saGetRelevantItemsForContext(text, 20).filter(item => item.title && normalizedRecallText.includes(item.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()));
     recallItems.forEach(item => rememberScheduleEntity(item, "recalled", [item.title, "that", "it"]));
-    if (recallItems.length) await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry }).catch(showPersistenceFailure);
+    if (recallItems.length) await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
   }
   const classification = recallContext ? "analytical_query" : classifyRequest(text);
 
@@ -1207,6 +1490,9 @@ function handleProposalOrClarification(result, message) {
 
 async function confirmProposal() {
   if (!currentProposal) return;
+  if (currentProposal.confirming) return;
+  currentProposal.confirming = true;
+  if (currentProposal.bulkAction) { await confirmBulkProposal(); return; }
   if (currentProposal.plan) {
     await confirmPlanProposal();
     return;
@@ -1248,6 +1534,21 @@ async function confirmProposal() {
       }
       rememberScheduleEntity(result.item, "cancelled", ["that", "it"]);
       appendEntry({ role: "assistant", text: `Cancelled "${result.item.title}".`, referencedItemIds: [result.item.id] });
+      break;
+
+    case "restore_item":
+      result = await saRestoreItem(action.targetId);
+      if (!result.success) { currentProposal.confirming = false; showProcessingError(result.error); return; }
+      rememberScheduleEntity(result.item, "restored", ["that", "it"]);
+      appendEntry({ role: "assistant", text: `Restored "${result.item.title}" to your upcoming schedule.`, referencedItemIds: [result.item.id] });
+      break;
+
+    case "delete_item":
+      result = await saDeleteItem(action.targetId);
+      if (!result.success) { currentProposal.confirming = false; showProcessingError(result.error); return; }
+      await firebaseStore.markConversationItemDeleted(activeConversationId, result.item.id).catch(showPersistenceFailure);
+      rememberScheduleEntity(result.item, "deleted", ["that", "it"]);
+      appendEntry({ role: "assistant", text: `Permanently deleted "${result.item.title}". This cannot be undone through normal app controls.`, referencedItemIds: [result.item.id] });
       break;
 
     case "mark_missed":
@@ -1321,7 +1622,9 @@ async function confirmProposal() {
   }
 
   currentProposal = null;
-  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry }).catch(showPersistenceFailure);
+  pendingOperation = null;
+  lastConfirmedAction = { type: action.type, targetId: action.targetId || null, confirmedAt: new Date().toISOString() };
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
   await persistenceQueue;
   await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
   conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
@@ -1330,8 +1633,34 @@ async function confirmProposal() {
   renderConversation();
 }
 
+async function confirmBulkProposal() {
+  const proposal = currentProposal;
+  if (!proposal?.bulkAction) return;
+  const result = await saApplyBulkAtomically(proposal.bulkAction);
+  if (!result.success) { showProcessingError(result.error); return; }
+  if (["delete_items", "deduplicate_items"].includes(proposal.bulkAction.type)) {
+    (result.items || []).forEach(item => rememberScheduleEntity(item, "deleted", ["that", "those", item.title]));
+    await firebaseStore.markConversationItemsDeleted(activeConversationId, result.items.map(item => item.id)).catch(showPersistenceFailure);
+  } else {
+    const lastAction = ({ cancel_items: "cancelled", complete_items: "completed", update_items: "updated", reschedule_items: "rescheduled" })[proposal.bulkAction.type] || "updated";
+    (result.changedItems || []).forEach(item => rememberScheduleEntity(item, lastAction, ["that", "those", item.title]));
+  }
+  const targetIds = proposal.bulkAction.targetIds.slice();
+  lastConfirmedAction = { type: proposal.bulkAction.type, targetIds, affectedCount: targetIds.length, confirmedAt: new Date().toISOString() };
+  pendingOperation = null;
+  currentProposal = null;
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+  await persistenceQueue;
+  await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+  conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
+  const deleted = ["delete_items", "deduplicate_items"].includes(proposal.bulkAction.type);
+  appendEntry({ role: "assistant", text: deleted ? `Permanently deleted ${targetIds.length} schedule item${targetIds.length === 1 ? "" : "s"}. This cannot be undone through normal app controls.` : `Confirmed. Updated ${targetIds.length} schedule item${targetIds.length === 1 ? "" : "s"}.`, referencedItemIds: targetIds });
+  await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("active")).catch(showPersistenceFailure);
+  renderConversation();
+}
+
 function validatePlanProposal(proposal) {
-  if (!proposal || !proposal.plan || typeof proposal.plan.title !== "string" || !Array.isArray(proposal.plan.actions) || !proposal.plan.actions.length || proposal.plan.actions.length > 5) return "This plan does not contain a valid number of actions.";
+  if (!proposal || !proposal.plan || typeof proposal.plan.title !== "string" || !Array.isArray(proposal.plan.actions) || proposal.plan.actions.length < 2 || proposal.plan.actions.length > 20) return "This plan does not contain a valid number of actions.";
   const actionKeys = new Set();
   for (const action of proposal.plan.actions) {
     const error = saValidatePlanAction(action);
@@ -1372,14 +1701,18 @@ async function confirmPlanProposal() {
   const savedIds = new Set(actionsById.keys());
   const createdItems = (result.changedItems || []).filter(item => !savedIds.has(item.id));
   (result.changedItems || []).forEach(item => rememberScheduleEntity(item, actionsById.get(item.id) || (createdItems.includes(item) ? "created" : "updated"), ["that", "it", item.title]));
+  (result.deletedItems || []).forEach(item => rememberScheduleEntity(item, "deleted", ["that", "it", item.title]));
+  if (result.deletedIds?.length) await firebaseStore.markConversationItemsDeleted(activeConversationId, result.deletedIds).catch(showPersistenceFailure);
   currentProposal = null;
   pendingClarification = null;
   activePlanningContext = null;
-  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry }).catch(showPersistenceFailure);
+  pendingOperation = null;
+  lastConfirmedAction = { type: "plan_proposal", targetIds: (result.changedItems || []).map(item => item.id), confirmedAt: new Date().toISOString() };
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
   await persistenceQueue;
   await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
   conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
-  appendEntry({ role: "assistant", text: `Confirmed. The complete plan with ${proposal.plan.actions.length} actions has been saved.`, referencedItemIds: (result.changedItems || []).map(item => item.id) });
+  appendEntry({ role: "assistant", text: `Confirmed. The complete plan with ${proposal.plan.actions.length} actions has been saved.`, referencedItemIds: [...(result.changedItems || []).map(item => item.id), ...(result.deletedIds || [])] });
   await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("active")).catch(showPersistenceFailure);
   renderConversation();
 }
@@ -1442,6 +1775,11 @@ function openAddDialogForEdit(proposal) {
 
 function showProcessingError(message) {
   appendEntry({ role: "assistant", text: message });
+  if (currentProposal) {
+    currentProposal.confirming = false;
+    assistantEls.conversation.querySelector(".proposal")?.remove();
+    renderProposal(currentProposal);
+  }
 }
 
 function submitInput() {
