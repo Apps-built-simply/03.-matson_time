@@ -447,7 +447,7 @@ function buildAnalyticalContext(message, scheduleItems) {
 }
 
 /* ========== 5. Gemini Request ========== */
-async function callGemini(requestContext) {
+async function callGemini(requestContext, timeoutMs = REQUEST_TIMEOUT_MS) {
   const configError = validateConfig();
   if (configError) return { error: "Configuration error", category: "missing_environment_configuration" };
 
@@ -482,14 +482,19 @@ async function callGemini(requestContext) {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), Math.max(1, Math.min(timeoutMs, REQUEST_TIMEOUT_MS)));
   let response;
   try {
     response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: serializedPayload, signal: controller.signal });
   } catch (error) {
     clearTimeout(timeoutId);
+    if (error?.name === "AbortError") {
+      logAssistantStageFailure("gemini-fetch", error, requestContext);
+      return { error: SAFE_TIMEOUT_MESSAGE, details: "Failed to reach the language service.", category: "timeout" };
+    }
+    if (isTemporaryGeminiNetworkError(error)) return { error: "Temporary network error", category: "temporary_network_error" };
     logAssistantStageFailure("gemini-fetch", error, requestContext);
-    return { error: error?.name === "AbortError" ? SAFE_TIMEOUT_MESSAGE : "Network error", details: "Failed to reach the language service.", category: error?.name === "AbortError" ? "timeout" : "invalid_request" };
+    return { error: "Network error", details: "Failed to reach the language service.", category: "invalid_request" };
   }
   clearTimeout(timeoutId);
 
@@ -497,6 +502,7 @@ async function callGemini(requestContext) {
   try {
     responseBody = await response.text();
   } catch (error) {
+    if (isTemporaryGeminiNetworkError(error)) return { error: "Temporary network error", category: "temporary_network_error" };
     logAssistantStageFailure("gemini-response-body-reading", error, requestContext);
     return { error: "Response reading failed", category: "invalid_gemini_response" };
   }
@@ -504,9 +510,10 @@ async function callGemini(requestContext) {
   let data;
   try {
     data = JSON.parse(responseBody);
-  } catch (error) {
-    logAssistantStageFailure("gemini-response-parsing", error, requestContext);
-    if (response.ok) return { error: "Invalid response", details: "The language service returned malformed JSON.", category: "invalid_gemini_response" };
+  } catch {
+    if (response.ok) {
+      return { error: "Invalid response", details: "The language service returned malformed JSON.", category: "invalid_gemini_response" };
+    }
     data = {};
   }
 
@@ -514,19 +521,7 @@ async function callGemini(requestContext) {
     const providerError = data?.error || {};
     const providerMessage = typeof providerError.message === "string" ? providerError.message : "";
     const category = classifyGeminiFailure(response.status, providerMessage);
-    const safeErrorMessage = sanitizeGeminiErrorMessage(providerMessage, requestContext);
-    console.error("Gemini request failed", {
-      model: GEMINI_MODEL,
-      status: response.status,
-      errorCode: safeProviderCode(providerError.code),
-      errorStatus: safeProviderStatus(providerError.status),
-      category,
-      message: safeErrorMessage || category
-    });
-    if (response.status === 429) return { error: "Gemini quota exceeded", details: "Rate limit reached. Please try again later.", category };
-    if (response.status === 400) return { error: "Invalid request", details: "The request to the language service was malformed.", category };
-    if (response.status === 401 || response.status === 403) return { error: "Authentication failed", details: "The API key is invalid or lacks permissions.", category };
-    return { error: "Language service error", details: "Service returned " + response.status, category };
+    return { error: "Language service error", category, status: response.status };
   }
 
   if (!data.candidates || !data.candidates.length) return { error: "Empty response", details: "The language service returned no candidates.", category: "invalid_gemini_response" };
@@ -535,11 +530,49 @@ async function callGemini(requestContext) {
   const content = candidate.content?.parts?.[0]?.text;
   if (!content) return { error: "Empty content", details: "The language service returned empty content.", category: "invalid_gemini_response" };
   let parsed;
-  try { parsed = JSON.parse(content); } catch (error) {
-    logAssistantStageFailure("gemini-response-parsing", error, requestContext);
+  try { parsed = JSON.parse(content); } catch {
     return { error: "Invalid JSON", details: "The language service returned malformed JSON.", category: "invalid_gemini_response" };
   }
   return { response: parsed };
+}
+
+const RETRYABLE_GEMINI_STATUSES = new Set([429, 500, 502, 503, 504]);
+const TEMPORARY_BUSY_MESSAGE = "The schedule assistant is temporarily busy. Please try again.";
+
+function isTemporaryGeminiNetworkError(error) {
+  if (error?.name === "AbortError") return false;
+  if (error?.name === "TypeError") return true;
+  return ["ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"].includes(error?.code);
+}
+
+function geminiRetryCategory(result) {
+  return result?.category === "temporary_network_error" ? "temporary_network_error" : "provider_busy";
+}
+
+async function callGeminiWithRetry(requestContext) {
+  const startedAt = Date.now();
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const remainingMs = Math.max(1, REQUEST_TIMEOUT_MS - (Date.now() - startedAt));
+    const result = await callGemini(requestContext, remainingMs);
+    if (result.response) return result;
+
+    const permanentCategory = ["invalid_request", "authentication", "unsupported_json_schema", "invalid_gemini_response"].includes(result.category);
+    const retryable = !permanentCategory && (RETRYABLE_GEMINI_STATUSES.has(result.status) || result.category === "temporary_network_error");
+    if (!retryable) return result;
+
+    const delayMs = 800 + Math.floor(Math.random() * 801);
+    const willRetry = attempt === 1 && Date.now() - startedAt + delayMs < REQUEST_TIMEOUT_MS;
+    console.warn("Gemini temporary failure", {
+      attempt,
+      model: GEMINI_MODEL,
+      status: result.status ?? null,
+      category: geminiRetryCategory(result),
+      willRetry
+    });
+    if (!willRetry) return { error: TEMPORARY_BUSY_MESSAGE, category: "temporary_provider_failure", status: result.status ?? null };
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+  return { error: TEMPORARY_BUSY_MESSAGE, category: "temporary_provider_failure" };
 }
 
 function classifyGeminiFailure(status, message) {
@@ -550,14 +583,6 @@ function classifyGeminiFailure(status, message) {
   if (/schema|response.?format/.test(text) && /unsupported|not supported|invalid|unknown/.test(text)) return "unsupported_json_schema";
   if (status === 400) return "invalid_request";
   return "gemini_http_error";
-}
-
-function safeProviderCode(value) {
-  return typeof value === "number" || (typeof value === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(value)) ? value : undefined;
-}
-
-function safeProviderStatus(value) {
-  return typeof value === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(value) ? value : undefined;
 }
 
 function sanitizeGeminiErrorMessage(message, requestContext) {
@@ -789,7 +814,7 @@ module.exports = async function handler(req, res) {
 
     let result;
     try {
-      result = await callGemini(requestContext);
+      result = await callGeminiWithRetry(requestContext);
     } catch (error) {
       logAssistantStageFailure("gemini-fetch", error, requestContext);
       if (error?.name === "AbortError") {
@@ -800,6 +825,10 @@ module.exports = async function handler(req, res) {
       return;
     }
     if (result.error) {
+      if (result.category === "temporary_provider_failure") {
+        sendJson(res, 503, { kind: "error", message: TEMPORARY_BUSY_MESSAGE });
+        return;
+      }
       if (result.category !== "missing_environment_configuration") {
         console.error("Assistant request failed", { category: result.category || "invalid_request" });
       }
