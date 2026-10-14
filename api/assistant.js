@@ -51,46 +51,85 @@ Return only a response matching the provided JSON schema.`;
 
 /* ========== 3. Structured Response Schema ========== */
 const GEMINI_RESPONSE_SCHEMA = {
-  type: "object",
+  type: "OBJECT",
   properties: {
-    kind: { type: "string", enum: ["answer", "clarification", "proposed_action", "no_action", "error"] },
-    message: { type: "string" },
-    requiresConfirmation: { type: "boolean" },
+    kind: { type: "STRING", enum: ["answer", "clarification", "proposed_action", "no_action", "error"] },
+    message: { type: "STRING" },
+    requiresConfirmation: { type: "BOOLEAN" },
     action: {
-      type: ["object", "null"],
+      type: "OBJECT",
+      nullable: true,
       properties: {
-        type: { type: "string", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
-        targetId: { type: ["string", "null"] },
+        type: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
+        targetId: { type: "STRING", nullable: true },
         item: {
-          type: ["object", "null"],
+          type: "OBJECT",
+          nullable: true,
           properties: {
-            type: { type: "string", enum: ["activity", "task", "routine"] },
-            title: { type: "string" },
-            date: { type: ["string", "null"], pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
-            start: { type: ["string", "null"], pattern: "^\\d{2}:\\d{2}$" },
-            end: { type: ["string", "null"], pattern: "^\\d{2}:\\d{2}$" },
-            category: { type: "string" },
-            notes: { type: "string" },
-            recurrence: { type: ["object", "null"], properties: { frequency: { type: "string", enum: ["daily", "weekly", "monthly"] }, days: { type: "array", items: { type: "integer", minimum: 0, maximum: 6 } }, interval: { type: "integer", minimum: 1 } } }
+            type: { type: "STRING", enum: ["activity", "task", "routine"] },
+            title: { type: "STRING" },
+            date: { type: "STRING", nullable: true },
+            start: { type: "STRING", nullable: true },
+            end: { type: "STRING", nullable: true },
+            category: { type: "STRING" },
+            notes: { type: "STRING" },
+            recurrence: {
+              type: "OBJECT",
+              nullable: true,
+              properties: {
+                frequency: { type: "STRING", enum: ["daily", "weekly", "monthly"] },
+                days: { type: "ARRAY", items: { type: "INTEGER" } },
+                interval: { type: "INTEGER" }
+              },
+              required: ["frequency", "days", "interval"]
+            }
           },
-          required: ["type", "title", "date", "category", "notes"],
-          additionalProperties: false
+          required: ["type", "title", "date", "start", "end", "category", "notes", "recurrence"]
         },
-        changes: { type: ["object", "null"], properties: { title: { type: ["string", "null"] }, date: { type: ["string", "null"], pattern: "^\\d{4}-\\d{2}-\\d{2}$" }, start: { type: ["string", "null"], pattern: "^\\d{2}:\\d{2}$" }, end: { type: ["string", "null"], pattern: "^\\d{2}:\\d{2}$" }, category: { type: ["string", "null"] }, notes: { type: ["string", "null"] }, status: { type: ["string", "null"], enum: ["upcoming", "in-progress", "overdue", "completed", "missed", "cancelled", "postponed", "awaiting-check-in"] } }, additionalProperties: false },
-        postponeMinutes: { type: ["integer", "null"], minimum: 1 }
+        changes: {
+          type: "OBJECT",
+          nullable: true,
+          properties: {
+            title: { type: "STRING", nullable: true },
+            date: { type: "STRING", nullable: true },
+            start: { type: "STRING", nullable: true },
+            end: { type: "STRING", nullable: true },
+            category: { type: "STRING", nullable: true },
+            notes: { type: "STRING", nullable: true },
+            status: { type: "STRING", nullable: true, enum: ["upcoming", "in-progress", "overdue", "completed", "missed", "cancelled", "postponed", "awaiting-check-in"] }
+          },
+          required: ["title", "date", "start", "end", "category", "notes", "status"]
+        },
+        postponeMinutes: { type: "INTEGER", nullable: true }
       },
-      required: ["type", "targetId", "item", "changes", "postponeMinutes"],
-      additionalProperties: false
+      required: ["type", "targetId", "item", "changes", "postponeMinutes"]
     },
     pendingClarification: {
-      type: ["object", "null"],
-      properties: { intent: { type: "string", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] }, knownFields: { type: "object", additionalProperties: true }, missingFields: { type: "array", items: { type: "string" } } },
-      required: ["intent", "knownFields", "missingFields"],
-      additionalProperties: false
+      type: "OBJECT",
+      nullable: true,
+      properties: {
+        intent: { type: "STRING", enum: ["create_item", "update_item", "reschedule_item", "postpone_item", "complete_item", "mark_missed", "cancel_item"] },
+        knownFields: {
+          type: "OBJECT",
+          properties: {
+            type: { type: "STRING", nullable: true, enum: ["activity", "task", "routine"] },
+            title: { type: "STRING", nullable: true },
+            date: { type: "STRING", nullable: true },
+            start: { type: "STRING", nullable: true },
+            end: { type: "STRING", nullable: true },
+            category: { type: "STRING", nullable: true },
+            notes: { type: "STRING", nullable: true },
+            recurrence: { type: "OBJECT", nullable: true, properties: { frequency: { type: "STRING", enum: ["daily", "weekly", "monthly"] }, days: { type: "ARRAY", items: { type: "INTEGER" } }, interval: { type: "INTEGER" } } },
+            targetId: { type: "STRING", nullable: true },
+            postponeMinutes: { type: "INTEGER", nullable: true }
+          }
+        },
+        missingFields: { type: "ARRAY", items: { type: "STRING" } }
+      },
+      required: ["intent", "knownFields", "missingFields"]
     }
   },
-  required: ["kind", "message", "requiresConfirmation", "action", "pendingClarification"],
-  additionalProperties: false
+  required: ["kind", "message", "requiresConfirmation", "action", "pendingClarification"]
 };
 
 /* ========== 4. Input Validation ========== */
