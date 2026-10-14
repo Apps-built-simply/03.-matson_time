@@ -128,6 +128,18 @@ section { margin-top: 28px; }
 .assistant-input-meta { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 4px; }
 .voice-notice { margin: 0; color: var(--color-muted); font-size: .78rem; }
 
+/* Assistant proposals */
+.proposal { margin: 16px 0; padding: 16px; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-surface); }
+.proposal-header h3 { margin: 0 0 12px; font-size: 1rem; font-weight: 600; color: var(--color-text); }
+.proposal-details { display: grid; gap: 8px; margin-bottom: 12px; }
+.detail-row { display: flex; justify-content: space-between; gap: 12px; }
+.detail-label { color: var(--color-text-secondary); font-size: .82rem; }
+.detail-value { color: var(--color-text); font-size: .88rem; font-weight: 500; }
+.proposal-changes ul { margin: 4px 0 0; padding: 0; list-style: none; }
+.proposal-changes li { color: var(--color-text-secondary); font-size: .82rem; }
+.proposal-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.proposal-actions button { min-height: 40px; flex: 1; }
+
 /* Progress — factual schedule summary, no scoring */
 .view-switch { display: inline-flex; margin-top: 20px; border: 1px solid var(--color-border); border-radius: var(--radius); overflow: hidden; }
 .view-switch-button { min-height: 38px; padding: 0 18px; border: 0; background: var(--color-surface-alt); color: var(--color-text-secondary); font-size: .85rem; }

@@ -1,4 +1,4 @@
-let items = loadItems();
+var items = loadItems();
 
 // View state: the month being displayed and the selected date (YYYY-MM-DD)
 let calendarCursor = new Date();
@@ -130,11 +130,17 @@ function render() {
 }
 
 function completeItem(id) {
-  items = items.map(i => i.id === id ? { ...i, status: "completed" } : i); saveItems(items); render();
+  const result = saCompleteItem(id);
+  if (!result.success) {
+    console.error("Complete failed:", result.error);
+  }
 }
 
 function postponeItem(id) {
-  items = items.map(i => i.id === id ? { ...i, status: "postponed", postponed: (i.postponed || 0) + 1 } : i); saveItems(items); render();
+  const result = saPostponeItem(id);
+  if (!result.success) {
+    console.error("Postpone failed:", result.error);
+  }
 }
 
 // Primary navigation
@@ -190,8 +196,22 @@ els.type.addEventListener("change", () => { els.timeFields.hidden = els.type.val
 els.form.addEventListener("submit", event => {
   event.preventDefault();
   const data = new FormData(els.form);
-  items.push({ id: crypto.randomUUID(), title: data.get("title").trim(), date: data.get("date"), type: data.get("type"), start: data.get("start"), end: data.get("end"), category: data.get("category"), notes: data.get("notes").trim(), status: "upcoming", postponed: 0 });
-  saveItems(items);
+  const newItem = {
+    title: data.get("title").trim(),
+    date: data.get("date"),
+    type: data.get("type"),
+    start: data.get("start"),
+    end: data.get("end"),
+    category: data.get("category"),
+    notes: data.get("notes").trim(),
+    status: "upcoming",
+    postponed: 0
+  };
+  const result = saCreateItem(newItem);
+  if (!result.success) {
+    console.error("Create failed:", result.error);
+    return;
+  }
   els.form.reset();
   els.form.date.value = localDateString(new Date());
   els.timeFields.hidden = false;

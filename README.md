@@ -17,9 +17,16 @@ This first working build includes:
 - Simple schedule conflict warnings
 - Browser storage for development testing
 
-## Run
+## Deploy to Vercel
 
-Open `index.html` in a browser. For development, use a simple local server so browser behavior is consistent.
+1. Import the GitHub repository into Vercel.
+2. Add `GEMINI_API_KEY` in the Vercel Environment Variables settings.
+3. Add `GEMINI_MODEL` in the Vercel Environment Variables settings.
+4. Deploy.
+5. The frontend calls `/api/assistant` automatically.
+6. Never put the Gemini key in browser JavaScript or commit it to Git.
+
+For local static previews, open the site with a simple static server. Deterministic Assistant questions work there; natural-language schedule requests require the deployed Vercel Function.
 
 ## Project rule
 

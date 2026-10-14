@@ -8,7 +8,8 @@ Thumbs.db
 # Environment and secrets
 .env
 .env.*
-!.env.example
+*.secret
+matson_ai_key.txt
 
 # Mobile build output added later
 android/
