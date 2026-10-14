@@ -36,7 +36,7 @@ function triggerScheduleRender() {
   else if (typeof render === "function") render();
 }
 
-function saCreateItem(item) {
+async function saCreateItem(item) {
   const error = scheduleValidateItem(item);
   if (error) return { success: false, error };
   const newItem = {
@@ -52,8 +52,9 @@ function saCreateItem(item) {
     postponed: 0
   };
   if (item.recurrence) newItem.recurrence = item.recurrence;
+  try { await firebaseStore.createScheduleItem(newItem); }
+  catch { return { success: false, error: "Could not save this item. Check your connection and retry." }; }
   items.push(newItem);
-  saveItems(items);
   triggerScheduleRender();
   return { success: true, item: newItem };
 }
@@ -71,19 +72,20 @@ function saFindItemsByTitle(title, dateFilter = null) {
   });
 }
 
-function saUpdateItem(id, updates) {
+async function saUpdateItem(id, updates) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
   const updated = { ...items[index], ...updates };
   const error = scheduleValidateItem(updated);
   if (error) return { success: false, error };
+  try { await firebaseStore.updateScheduleItem(id, updates); }
+  catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
   items[index] = updated;
-  saveItems(items);
   triggerScheduleRender();
   return { success: true, item: updated };
 }
 
-function saRescheduleItem(id, newDate, newStart, newEnd) {
+async function saRescheduleItem(id, newDate, newStart, newEnd) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
   const item = items[index];
@@ -92,13 +94,15 @@ function saRescheduleItem(id, newDate, newStart, newEnd) {
   if (!scheduleValidateTime(newStart)) return { success: false, error: "Valid start time (HH:mm) is required" };
   if (!scheduleValidateTime(newEnd)) return { success: false, error: "Valid end time (HH:mm) is required" };
   if (newStart >= newEnd) return { success: false, error: "End time must be after start time" };
-  items[index] = { ...item, date: newDate, start: newStart, end: newEnd };
-  saveItems(items);
+  const updated = { ...item, date: newDate, start: newStart, end: newEnd };
+  try { await firebaseStore.updateScheduleItem(id, { date: newDate, start: newStart, end: newEnd }); }
+  catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
+  items[index] = updated;
   triggerScheduleRender();
-  return { success: true, item: items[index] };
+  return { success: true, item: updated };
 }
 
-function saPostponeItem(id, minutes = 15) {
+async function saPostponeItem(id, minutes = 15) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
   const item = items[index];
@@ -113,7 +117,7 @@ function saPostponeItem(id, minutes = 15) {
   const newDate = localDateString(newStart);
   const newStartTime = `${String(newStart.getHours()).padStart(2, "0")}:${String(newStart.getMinutes()).padStart(2, "0")}`;
   const newEndTime = `${String(newEnd.getHours()).padStart(2, "0")}:${String(newEnd.getMinutes()).padStart(2, "0")}`;
-  items[index] = {
+  const updated = {
     ...item,
     date: newDate,
     start: newStartTime,
@@ -121,34 +125,42 @@ function saPostponeItem(id, minutes = 15) {
     status: "postponed",
     postponed: (item.postponed || 0) + 1
   };
-  saveItems(items);
+  try { await firebaseStore.updateScheduleItem(id, updated); }
+  catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
+  items[index] = updated;
   triggerScheduleRender();
   return { success: true, item: items[index], postponedMinutes: minutes };
 }
 
-function saCompleteItem(id) {
+async function saCompleteItem(id) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
-  items[index] = { ...items[index], status: "completed" };
-  saveItems(items);
+  const updated = { ...items[index], status: "completed" };
+  try { await firebaseStore.updateScheduleItem(id, { status: updated.status }); }
+  catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
+  items[index] = updated;
   triggerScheduleRender();
   return { success: true, item: items[index] };
 }
 
-function saMarkItemMissed(id) {
+async function saMarkItemMissed(id) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
-  items[index] = { ...items[index], status: "missed" };
-  saveItems(items);
+  const updated = { ...items[index], status: "missed" };
+  try { await firebaseStore.updateScheduleItem(id, { status: updated.status }); }
+  catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
+  items[index] = updated;
   triggerScheduleRender();
   return { success: true, item: items[index] };
 }
 
-function saCancelItem(id) {
+async function saCancelItem(id) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
-  items[index] = { ...items[index], status: "cancelled" };
-  saveItems(items);
+  const updated = { ...items[index], status: "cancelled" };
+  try { await firebaseStore.updateScheduleItem(id, { status: updated.status }); }
+  catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
+  items[index] = updated;
   triggerScheduleRender();
   return { success: true, item: items[index] };
 }
@@ -347,10 +359,11 @@ function saValidatePlanAction(action, scheduleItems = items) {
   return null;
 }
 
-function saApplyPlanAtomically(actions) {
+async function saApplyPlanAtomically(actions) {
   if (!Array.isArray(actions) || !actions.length || actions.length > 5) return { success: false, error: "A plan must contain between one and five actions." };
   const original = items;
   const nextItems = original.map(item => ({ ...item }));
+  const changedIds = new Set();
   const originalConflictKeys = new Set(saScheduleConflictKeys(original));
 
   for (const action of actions) {
@@ -363,6 +376,7 @@ function saApplyPlanAtomically(actions) {
         notes: action.item.notes?.trim() || "", status: "upcoming", postponed: 0,
         ...(action.item.recurrence ? { recurrence: action.item.recurrence } : {})
       });
+      changedIds.add(nextItems[nextItems.length - 1].id);
       continue;
     }
 
@@ -385,6 +399,7 @@ function saApplyPlanAtomically(actions) {
       const time = value => `${String(value.getHours()).padStart(2, "0")}:${String(value.getMinutes()).padStart(2, "0")}`;
       nextItems[index] = { ...target, date: localDateString(startDateTime), start: time(startDateTime), end: time(endDateTime), status: "postponed", postponed: (target.postponed || 0) + 1 };
     }
+    changedIds.add(action.targetId);
   }
 
   for (const item of nextItems) {
@@ -395,7 +410,7 @@ function saApplyPlanAtomically(actions) {
   if (introducedConflicts.length) return { success: false, error: "This plan would create a new schedule conflict." };
 
   try {
-    saveItems(nextItems);
+    await firebaseStore.writeSchedulePlanBatch(nextItems, [...changedIds]);
   } catch {
     return { success: false, error: "The plan could not be saved. No schedule changes were applied." };
   }

@@ -8,13 +8,28 @@
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
-  <div class="app-shell">
+  <section id="loginGate" class="auth-screen" hidden aria-labelledby="loginTitle">
+    <form id="loginForm" class="auth-form" autocomplete="on">
+      <h1 id="loginTitle">Matson Time</h1>
+      <label>Email<input name="email" type="email" autocomplete="username" required></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <p id="loginError" class="auth-error" role="alert" hidden></p>
+      <button class="primary-button" type="submit">Sign in</button>
+    </form>
+  </section>
+  <section id="cloudLoading" class="cloud-loading" hidden aria-live="polite">
+    <p id="cloudLoadingText">Loading your Matson Time data…</p>
+    <p id="cloudError" class="auth-error" role="alert" hidden></p>
+    <button id="retryCloudButton" class="secondary-button" type="button" hidden>Retry</button>
+  </section>
+
+  <div class="app-shell" hidden>
     <!-- Today view -->
     <div id="todayView">
       <header class="app-header">
         <div class="container">
           <p class="eyebrow" id="todayDate"></p>
-          <h1>Today</h1>
+          <div class="heading-with-action"><h1>Today</h1><button class="text-button muted" id="signOutButton" type="button">Sign out</button></div>
         </div>
       </header>
 
@@ -88,6 +103,16 @@
         <p class="assistant-description">Ask about your schedule or tell Matson Time what you need to do.</p>
 
         <div class="conversation" id="conversation" aria-live="polite"></div>
+
+        <div class="conversation-controls">
+          <button class="text-button muted" id="newConversationButton" type="button">New conversation</button>
+          <label class="conversation-picker-label" for="recentConversations">Recent conversations</label>
+          <select id="recentConversations" aria-label="Recent conversations"><option value="">Select conversation</option></select>
+        </div>
+        <div class="conversation-save-notice" id="conversationSaveNotice" hidden role="status">
+          <span id="conversationSaveText">A message is waiting to sync.</span>
+          <button class="text-button muted" id="retryConversationSave" type="button">Retry</button>
+        </div>
 
         <div class="assistant-empty" id="assistantEmpty">
           <p class="muted">Ask a question about today or your upcoming schedule.</p>
@@ -215,11 +240,6 @@
     </form>
   </dialog>
 
-  <script src="js/data.js"></script>
-  <script src="js/config.js"></script>
-  <script src="js/schedule-actions.js"></script>
-  <script src="js/app.js"></script>
-  <script src="js/assistant.js"></script>
-  <script src="js/progress.js"></script>
+  <script type="module" src="js/bootstrap.js"></script>
 </body>
 </html>

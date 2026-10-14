@@ -1,7 +1,6 @@
 /* Assistant page — coordinator for deterministic and Gemini-assisted schedule requests */
 
-const ASSISTANT_STORAGE_KEY = "matson-time-assistant-v1";
-const PLANNING_CONTEXT_STORAGE_KEY = "matson-time-active-planning-v1";
+const PENDING_MESSAGE_WRITES_KEY = `matson-time-pending-message-writes-${firebaseStore.getCurrentUser().uid}`;
 const MAX_CONVERSATION_ENTRIES = 30;
 
 const assistantEls = {
@@ -14,45 +13,180 @@ const assistantEls = {
   voice: document.querySelector("#voiceButton"),
   voiceNotice: document.querySelector("#voiceNotice"),
   clear: document.querySelector("#clearConversation"),
-  nav: document.querySelector("#navAssistant")
+  nav: document.querySelector("#navAssistant"),
+  newConversation: document.querySelector("#newConversationButton"),
+  recentConversations: document.querySelector("#recentConversations"),
+  saveNotice: document.querySelector("#conversationSaveNotice"),
+  saveText: document.querySelector("#conversationSaveText"),
+  retrySave: document.querySelector("#retryConversationSave")
 };
 
 let voiceNoticeTimer = null;
-let conversation = loadConversation();
-let pendingClarification = null;
+let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ role: message.role, text: message.text, kind: message.kind, resolved: message.resolved })) : [];
+let activeConversationId = window.initialConversation?.id || window.initialAssistantState?.activeConversationId || null;
+let pendingClarification = window.initialAssistantState?.pendingClarification || null;
 let currentProposal = null;
-let activePlanningContext = loadPlanningContext();
+let activePlanningContext = window.initialAssistantState?.planningContext || null;
+let planningTopicResolved = false;
+let persistenceQueue = Promise.resolve();
+let pendingMessageWrites = loadPendingMessageWrites();
 
-function loadPlanningContext() {
-  try {
-    const value = JSON.parse(localStorage.getItem(PLANNING_CONTEXT_STORAGE_KEY) || "null");
-    if (!value || typeof value !== "object" || !Array.isArray(value.proposedItems) || !Array.isArray(value.constraints) || typeof value.goal !== "string") return null;
-    return value;
-  } catch { return null; }
+function loadPendingMessageWrites() {
+  try { const saved = JSON.parse(localStorage.getItem(PENDING_MESSAGE_WRITES_KEY) || "[]"); return Array.isArray(saved) ? saved : []; }
+  catch { return []; }
 }
-
 function savePlanningContext() {
-  if (activePlanningContext) localStorage.setItem(PLANNING_CONTEXT_STORAGE_KEY, JSON.stringify(activePlanningContext));
-  else localStorage.removeItem(PLANNING_CONTEXT_STORAGE_KEY);
+  firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext }).catch(showPersistenceFailure);
+}
+function saveConversation() { /* Conversation writes are queued by appendEntry. */ }
+
+async function ensureConversation() {
+  if (activeConversationId) return activeConversationId;
+  activeConversationId = await firebaseStore.createConversation({ title: "New conversation", status: "active" });
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext });
+  await refreshRecentConversationList();
+  return activeConversationId;
 }
 
-function loadConversation() {
+async function refreshRecentConversationList(max = 15) {
+  const recent = await firebaseStore.listRecentConversations(max);
+  const selected = activeConversationId;
+  assistantEls.recentConversations.replaceChildren(new Option("Select conversation", ""));
+  for (const item of recent) {
+    const option = new Option(item.title || "Conversation", item.id);
+    assistantEls.recentConversations.add(option);
+  }
+  if (max <= 15) assistantEls.recentConversations.add(new Option("Load older conversations…", "__load_more__"));
+  assistantEls.recentConversations.value = selected || "";
+}
+
+function conversationSummary(status = "active") {
+  const userMessages = conversation.filter(entry => entry.role === "user").map(entry => entry.text);
+  const title = (userMessages[0] || "Matson Time conversation").slice(0, 72);
+  const summary = conversation.slice(-6).map(entry => `${entry.role === "user" ? "Matson" : "Assistant"}: ${entry.text}`).join(" ").slice(0, 500);
+  return { title, summary, keywords: firebaseStore.tokenizeKeywords(`${title} ${summary}`), status };
+}
+
+function updateSummaryIfPlanningResolved() {
+  if (!planningTopicResolved || !activeConversationId) return;
+  planningTopicResolved = false;
+  firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("active")).catch(showPersistenceFailure);
+}
+
+async function getRecallContext(text) {
+  if (!/\b(remember|recall|asked about|talked about|discussed|previous conversation|last time|earlier conversation)\b/i.test(text)) return null;
+  const keywords = firebaseStore.tokenizeKeywords(text);
+  if (!keywords.length) return null;
   try {
-    const saved = localStorage.getItem(ASSISTANT_STORAGE_KEY);
-    const parsed = saved ? JSON.parse(saved) : [];
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(entry => entry && (entry.role === "user" || entry.role === "assistant") && typeof entry.text === "string").slice(-MAX_CONVERSATION_ENTRIES);
-  } catch { return []; }
+    const [matches, memories] = await Promise.all([
+      firebaseStore.searchConversationSummaries(keywords, 5),
+      firebaseStore.searchMemories(keywords, 5)
+    ]);
+    const conversations = [];
+    for (const match of matches.slice(0, 3)) {
+      const loaded = await firebaseStore.loadConversation(match.id, 8);
+      const relevant = loaded.messages.filter(message => {
+        const words = new Set(firebaseStore.tokenizeKeywords(message.text));
+        return keywords.some(word => words.has(word));
+      }).slice(-3).map(message => ({ role: message.role, text: String(message.text).slice(0, 220) }));
+      conversations.push({ title: String(match.title || "").slice(0, 80), summary: String(match.summary || "").slice(0, 300), messages: relevant });
+    }
+    return {
+      conversations,
+      memories: memories.map(memory => ({ type: String(memory.type || ""), text: String(memory.text || "").slice(0, 240) }))
+    };
+  } catch (error) {
+    console.error("Conversation recall failed", { name: error?.name || "Error", message: String(error?.message || error) });
+    return null;
+  }
 }
 
-function saveConversation() {
-  localStorage.setItem(ASSISTANT_STORAGE_KEY, JSON.stringify(conversation.slice(-MAX_CONVERSATION_ENTRIES)));
+async function startNewConversation() {
+  if (activeConversationId) {
+    await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+    await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("archived"));
+  }
+  activeConversationId = null;
+  conversation = [];
+  pendingClarification = null;
+  currentProposal = null;
+  activePlanningContext = null;
+  await firebaseStore.clearAssistantState();
+  renderConversation();
+  await refreshRecentConversationList();
+  assistantEls.recentConversations.value = "";
+}
+
+async function openConversation(id) {
+  if (!id) return;
+  if (id === "__load_more__") {
+    await refreshRecentConversationList(1000);
+    assistantEls.recentConversations.value = activeConversationId || "";
+    return;
+  }
+  try {
+    if (activeConversationId && activeConversationId !== id) {
+      await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("archived"));
+    }
+    const loaded = await firebaseStore.loadConversation(id, 50);
+    await firebaseStore.updateConversationSummary(id, { status: "active" });
+    activeConversationId = id;
+    conversation = loaded.messages.map(message => ({
+      role: message.role,
+      text: message.text,
+      kind: message.kind,
+      resolved: message.resolved !== false
+    }));
+    currentProposal = null;
+    const state = await firebaseStore.loadAssistantState();
+    const isActive = state.activeConversationId === id;
+    pendingClarification = isActive ? state.pendingClarification : null;
+    activePlanningContext = isActive ? state.planningContext : null;
+    await firebaseStore.saveAssistantState({ activeConversationId: id, pendingClarification, planningContext: activePlanningContext });
+    renderConversation();
+  } catch (error) {
+    showPersistenceFailure();
+    console.error("Conversation load failed", { name: error?.name || "Error", message: String(error?.message || error) });
+  }
+}
+
+function showPersistenceFailure() {
+  assistantEls.saveNotice.hidden = false;
+  assistantEls.saveText.textContent = "A message is waiting to sync. Retry when your connection is available.";
+}
+
+async function persistPendingMessages() {
+  try {
+    while (pendingMessageWrites.length) {
+      const pending = pendingMessageWrites[0];
+      pending.conversationId = pending.conversationId || await ensureConversation();
+      localStorage.setItem(PENDING_MESSAGE_WRITES_KEY, JSON.stringify(pendingMessageWrites));
+      await firebaseStore.addConversationMessage(pending.conversationId, pending.message);
+      pendingMessageWrites.shift();
+      localStorage.setItem(PENDING_MESSAGE_WRITES_KEY, JSON.stringify(pendingMessageWrites));
+    }
+    pendingMessageWrites = [];
+    localStorage.removeItem(PENDING_MESSAGE_WRITES_KEY);
+    assistantEls.saveNotice.hidden = true;
+  } catch (error) {
+    localStorage.setItem(PENDING_MESSAGE_WRITES_KEY, JSON.stringify(pendingMessageWrites));
+    showPersistenceFailure();
+    console.error("Conversation message save failed", { name: error?.name || "Error", message: String(error?.message || error) });
+  }
 }
 
 function appendEntry(entry) {
   conversation.push(entry);
   renderConversationEntry(entry);
-  saveConversation();
+  const message = {
+    id: crypto.randomUUID(),
+    role: entry.role, text: entry.text, kind: entry.kind || (entry.role === "user" ? "user_message" : "assistant_message"),
+    referencedItemIds: entry.referencedItemIds || [], proposalSummary: entry.proposalSummary || null,
+    resolved: entry.resolved !== false
+  };
+  pendingMessageWrites.push({ conversationId: activeConversationId, message });
+  localStorage.setItem(PENDING_MESSAGE_WRITES_KEY, JSON.stringify(pendingMessageWrites));
+  persistenceQueue = persistenceQueue.then(persistPendingMessages);
 }
 
 function renderConversationEntry(entry) {
@@ -86,7 +220,12 @@ function renderConversationEntry(entry) {
 
 function renderConversation() {
   assistantEls.conversation.replaceChildren();
-  for (const entry of conversation) renderConversationEntry(entry);
+  for (const entry of conversation) {
+    const displayEntry = entry.resolved === false
+      ? { ...entry, text: `${entry.text} (This earlier proposal expired when you left the conversation; request it again to review it.)` }
+      : entry;
+    renderConversationEntry(displayEntry);
+  }
   assistantEls.empty.hidden = conversation.length > 0;
   if (conversation.length > 0) {
     assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
@@ -747,7 +886,7 @@ function validateGeminiResponse(response) {
   return null;
 }
 
-async function callGeminiEndpoint(message, planningRequest = false) {
+async function callGeminiEndpoint(message, planningRequest = false, priorContext = null) {
   const isPlanning = planningRequest || Boolean(activePlanningContext);
   const relevantItems = isPlanning ? saGetPlanningItems(activePlanningContext) : saGetRelevantItemsForContext(message);
   const compactFacts = isPlanning ? saGetWeeklyAvailabilityFacts() : saGetCompactFacts();
@@ -757,7 +896,8 @@ async function callGeminiEndpoint(message, planningRequest = false) {
     context: relevantItems,
     pendingClarification: pendingClarification,
     compactFacts: compactFacts,
-    activePlanningContext: activePlanningContext
+    activePlanningContext: activePlanningContext,
+    priorContext
   };
 
   try {
@@ -790,12 +930,17 @@ function processGeminiResponse(response) {
     };
   }
 
-  activePlanningContext = response.planningContext || null;
-  savePlanningContext();
+  const hadPlanningContext = Boolean(activePlanningContext);
+  if (response.kind !== "error") activePlanningContext = response.planningContext || null;
+  const persistResponseState = () => {
+    savePlanningContext();
+    if (hadPlanningContext && !activePlanningContext) planningTopicResolved = true;
+  };
 
   switch (response.kind) {
     case "answer":
       pendingClarification = null;
+      persistResponseState();
       return {
         message: response.message || "Here's what I found.",
         items: []
@@ -803,6 +948,7 @@ function processGeminiResponse(response) {
 
     case "clarification":
       pendingClarification = response.pendingClarification || null;
+      persistResponseState();
       return {
         message: response.message || "Could you clarify?",
         items: [],
@@ -811,6 +957,7 @@ function processGeminiResponse(response) {
 
     case "proposed_action":
       pendingClarification = null;
+      persistResponseState();
       const proposal = buildProposalFromGeminiResponse(response);
       if (!proposal) {
         return {
@@ -826,6 +973,7 @@ function processGeminiResponse(response) {
 
     case "plan_proposal":
       pendingClarification = null;
+      persistResponseState();
       return {
         message: response.message || "Here's the plan I recommend.",
         items: [],
@@ -834,12 +982,14 @@ function processGeminiResponse(response) {
 
     case "no_action":
       pendingClarification = null;
+      persistResponseState();
       return {
         message: response.message || "I can't help with that.",
         items: []
       };
 
     case "error":
+      persistResponseState();
       return {
         message: response.message || "Something went wrong.",
         items: []
@@ -897,6 +1047,8 @@ async function sendMessage(rawText) {
   const text = rawText.trim();
   if (!text) return;
 
+  try { await ensureConversation(); }
+  catch { /* The message is retained locally and a retry notice is shown below. */ }
   appendEntry({ role: "user", text });
 
   if (/^(?:never mind|forget (?:it|that|the plan)|drop the plan|cancel (?:this|the) plan|abandon (?:this|the) plan)$/i.test(text.trim())) {
@@ -905,11 +1057,13 @@ async function sendMessage(rawText) {
     currentProposal = null;
     savePlanningContext();
     appendEntry({ role: "assistant", text: "Okay, I’ve cleared that planning topic." });
+    updateSummaryIfPlanningResolved();
     renderConversation();
     return;
   }
 
-  const classification = classifyRequest(text);
+  const recallContext = await getRecallContext(text);
+  const classification = recallContext ? "analytical_query" : classifyRequest(text);
 
   let result;
 
@@ -933,7 +1087,7 @@ async function sendMessage(rawText) {
       currentProposal = directResult.proposal;
       renderProposalMessage(directResult.proposal.message);
       renderProposal(currentProposal);
-      appendEntry({ role: "assistant", text: directResult.proposal.message });
+      appendEntry({ role: "assistant", text: directResult.proposal.message, kind: "proposal_summary", proposalSummary: directResult.proposal.message, resolved: false });
       saveConversation();
       return;
     }
@@ -949,14 +1103,14 @@ async function sendMessage(rawText) {
   }
 
   if (classification === "analytical_query" || classification === "analytical_planning" || classification === "natural_language_action" || classification === "clarification_reply") {
-    const geminiResponse = await callGeminiEndpoint(text, classification === "analytical_planning");
+    const geminiResponse = await callGeminiEndpoint(text, classification === "analytical_planning", recallContext);
     result = processGeminiResponse(geminiResponse);
 
     if (result.proposal) {
       currentProposal = result.proposal;
       renderProposalMessage(result.message || "I've prepared an action for you to review.");
       renderProposal(currentProposal);
-      appendEntry({ role: "assistant", text: result.message || "Here's a proposed action." });
+      appendEntry({ role: "assistant", text: result.message || "Here's a proposed action.", kind: "proposal_summary", proposalSummary: result.message || "", resolved: false });
       saveConversation();
       return;
     }
@@ -968,6 +1122,7 @@ async function sendMessage(rawText) {
     }
 
     appendEntry({ role: "assistant", text: result.message, items: result.items || [] });
+    updateSummaryIfPlanningResolved();
     saveConversation();
     return;
   }
@@ -979,10 +1134,10 @@ async function sendMessage(rawText) {
 function handleProposalOrClarification(result, message) {
 }
 
-function confirmProposal() {
+async function confirmProposal() {
   if (!currentProposal) return;
   if (currentProposal.plan) {
-    confirmPlanProposal();
+    await confirmPlanProposal();
     return;
   }
 
@@ -995,7 +1150,7 @@ function confirmProposal() {
         showProcessingError("Missing item data.");
         return;
       }
-      result = saCreateItem(action.item);
+      result = await saCreateItem(action.item);
       if (!result.success) {
         showProcessingError(result.error);
         return;
@@ -1004,7 +1159,7 @@ function confirmProposal() {
       break;
 
     case "complete_item":
-      result = saCompleteItem(action.targetId);
+      result = await saCompleteItem(action.targetId);
       if (!result.success) {
         showProcessingError(result.error);
         return;
@@ -1013,7 +1168,7 @@ function confirmProposal() {
       break;
 
     case "cancel_item":
-      result = saCancelItem(action.targetId);
+      result = await saCancelItem(action.targetId);
       if (!result.success) {
         showProcessingError(result.error);
         return;
@@ -1022,7 +1177,7 @@ function confirmProposal() {
       break;
 
     case "mark_missed":
-      result = saMarkItemMissed(action.targetId);
+      result = await saMarkItemMissed(action.targetId);
       if (!result.success) {
         showProcessingError(result.error);
         return;
@@ -1044,7 +1199,7 @@ function confirmProposal() {
       if (conflictCheck && !conflictCheck.find(i => i.id === action.targetId)) {
         renderProposalMessage(`Warning: ${conflictCheck[0].title} and ${conflictCheck[1].title} overlap on ${formatDateLabel(action.item.date)}.`);
       }
-      result = saRescheduleItem(action.targetId, action.item.date, action.item.start, action.item.end);
+      result = await saRescheduleItem(action.targetId, action.item.date, action.item.start, action.item.end);
       if (!result.success) {
         showProcessingError(result.error);
         return;
@@ -1058,7 +1213,7 @@ function confirmProposal() {
         showProcessingError("Item no longer exists.");
         return;
       }
-      result = saUpdateItem(action.targetId, action.changes || {});
+      result = await saUpdateItem(action.targetId, action.changes || {});
       if (!result.success) {
         showProcessingError(result.error);
         return;
@@ -1072,7 +1227,7 @@ function confirmProposal() {
         showProcessingError("Item no longer exists.");
         return;
       }
-      result = saPostponeItem(action.targetId, action.postponeMinutes || 15);
+      result = await saPostponeItem(action.targetId, action.postponeMinutes || 15);
       if (!result.success) {
         showProcessingError(result.error);
         return;
@@ -1086,6 +1241,10 @@ function confirmProposal() {
   }
 
   currentProposal = null;
+  await persistenceQueue;
+  await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+  conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
+  await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("active")).catch(showPersistenceFailure);
   saveConversation();
   renderConversation();
 }
@@ -1111,7 +1270,7 @@ function applyPlanEdits(proposal, proposalEl) {
   }
 }
 
-function confirmPlanProposal() {
+async function confirmPlanProposal() {
   const proposal = currentProposal;
   const proposalEl = assistantEls.conversation.querySelector(`.proposal[data-proposal-id="${proposal.id}"]`);
   if (!proposalEl) return;
@@ -1122,7 +1281,7 @@ function confirmPlanProposal() {
     renderConversation();
     return;
   }
-  const result = saApplyPlanAtomically(proposal.plan.actions);
+  const result = await saApplyPlanAtomically(proposal.plan.actions);
   if (!result.success) {
     showProcessingError(`I couldn't apply that plan: ${result.error}`);
     renderConversation();
@@ -1132,7 +1291,11 @@ function confirmPlanProposal() {
   pendingClarification = null;
   activePlanningContext = null;
   savePlanningContext();
+  await persistenceQueue;
+  await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+  conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
   appendEntry({ role: "assistant", text: `Confirmed. The complete plan with ${proposal.plan.actions.length} actions has been saved.` });
+  await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("active")).catch(showPersistenceFailure);
   renderConversation();
 }
 
@@ -1149,7 +1312,7 @@ function editProposal() {
   openAddDialogForEdit(currentProposal);
 }
 
-function cancelProposal() {
+async function cancelProposal() {
   if (!currentProposal) return;
 
   const wasPlan = Boolean(currentProposal.plan);
@@ -1157,7 +1320,11 @@ function cancelProposal() {
   pendingClarification = null;
   activePlanningContext = null;
   savePlanningContext();
+  await persistenceQueue;
+  await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+  conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
   if (wasPlan) appendEntry({ role: "assistant", text: "Plan cancelled. No schedule changes were made." });
+  await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("active")).catch(showPersistenceFailure);
   renderConversation();
 }
 
@@ -1243,14 +1410,14 @@ assistantEls.voice.addEventListener("click", () => {
 });
 
 assistantEls.clear.addEventListener("click", () => {
-  conversation = [];
-  pendingClarification = null;
-  currentProposal = null;
-  activePlanningContext = null;
-  savePlanningContext();
-  saveConversation();
-  renderConversation();
+  startNewConversation().catch(showPersistenceFailure);
   assistantEls.input.focus();
+});
+
+assistantEls.newConversation.addEventListener("click", () => startNewConversation().catch(showPersistenceFailure));
+assistantEls.recentConversations.addEventListener("change", event => openConversation(event.target.value));
+assistantEls.retrySave.addEventListener("click", () => {
+  persistenceQueue = persistenceQueue.then(persistPendingMessages);
 });
 
 assistantEls.conversation.addEventListener("click", event => {
@@ -1270,6 +1437,10 @@ assistantEls.conversation.addEventListener("click", event => {
   if (button.dataset.action === "cancel") cancelProposal();
 });
 
+renderConversation();
+refreshRecentConversationList().catch(showPersistenceFailure);
+if (pendingMessageWrites.length) showPersistenceFailure();
+
 function openAddDialog() {
   document.querySelector("#addForm").reset();
   document.querySelector("#itemType").value = "activity";
@@ -1282,5 +1453,3 @@ function classifyAndProcess(text) {
   const classification = classifyRequest(text);
   return classification;
 }
-
-renderConversation();

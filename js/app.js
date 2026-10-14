@@ -4,9 +4,7 @@ var items = loadItems();
 let calendarCursor = new Date();
 let selectedDate = localDateString(new Date());
 
-const categoryColors = {
-  Music: "#8B5CF6", Health: "#EC4899", Personal: "#14B8A6", Meetings: "#F97316", Travel: "#6366F1"
-};
+const categoryColors = Object.fromEntries((window.cloudCategories || []).map(category => [category.name, /^#[0-9a-f]{6}$/i.test(category.color || "") ? category.color : "#2563EB"]));
 
 const els = {
   todayView: document.querySelector("#todayView"), calendarView: document.querySelector("#calendarView"), assistantView: document.querySelector("#assistantView"), progressView: document.querySelector("#progressView"),
@@ -22,6 +20,11 @@ const els = {
   navToday: document.querySelector("#navToday"), navCalendar: document.querySelector("#navCalendar"), navAssistant: document.querySelector("#navAssistant"), navProgress: document.querySelector("#navProgress"), navAdd: document.querySelector("#navAddButton"),
   prevMonth: document.querySelector("#prevMonthButton"), nextMonth: document.querySelector("#nextMonthButton")
 };
+
+const categorySelect = document.querySelector('#addForm select[name="category"]');
+if (categorySelect && window.cloudCategories?.length) {
+  categorySelect.replaceChildren(...window.cloudCategories.map(category => new Option(category.name, category.name)));
+}
 
 // Local date helpers — every YYYY-MM-DD value is built and read in local time
 function parseLocalDate(value) {
@@ -56,19 +59,77 @@ function detectConflict(dateItems) {
   return null;
 }
 
-function scheduleItemHtml(item) {
-  return `<article class="schedule-item"><span class="category-dot" style="--category-color:${categoryColors[item.category] || "#2563EB"}"></span><div><h3>${item.title}</h3><p>${itemTime(item)} · ${item.category}</p></div><span class="item-status status-${item.status}">${item.status.replace("-", " ")}</span></article>`;
+function scheduleItemNode(item) {
+  const article = document.createElement("article");
+  article.className = "schedule-item";
+  const dot = document.createElement("span");
+  dot.className = "category-dot";
+  dot.style.setProperty("--category-color", categoryColors[item.category] || "#2563EB");
+  const content = document.createElement("div");
+  const title = document.createElement("h3");
+  title.textContent = item.title;
+  const detail = document.createElement("p");
+  detail.textContent = `${itemTime(item)} · ${item.category}`;
+  content.append(title, detail);
+  const status = document.createElement("span");
+  status.className = `item-status status-${String(item.status || "upcoming").replace(/[^a-z-]/gi, "")}`;
+  status.textContent = String(item.status || "upcoming").replaceAll("-", " ");
+  article.append(dot, content, status);
+  return article;
 }
 
 function renderAttention(dateItems) {
   const attention = getAttentionItem(dateItems);
-  els.now.innerHTML = attention ? `<article class="attention-item"><span class="status">${attention.status.replace("-", " ")}</span><h3>${attention.title}</h3><p>${itemTime(attention)}</p><p class="reason">${attention.status === "in-progress" ? "Currently scheduled" : attention.postponed ? `Postponed ${attention.postponed} time${attention.postponed > 1 ? "s" : ""}` : "Next item needing attention"}</p><div class="actions"><button class="primary-button" data-action="complete" data-id="${attention.id}">Done</button><button class="secondary-button" data-action="postpone" data-id="${attention.id}">Postpone</button></div></article>` : `<div class="empty-state">Nothing needs attention right now.</div>`;
+  if (!attention) {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = "Nothing needs attention right now.";
+    els.now.replaceChildren(empty);
+    return;
+  }
+  const article = document.createElement("article");
+  article.className = "attention-item";
+  const status = document.createElement("span");
+  status.className = "status";
+  status.textContent = String(attention.status || "upcoming").replaceAll("-", " ");
+  const title = document.createElement("h3");
+  title.textContent = attention.title;
+  const time = document.createElement("p");
+  time.textContent = itemTime(attention);
+  const reason = document.createElement("p");
+  reason.className = "reason";
+  reason.textContent = attention.status === "in-progress" ? "Currently scheduled" : attention.postponed ? `Postponed ${attention.postponed} time${attention.postponed > 1 ? "s" : ""}` : "Next item needing attention";
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  for (const [action, label, className] of [["complete", "Done", "primary-button"], ["postpone", "Postpone", "secondary-button"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.dataset.action = action;
+    button.dataset.id = attention.id;
+    button.textContent = label;
+    actions.appendChild(button);
+  }
+  article.append(status, title, time, reason, actions);
+  els.now.replaceChildren(article);
 }
 
 function renderSchedule(dateItems, listEl, conflictEl, emptyText) {
-  listEl.innerHTML = dateItems.length ? dateItems.map(scheduleItemHtml).join("") : `<div class="empty-state">${emptyText}</div>`;
+  if (dateItems.length) listEl.replaceChildren(...dateItems.map(scheduleItemNode));
+  else {
+    const empty = document.createElement("div");
+    empty.className = "empty-state";
+    empty.textContent = emptyText;
+    listEl.replaceChildren(empty);
+  }
   const conflict = detectConflict(dateItems);
-  conflictEl.innerHTML = conflict ? `<div class="conflict"><strong>Schedule conflict:</strong> ${conflict[0].title} overlaps with ${conflict[1].title}.</div>` : "";
+  if (!conflict) { conflictEl.replaceChildren(); return; }
+  const notice = document.createElement("div");
+  notice.className = "conflict";
+  const label = document.createElement("strong");
+  label.textContent = "Schedule conflict: ";
+  notice.append(label, document.createTextNode(`${conflict[0].title} overlaps with ${conflict[1].title}.`));
+  conflictEl.replaceChildren(notice);
 }
 
 // Timed activities first (by start time), then untimed activities, tasks, then routines
@@ -129,17 +190,17 @@ function render() {
   renderSelectedDate();
 }
 
-function completeItem(id) {
-  const result = saCompleteItem(id);
+async function completeItem(id) {
+  const result = await saCompleteItem(id);
   if (!result.success) {
-    console.error("Complete failed:", result.error);
+    alert(`Could not complete item: ${result.error}`);
   }
 }
 
-function postponeItem(id) {
-  const result = saPostponeItem(id);
+async function postponeItem(id) {
+  const result = await saPostponeItem(id);
   if (!result.success) {
-    console.error("Postpone failed:", result.error);
+    alert(`Could not postpone item: ${result.error}`);
   }
 }
 
@@ -193,7 +254,7 @@ function openAddDialog() {
 
 document.querySelector("#closeAddButton").addEventListener("click", () => els.dialog.close());
 els.type.addEventListener("change", () => { els.timeFields.hidden = els.type.value === "task"; });
-els.form.addEventListener("submit", event => {
+els.form.addEventListener("submit", async event => {
   event.preventDefault();
   const data = new FormData(els.form);
   const newItem = {
@@ -207,9 +268,9 @@ els.form.addEventListener("submit", event => {
     status: "upcoming",
     postponed: 0
   };
-  const result = saCreateItem(newItem);
+  const result = await saCreateItem(newItem);
   if (!result.success) {
-    console.error("Create failed:", result.error);
+    alert(`Could not save item: ${result.error}`);
     return;
   }
   els.form.reset();

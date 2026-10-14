@@ -11,7 +11,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL;
 /* ========== 2. System Instruction ========== */
 const GEMINI_SYSTEM_INSTRUCTION = `You are the natural-language interpretation and conversational reasoning component of Matson Time, a private personal time-management application.
 
-You operate Matson's personal time-management calendar. Interpret requests using only the supplied message and request context: currentDate (the supplied localDate), currentTime, timezone, availableCategories, relevantItems, pendingClarification, allowedActions, and compactFacts. Never treat this as business reservation management.
+You operate Matson's personal time-management calendar. Interpret requests using only the supplied message and request context: currentDate (the supplied localDate), currentTime, timezone, availableCategories, relevantItems, pendingClarification, allowedActions, compactFacts, activePlanningContext, and compact priorContext. Never treat this as business reservation management.
 
 SCHEDULING INTENT
 Words such as reserve, block, set aside, schedule, add, plan, book time for, make time for, put on my calendar, put in my schedule, and remind me to are ordinary personal schedule-management language. Do not reject them because they can mean something else outside this app. Infer the supported action from the whole request. Prefer create_item for a new commitment, activity, task, or explicitly recurring routine. Do not return no_action for a request that clearly maps to an allowed action. Use no_action only for unrelated requests or requests that cannot safely map to an allowed action, and explain briefly what you could not map.
@@ -56,6 +56,9 @@ PLANNING CONVERSATIONS
 Proposed commitments Matson mentions are valid planning facts even when unsaved. Never say they are absent just because they are not in relevantItems. On the first turn, extract mentioned proposed items, people, dates, times/durations, constraints, travel/preparation concerns, and planning goal into one small activePlanningContext. Continue from it on follow-up turns; do not discard its proposedItems, constraints, or goal when a follow-up omits details. Update that single active context when Matson corrects or adds information, and return the updated object as planningContext. Return null when the topic is clearly abandoned or resolved. The application sends this compact context, not the complete conversation history.
 
 When Matson asks for advice or to help manage, work out, fit into the week, resolve a conflict, choose where to move something, or plan mentioned items, use supplied weekly compactFacts and stored relevantItems. Never ask how to proceed when Matson asked for the best plan. Recommend one practical plan: identify the conflict, preserve fixed commitments where possible, move the more flexible item, allow enough activity and travel/preparation time, explain briefly, and require confirmation before writing. Do not silently change saved items. If duration, travel, meeting flexibility, or another necessary fact is missing, ask one focused clarification and retain planningContext. “30 minutes is not enough” is a constraint, not the desired duration.
+
+PRIOR CONVERSATION RECALL
+When compact priorContext is supplied, use only its matching summaries, snippets, and active memories to answer a recall question. Treat it as conversation history, not current schedule data. If no relevant match is supplied, say you could not find that prior topic and ask for another keyword. Do not claim details absent from that context.
 
 Use plan_proposal with requiresConfirmation true and non-empty plan.actions when multiple coordinated actions are needed. Keep action null for plan_proposal. Use proposed_action when only one action is needed. If a plan item lacks a required end time, ask for clarification before proposing the plan.
 
@@ -218,6 +221,7 @@ function validateRequest(body) {
   if (body.context !== undefined && (!Array.isArray(body.context) || body.context.some(item => !item || typeof item !== "object" || Array.isArray(item)))) return "Invalid context";
   if (body.pendingClarification !== undefined && body.pendingClarification !== null && (typeof body.pendingClarification !== "object" || Array.isArray(body.pendingClarification))) return "Invalid pendingClarification";
   if (body.activePlanningContext !== undefined && body.activePlanningContext !== null && (typeof body.activePlanningContext !== "object" || Array.isArray(body.activePlanningContext))) return "Invalid activePlanningContext";
+  if (body.priorContext !== undefined && body.priorContext !== null && (typeof body.priorContext !== "object" || Array.isArray(body.priorContext))) return "Invalid priorContext";
   return null;
 }
 
@@ -251,7 +255,7 @@ function getCurrentLocalTime() {
   return new Intl.DateTimeFormat("en-GB", { timeZone: TIMEZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date());
 }
 
-function buildRequestContext(message, scheduleItems, pendingClarification, compactFacts, activePlanningContext) {
+function buildRequestContext(message, scheduleItems, pendingClarification, compactFacts, activePlanningContext, priorContext) {
   return {
     message: message.trim(),
     currentDate: getCurrentLocalDate(),
@@ -268,7 +272,15 @@ function buildRequestContext(message, scheduleItems, pendingClarification, compa
       category: item.category, notes: item.notes, status: item.status,
       postponed: item.postponed || 0, recurrence: item.recurrence || null
     })),
-    compactFacts: compactFacts
+    compactFacts: compactFacts,
+    priorContext: priorContext && typeof priorContext === "object" ? {
+      conversations: Array.isArray(priorContext.conversations) ? priorContext.conversations.slice(0, 3).map(entry => ({
+        title: String(entry.title || "").slice(0, 80),
+        summary: String(entry.summary || "").slice(0, 300),
+        messages: Array.isArray(entry.messages) ? entry.messages.slice(-3).map(message => ({ role: message.role === "user" ? "user" : "assistant", text: String(message.text || "").slice(0, 220) })) : []
+      })) : [],
+      memories: Array.isArray(priorContext.memories) ? priorContext.memories.slice(0, 5).map(memory => ({ type: String(memory.type || "").slice(0, 50), text: String(memory.text || "").slice(0, 240) })) : []
+    } : null
   };
 }
 
@@ -557,7 +569,7 @@ module.exports = async function handler(req, res) {
     const contextItems = Array.isArray(body.context) ? body.context : [];
     let requestContext;
     try {
-      requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null, body.activePlanningContext || null);
+      requestContext = buildRequestContext(message, contextItems, body.pendingClarification || null, body.compactFacts || null, body.activePlanningContext || null, body.priorContext || null);
     } catch (error) {
       logAssistantStageFailure("gemini-request-body-construction", error, body);
       sendJson(res, 502, { kind: "error", message: "Unable to process that request right now." });
