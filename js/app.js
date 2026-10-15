@@ -28,8 +28,6 @@ const scheduleStatusPresentation = {
   cancelled: { label: "Cancelled", className: "cancelled" }
 };
 
-const categoryColors = Object.fromEntries((window.cloudCategories || []).map(category => [category.name, /^#[0-9a-f]{6}$/i.test(category.color || "") ? category.color : "#2563EB"]));
-function getCategoryColor(categoryName) { return categoryColors[categoryName] || "#2563EB"; }
 const attentionVisuals = {
   Health: { className: "health", image: "assets/illustrations/health.png" },
   Music: { className: "music", image: "assets/illustrations/music.png" },
@@ -40,10 +38,12 @@ const attentionVisuals = {
 
 const els = {
   todayView: document.querySelector("#todayView"), calendarView: document.querySelector("#calendarView"), assistantView: document.querySelector("#assistantView"), progressView: document.querySelector("#progressView"),
-  calendarDate: document.querySelector("#calendarDate"), todayMain: document.querySelector("#todayMain"), emptyDay: document.querySelector("#emptyDayState"), emptyAdd: document.querySelector("#emptyAddButton"), attentionSection: document.querySelector("#attentionSection"), todayScheduleSection: document.querySelector("#todayScheduleSection"), dailyProgress: document.querySelector("#dailyProgress"),
+  todayMain: document.querySelector("#todayMain"), emptyDay: document.querySelector("#emptyDayState"), emptyAdd: document.querySelector("#emptyAddButton"), attentionSection: document.querySelector("#attentionSection"), todayScheduleSection: document.querySelector("#todayScheduleSection"), dailyProgress: document.querySelector("#dailyProgress"),
   list: document.querySelector("#scheduleList"), count: document.querySelector("#scheduleCount"),
   now: document.querySelector("#nowCard"), conflict: document.querySelector("#conflictNotice"),
-  monthYear: document.querySelector("#monthYear"), calendarGrid: document.querySelector("#calendarGrid"),
+  monthYear: document.querySelector("#monthYear"), calendarGrid: document.querySelector("#calendarGrid"), calendarCard: document.querySelector("#calendarCard"),
+  calendarDateForm: document.querySelector("#calendarDateForm"), calendarDayInput: document.querySelector("#calendarDayInput"), calendarMonthInput: document.querySelector("#calendarMonthInput"),
+  calendarYearInput: document.querySelector("#calendarYearInput"), calendarMonthSuggestions: document.querySelector("#calendarMonthSuggestions"), calendarDateError: document.querySelector("#calendarDateError"),
   selectedTitle: document.querySelector("#selectedDateTitle"), selectedCount: document.querySelector("#selectedCount"),
   selectedSchedule: document.querySelector("#selectedSchedule"), selectedConflict: document.querySelector("#selectedConflict"),
   dialog: document.querySelector("#addDialog"), form: document.querySelector("#addForm"),
@@ -63,7 +63,10 @@ const els = {
   postponeNewStart: document.querySelector("#postponeNewStart"), postponeKeepDuration: document.querySelector("#postponeKeepDuration"),
   postponeNewEnd: document.querySelector("#postponeNewEnd"), postponeNewEndLabel: document.querySelector("#postponeNewEndLabel"),
   postponeDurationLabel: document.querySelector("#postponeDurationLabel"), postponeConflict: document.querySelector("#postponeConflict"),
-  postponeError: document.querySelector("#postponeError"), savePostpone: document.querySelector("#savePostponeButton")
+  postponeError: document.querySelector("#postponeError"), savePostpone: document.querySelector("#savePostponeButton"),
+  eventDetailDialog: document.querySelector("#calendarEventDialog"), eventDetailTitle: document.querySelector("#eventDetailTitle"), eventDetailContent: document.querySelector("#eventDetailContent"),
+  closeEventDetailButton: document.querySelector("#closeEventDetailButton"), closeEventDetailAction: document.querySelector("#closeEventDetailAction"), editEventDetailButton: document.querySelector("#editEventDetailButton"),
+  eventDetailTrigger: null, eventDetailItemId: null
 };
 
 const categorySelect = document.querySelector('#addForm select[name="category"]');
@@ -120,15 +123,6 @@ function resolveTodayState(todayItems, heroItems) {
   return heroItems.length ? "active_day" : "resolved_day";
 }
 
-// Overlapping timed activities within a single date
-function detectConflict(dateItems) {
-  const timed = dateItems.filter(i => i.start && i.end && i.status !== "completed").sort((a, b) => a.start.localeCompare(b.start));
-  for (let i = 0; i < timed.length - 1; i++) {
-    if (timed[i + 1].start < timed[i].end) return [timed[i], timed[i + 1]];
-  }
-  return null;
-}
-
 function timestampOrder(value) {
   if (!value) return Number.MAX_SAFE_INTEGER;
   if (typeof value.toMillis === "function") return value.toMillis();
@@ -156,21 +150,25 @@ function sortTodayItems(dateItems) {
   });
 }
 
-function scheduleItemNode(item, todayStyle = false) {
+function calendarItemTime(item) {
+  if (item.schedulePending || (!item.date && item.status === "postponed")) return "Time not set";
+  return item.start ? `${formatTime(item.start)}${item.end ? ` – ${formatTime(item.end)}` : ""}` : "Anytime";
+}
+
+function scheduleItemNode(item, todayStyle = false, calendarDate = null) {
   const article = document.createElement("article");
   const activeStatuses = ["upcoming", "in-progress", "overdue", "awaiting-check-in", "postponed"];
-  const selectable = todayStyle && activeStatuses.includes(item.status) && !item.schedulePending;
+  const calendarListing = !todayStyle && calendarDate !== null;
+  const isTodayCalendarDate = calendarListing && calendarDate === localDateString(new Date());
+  const routesToTodayHero = (todayStyle || isTodayCalendarDate) && activeStatuses.includes(item.status) && !item.schedulePending;
+  const selectable = (todayStyle && routesToTodayHero) || calendarListing;
   article.className = `schedule-item${selectable ? " is-selectable" : ""}${attentionSelectedItemId === item.id ? " is-hero-selected" : ""}`;
   if (selectable) {
     article.tabIndex = 0;
     article.setAttribute("role", "button");
-    article.setAttribute("aria-label", `Show ${item.title} in Today focus`);
-    article.dataset.todayHeroItem = item.id;
-  }
-  const categoryMarker = todayStyle ? null : document.createElement("span");
-  if (categoryMarker) {
-    categoryMarker.className = "category-dot";
-    categoryMarker.style.setProperty("--category-color", getCategoryColor(item.category));
+    article.setAttribute("aria-label", routesToTodayHero ? `Show ${item.title} in Today focus` : `View ${item.title} details`);
+    if (routesToTodayHero) article.dataset.todayHeroItem = item.id;
+    else if (calendarListing) article.dataset.calendarItem = item.id;
   }
   const content = document.createElement("div");
   const title = document.createElement("h3");
@@ -183,16 +181,15 @@ function scheduleItemNode(item, todayStyle = false) {
     time.textContent = itemTime(item);
     detail.append(time);
   } else {
-    detail.textContent = `${itemTime(item)} · ${item.category}`;
+    detail.textContent = calendarItemTime(item);
   }
 
   content.append(title, detail);
   const status = document.createElement("span");
   const statusStyle = scheduleStatusPresentation[item.status] || scheduleStatusPresentation.upcoming;
-  const statusClass = todayStyle ? statusStyle.className : String(item.status || "upcoming").replace(/[^a-z-]/gi, "");
+  const statusClass = statusStyle.className;
   status.className = `item-status status-${statusClass}`;
-  status.textContent = todayStyle ? statusStyle.label : String(item.status || "upcoming").replaceAll("-", " ");
-  if (categoryMarker) article.append(categoryMarker);
+  status.textContent = statusStyle.label;
   article.append(content, status);
   return article;
 }
@@ -283,28 +280,27 @@ function renderAttention(dateItems, heroItems = getAttentionItems(dateItems)) {
   els.now.replaceChildren(stage, actions);
 }
 
-function renderSchedule(dateItems, listEl, conflictEl, emptyText, todayStyle = false) {
-  if (dateItems.length) listEl.replaceChildren(...dateItems.map(item => scheduleItemNode(item, todayStyle)));
+function renderSchedule(dateItems, listEl, conflictEl, emptyText, todayStyle = false, calendarDate = null) {
+  if (dateItems.length) listEl.replaceChildren(...dateItems.map(item => scheduleItemNode(item, todayStyle, calendarDate)));
   else {
     const empty = document.createElement("div");
     empty.className = "empty-state";
     empty.textContent = emptyText;
     listEl.replaceChildren(empty);
   }
-  const conflict = detectConflict(dateItems);
-  if (!conflict) { conflictEl.replaceChildren(); return; }
+  const conflictDate = calendarDate || dateItems.find(item => item.date)?.date;
+  const allConflicts = conflictDate ? saDetectConflictsForDate(conflictDate, dateItems) : [];
+  const conflicts = calendarDate === null ? allConflicts.slice(0, 1) : allConflicts;
+  if (!conflicts.length) { conflictEl.replaceChildren(); return; }
   const notice = document.createElement("div");
   notice.className = "conflict";
-  const label = document.createElement("strong");
-  label.textContent = "Schedule conflict: ";
-  notice.append(label, document.createTextNode(`${conflict[0].title} overlaps with ${conflict[1].title}.`));
+  for (const conflict of conflicts) {
+    const line = document.createElement("p");
+    line.className = "conflict-line";
+    line.textContent = `Schedule conflict: ${conflict.firstTitle} overlaps with ${conflict.secondTitle} from ${formatTime(conflict.overlapStart)} to ${formatTime(conflict.overlapEnd)}.`;
+    notice.append(line);
+  }
   conflictEl.replaceChildren(notice);
-}
-
-// Timed activities first (by start time), then untimed activities, tasks, then routines
-function sortForDate(dateItems) {
-  const rank = item => item.type === "activity" ? (item.start ? 0 : 1) : item.type === "task" ? 2 : 3;
-  return [...dateItems].sort((a, b) => rank(a) - rank(b) || (rank(a) === 0 ? a.start.localeCompare(b.start) : 0));
 }
 
 function renderCalendar(today) {
@@ -320,16 +316,13 @@ function renderCalendar(today) {
   }
 
   const firstWeekday = (new Date(year, month, 1).getDay() + 6) % 7; // Monday = 0 … Sunday = 6
-  const cells = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map(day => `<span class="calendar-weekday">${day}</span>`);
-
-  // Six weeks cover every month layout; adjacent-month dates roll over via Date overflow
+  const cells = [];
   for (let index = 0; index < 42; index++) {
     const date = new Date(year, month, index - firstWeekday + 1);
     const dateStr = localDateString(date);
     const dateItems = itemsByDate.get(dateStr) || [];
-    const dots = dateItems.slice(0, 3).map(item => `<span class="day-dot" style="--category-color:${getCategoryColor(item.category)}"></span>`).join("");
     const classes = ["calendar-day", date.getMonth() !== month ? "other-month" : "", dateStr === today ? "today" : "", dateStr === selectedDate ? "selected" : ""].filter(Boolean).join(" ");
-    cells.push(`<button type="button" class="${classes}" data-date="${dateStr}" aria-label="${formatDateLabel(dateStr)}${dateItems.length ? `, ${dateItems.length} item${dateItems.length > 1 ? "s" : ""}` : ""}"><span class="day-number">${date.getDate()}</span><span class="day-dots" aria-hidden="true">${dots}</span></button>`);
+    cells.push(`<button type="button" class="${classes}" data-date="${dateStr}" aria-label="${formatDateLabel(dateStr)}" aria-pressed="${dateStr === selectedDate}"${dateStr === today ? ' aria-current="date"' : ""}><span class="day-number">${date.getDate()}</span></button>`);
   }
 
   els.calendarGrid.innerHTML = cells.join("");
@@ -339,13 +332,11 @@ function renderSelectedDate() {
   const dateItems = items.filter(item => item.date === selectedDate && !item.schedulePending);
   els.selectedTitle.textContent = formatDateLabel(selectedDate);
   els.selectedCount.textContent = `${dateItems.length} item${dateItems.length === 1 ? "" : "s"}`;
-  renderSchedule(sortForDate(dateItems), els.selectedSchedule, els.selectedConflict, "No items planned for this date.");
+  renderSchedule(sortTodayItems(dateItems), els.selectedSchedule, els.selectedConflict, "No items planned for this date.", false, selectedDate);
 }
 
 function render() {
   const today = localDateString(new Date());
-  els.calendarDate.textContent = formatDateLabel(today);
-
   const todayItems = items.filter(item => item.date === today && !item.schedulePending);
   const heroItems = getAttentionItems(todayItems);
   const todayState = resolveTodayState(todayItems, heroItems);
@@ -468,12 +459,12 @@ function getPostponeSchedule(item) {
 }
 
 function postponeConflictFor(candidate, scheduleItems = items) {
-  if (candidate.schedulePending || candidate.type !== "activity" || !candidate.start || !candidate.end) return null;
-  const overlaps = scheduleItems.find(item => item.id !== candidate.id && item.date === candidate.date && item.type === "activity" && item.start && item.end && !["completed", "missed", "cancelled"].includes(item.status) && candidate.start < item.end && item.start < candidate.end);
-  if (!overlaps) return null;
-  const start = candidate.start > overlaps.start ? candidate.start : overlaps.start;
-  const end = candidate.end < overlaps.end ? candidate.end : overlaps.end;
-  return `Schedule conflict: ${candidate.title} overlaps with ${overlaps.title} from ${formatTime(start)} to ${formatTime(end)}.`;
+  if (!candidate || candidate.schedulePending || !candidate.date) return null;
+  const conflict = saDetectConflictsForDate(candidate.date, [...scheduleItems.filter(item => item.id !== candidate.id), candidate])
+    .find(record => record.firstItemId === candidate.id || record.secondItemId === candidate.id);
+  return conflict
+    ? `Schedule conflict: ${conflict.firstTitle} overlaps with ${conflict.secondTitle} from ${formatTime(conflict.overlapStart)} to ${formatTime(conflict.overlapEnd)}.`
+    : null;
 }
 
 async function savePostponement(event) {
@@ -521,7 +512,7 @@ async function savePostponement(event) {
   }
 }
 
-function openEditItem(id) {
+function openEditItem(id, sourceDialog = els.postponeDialog) {
   const item = items.find(candidate => candidate.id === id);
   if (!item) return;
   editingItemId = id;
@@ -541,9 +532,48 @@ function openEditItem(id) {
   els.addDialog.querySelector(".eyebrow").textContent = "Update";
   els.addDialog.querySelector('[type="submit"]').textContent = "Save changes";
   els.timeFields.hidden = item.type === "task";
-  els.postponeDialog.close("edit");
+  if (sourceDialog?.open) sourceDialog.close("edit");
   els.addDialog.showModal();
   form.elements.title.focus();
+}
+
+function appendEventDetailRow(labelText, value) {
+  const label = document.createElement("dt");
+  label.textContent = labelText;
+  const description = document.createElement("dd");
+  description.textContent = value;
+  els.eventDetailContent.append(label, description);
+}
+
+function recurrenceLabel(recurrence) {
+  if (!recurrence?.frequency) return "Does not repeat";
+  const frequency = recurrence.frequency[0].toUpperCase() + recurrence.frequency.slice(1);
+  const interval = Math.max(1, Number(recurrence.interval) || 1);
+  const cadence = interval === 1 ? frequency : `Every ${interval} ${recurrence.frequency === "daily" ? "days" : recurrence.frequency === "weekly" ? "weeks" : "months"}`;
+  if (recurrence.frequency !== "weekly" || !Array.isArray(recurrence.days) || !recurrence.days.length) return cadence;
+  return `${cadence} on ${recurrence.days.join(", ")}`;
+}
+
+function openCalendarEventDetails(id, trigger) {
+  const item = items.find(candidate => candidate.id === id);
+  if (!item) return;
+  els.eventDetailItemId = id;
+  els.eventDetailTrigger = trigger;
+  els.eventDetailTitle.textContent = item.title;
+  els.eventDetailContent.replaceChildren();
+  appendEventDetailRow("Date", formatDateLabel(item.date));
+  appendEventDetailRow("Time", calendarItemTime(item));
+  appendEventDetailRow("Status", (scheduleStatusPresentation[item.status] || scheduleStatusPresentation.upcoming).label);
+  appendEventDetailRow("Category", item.category || "Personal");
+  if (item.notes) appendEventDetailRow("Notes", item.notes);
+  appendEventDetailRow("Repeat", recurrenceLabel(item.recurrence));
+  els.eventDetailDialog.returnValue = "";
+  els.eventDetailDialog.showModal();
+  els.closeEventDetailAction.focus();
+}
+
+function closeCalendarEventDetails(result = "close") {
+  if (els.eventDetailDialog.open) els.eventDetailDialog.close(result);
 }
 
 // Primary navigation
@@ -573,6 +603,121 @@ function shiftMonth(delta) {
 
 els.prevMonth.addEventListener("click", () => shiftMonth(-1));
 els.nextMonth.addEventListener("click", () => shiftMonth(1));
+
+const calendarMonthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+let activeMonthSuggestion = -1;
+
+function closeMonthSuggestions() {
+  els.calendarMonthSuggestions.hidden = true;
+  els.calendarMonthInput.setAttribute("aria-expanded", "false");
+  els.calendarMonthInput.removeAttribute("aria-activedescendant");
+  activeMonthSuggestion = -1;
+}
+
+function setActiveMonthSuggestion(index) {
+  const options = [...els.calendarMonthSuggestions.querySelectorAll('[role="option"]')];
+  if (!options.length) return;
+  activeMonthSuggestion = (index + options.length) % options.length;
+  options.forEach((option, optionIndex) => option.setAttribute("aria-selected", String(optionIndex === activeMonthSuggestion)));
+  els.calendarMonthInput.setAttribute("aria-activedescendant", options[activeMonthSuggestion].id);
+}
+
+function renderMonthSuggestions() {
+  const query = els.calendarMonthInput.value.trim().toLocaleLowerCase();
+  if (!query) { closeMonthSuggestions(); return; }
+  const matches = calendarMonthNames.map((name, index) => ({ name, index })).filter(month => month.name.toLocaleLowerCase().startsWith(query));
+  if (!matches.length) { closeMonthSuggestions(); return; }
+  els.calendarMonthSuggestions.replaceChildren(...matches.map(({ name, index }) => {
+    const option = document.createElement("li");
+    option.id = `calendar-month-option-${index}`;
+    option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", "false");
+    option.dataset.monthIndex = String(index);
+    option.textContent = name;
+    return option;
+  }));
+  activeMonthSuggestion = -1;
+  els.calendarMonthSuggestions.hidden = false;
+  els.calendarMonthInput.setAttribute("aria-expanded", "true");
+  setActiveMonthSuggestion(0);
+}
+
+function chooseMonthSuggestion(option) {
+  if (!option) return;
+  els.calendarMonthInput.value = calendarMonthNames[Number(option.dataset.monthIndex)];
+  closeMonthSuggestions();
+  if (isEnteredCalendarDateValid()) setCalendarDateError("");
+}
+
+function monthIndexFromInput(value) {
+  const normalized = value.trim().toLocaleLowerCase();
+  return calendarMonthNames.findIndex(name => normalized === name.toLocaleLowerCase() || normalized === name.slice(0, 3).toLocaleLowerCase());
+}
+
+function setCalendarDateError(message) {
+  els.calendarDateError.textContent = message;
+  els.calendarDateError.hidden = !message;
+}
+
+function isEnteredCalendarDateValid() {
+  const dayText = els.calendarDayInput.value.trim();
+  const monthIndex = monthIndexFromInput(els.calendarMonthInput.value);
+  const yearText = els.calendarYearInput.value.trim();
+  const day = Number(dayText), year = Number(yearText);
+  if (!/^\d{1,2}$/.test(dayText) || day < 1 || day > 31 || monthIndex < 0 || !/^\d{4}$/.test(yearText) || year < 1900 || year > 2100) return false;
+  const candidate = new Date(year, monthIndex, day);
+  return candidate.getFullYear() === year && candidate.getMonth() === monthIndex && candidate.getDate() === day;
+}
+
+function goToEnteredDate(event) {
+  event.preventDefault();
+  if (!els.calendarMonthSuggestions.hidden && activeMonthSuggestion >= 0) {
+    chooseMonthSuggestion(els.calendarMonthSuggestions.querySelectorAll('[role="option"]')[activeMonthSuggestion]);
+  }
+  const dayText = els.calendarDayInput.value.trim();
+  const monthIndex = monthIndexFromInput(els.calendarMonthInput.value);
+  const yearText = els.calendarYearInput.value.trim();
+  const day = Number(dayText), year = Number(yearText);
+  if (!/^\d{1,2}$/.test(dayText) || day < 1 || day > 31 || monthIndex < 0 || !/^\d{4}$/.test(yearText) || year < 1900 || year > 2100) {
+    setCalendarDateError("Enter a valid date.");
+    return;
+  }
+  const candidate = new Date(year, monthIndex, day);
+  if (candidate.getFullYear() !== year || candidate.getMonth() !== monthIndex || candidate.getDate() !== day) {
+    setCalendarDateError("Enter a valid date.");
+    return;
+  }
+  selectedDate = localDateString(candidate);
+  calendarCursor = new Date(year, monthIndex, 1);
+  setCalendarDateError("");
+  closeMonthSuggestions();
+  render();
+}
+
+els.calendarMonthInput.addEventListener("input", () => { if (isEnteredCalendarDateValid()) setCalendarDateError(""); renderMonthSuggestions(); });
+els.calendarMonthInput.addEventListener("keydown", event => {
+  if (event.key === "ArrowDown" && !els.calendarMonthSuggestions.hidden) { event.preventDefault(); setActiveMonthSuggestion(activeMonthSuggestion + 1); }
+  else if (event.key === "ArrowUp" && !els.calendarMonthSuggestions.hidden) { event.preventDefault(); setActiveMonthSuggestion(activeMonthSuggestion <= 0 ? els.calendarMonthSuggestions.children.length - 1 : activeMonthSuggestion - 1); }
+  else if (event.key === "Enter" && !els.calendarMonthSuggestions.hidden && activeMonthSuggestion >= 0) {
+    event.preventDefault();
+    chooseMonthSuggestion(els.calendarMonthSuggestions.querySelectorAll('[role="option"]')[activeMonthSuggestion]);
+  } else if (event.key === "Escape" && !els.calendarMonthSuggestions.hidden) { event.preventDefault(); closeMonthSuggestions(); }
+});
+els.calendarMonthSuggestions.addEventListener("pointerdown", event => event.preventDefault());
+document.addEventListener("pointerdown", event => {
+  if (!els.calendarDateForm.contains(event.target)) closeMonthSuggestions();
+});
+els.calendarMonthSuggestions.addEventListener("click", event => {
+  const option = event.target.closest('[role="option"]');
+  if (option) chooseMonthSuggestion(option);
+});
+for (const input of [els.calendarDayInput, els.calendarYearInput]) {
+  input.addEventListener("input", () => {
+    input.value = input.value.replace(/\D/g, "").slice(0, input === els.calendarDayInput ? 2 : 4);
+    if (isEnteredCalendarDateValid()) setCalendarDateError("");
+  });
+}
+els.calendarDateForm.addEventListener("submit", goToEnteredDate);
 
 els.calendarGrid.addEventListener("click", event => {
   const day = event.target.closest(".calendar-day");
@@ -623,6 +768,36 @@ els.list.addEventListener("keydown", event => {
   if (!row || !["Enter", " "].includes(event.key)) return;
   event.preventDefault();
   selectTodayHeroItem(row.dataset.todayHeroItem);
+});
+
+function handleCalendarScheduleActivation(event) {
+  const row = event.target.closest("[data-today-hero-item], [data-calendar-item]");
+  if (!row) return;
+  if (event.type === "keydown") {
+    if (!["Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+  }
+  if (row.dataset.todayHeroItem) selectTodayHeroItem(row.dataset.todayHeroItem);
+  else openCalendarEventDetails(row.dataset.calendarItem, row);
+}
+
+els.selectedSchedule.addEventListener("click", handleCalendarScheduleActivation);
+els.selectedSchedule.addEventListener("keydown", handleCalendarScheduleActivation);
+els.closeEventDetailButton.addEventListener("click", () => closeCalendarEventDetails());
+els.closeEventDetailAction.addEventListener("click", () => closeCalendarEventDetails());
+els.editEventDetailButton.addEventListener("click", () => {
+  const id = els.eventDetailItemId;
+  if (id) openEditItem(id, els.eventDetailDialog);
+});
+els.eventDetailDialog.addEventListener("click", event => {
+  if (event.target === els.eventDetailDialog) closeCalendarEventDetails();
+});
+els.eventDetailDialog.addEventListener("close", () => {
+  const trigger = els.eventDetailTrigger;
+  const wasEdit = els.eventDetailDialog.returnValue === "edit";
+  els.eventDetailTrigger = null;
+  els.eventDetailItemId = null;
+  if (!wasEdit && trigger?.isConnected) trigger.focus();
 });
 
 function openAttentionCancel(trigger) {

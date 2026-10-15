@@ -254,9 +254,51 @@ function saGetWeekItems(startDate = null) {
   return items.filter(item => item.date && item.date >= weekStart && item.date <= weekEnd);
 }
 
-function saDetectConflictsForDate(dateStr) {
-  const dateItems = saGetItemsForDate(dateStr);
-  return detectConflict(dateItems);
+function saTimeToMinutes(value) {
+  if (typeof value !== "string" || !/^\d{2}:\d{2}$/.test(value)) return null;
+  const [hour, minute] = value.split(":").map(Number);
+  return hour <= 23 && minute <= 59 ? hour * 60 + minute : null;
+}
+
+function saMinutesToTime(value) {
+  return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
+}
+
+function saDetectConflictsForDate(dateStr, scheduleItems = items) {
+  if (!scheduleValidateDate(dateStr)) return [];
+  const eligibleStatuses = new Set(["upcoming", "in-progress", "overdue", "awaiting-check-in", "postponed"]);
+  const timed = scheduleItems.filter(item => {
+    if (!item || !item.id || item.date !== dateStr || !eligibleStatuses.has(item.status) || item.schedulePending) return false;
+    if (item.status === "postponed" && (!item.date || !item.start || !item.end)) return false;
+    const start = saTimeToMinutes(item.start), end = saTimeToMinutes(item.end);
+    return start !== null && end !== null && end > start;
+  }).map(item => ({ item, start: saTimeToMinutes(item.start), end: saTimeToMinutes(item.end) }))
+    .sort((a, b) => a.start - b.start || a.end - b.end || String(a.item.id).localeCompare(String(b.item.id)));
+
+  const conflicts = [];
+  const seen = new Set();
+  for (let i = 0; i < timed.length; i++) {
+    for (let j = i + 1; j < timed.length; j++) {
+      const first = timed[i], second = timed[j];
+      if (second.start >= first.end) break;
+      if (first.item.id === second.item.id) continue;
+      const [smallerId, largerId] = [String(first.item.id), String(second.item.id)].sort();
+      const pairKey = `${smallerId}::${largerId}`;
+      if (seen.has(pairKey)) continue;
+      seen.add(pairKey);
+      conflicts.push({
+        firstItemId: first.item.id,
+        firstTitle: typeof first.item.title === "string" ? first.item.title : "Schedule item",
+        secondItemId: second.item.id,
+        secondTitle: typeof second.item.title === "string" ? second.item.title : "Schedule item",
+        date: dateStr,
+        overlapStart: saMinutesToTime(Math.max(first.start, second.start)),
+        overlapEnd: saMinutesToTime(Math.min(first.end, second.end)),
+        pairKey: `${dateStr}|${pairKey}`
+      });
+    }
+  }
+  return conflicts.sort((a, b) => saTimeToMinutes(a.overlapStart) - saTimeToMinutes(b.overlapStart) || a.pairKey.localeCompare(b.pairKey));
 }
 
 function saCalculateDailyProgress(dateStr = null) {
@@ -406,8 +448,7 @@ function saGetCompactFacts() {
     const date = new Date(parseLocalDate(today));
     date.setDate(date.getDate() + i);
     const dateStr = localDateString(date);
-    const conflict = saDetectConflictsForDate(dateStr);
-    if (conflict) conflicts.push({ date: dateStr, items: [conflict[0].title, conflict[1].title] });
+    for (const conflict of saDetectConflictsForDate(dateStr)) conflicts.push({ date: dateStr, items: [conflict.firstTitle, conflict.secondTitle] });
   }
   return { dailyMinutes, postponementCounts, conflicts };
 }
@@ -442,12 +483,7 @@ function saGetWeeklyAvailabilityFacts() {
     for (let i = 1; i < timed.length; i++) {
       if (timed[i - 1].end < timed[i].start) openPeriods.push({ start: timed[i - 1].end, end: timed[i].start });
     }
-    const conflicts = [];
-    for (let i = 0; i < timed.length; i++) {
-      for (let j = i + 1; j < timed.length; j++) {
-        if (timed[j].start < timed[i].end) conflicts.push([timed[i].title, timed[j].title]);
-      }
-    }
+    const conflicts = saDetectConflictsForDate(dateStr, dateItems).map(conflict => [conflict.firstTitle, conflict.secondTitle]);
     days.push({
       date: dateStr,
       scheduledPeriods,
@@ -605,22 +641,8 @@ async function saApplyBulkAtomically(bulkAction) {
 }
 
 function saScheduleConflictKeys(scheduleItems) {
-  const grouped = new Map();
-  for (const item of scheduleItems) {
-    if (!item.date || !item.start || !item.end || ["cancelled", "completed"].includes(item.status)) continue;
-    if (!grouped.has(item.date)) grouped.set(item.date, []);
-    grouped.get(item.date).push(item);
-  }
-  const keys = [];
-  for (const [date, timed] of grouped) {
-    timed.sort((a, b) => a.start.localeCompare(b.start));
-    for (let i = 0; i < timed.length; i++) {
-      for (let j = i + 1; j < timed.length; j++) {
-        if (timed[j].start < timed[i].end) keys.push(`${date}|${[timed[i].id, timed[j].id].sort().join("|")}`);
-      }
-    }
-  }
-  return keys;
+  const dates = new Set(scheduleItems.map(item => item.date).filter(Boolean));
+  return [...dates].flatMap(date => saDetectConflictsForDate(date, scheduleItems).map(conflict => conflict.pairKey));
 }
 
 function saFormatDateForGemini(dateStr) {

@@ -739,11 +739,10 @@ function answerConflicts() {
     const date = new Date();
     date.setDate(date.getDate() + i);
     const dateStr = localDateString(date);
-    const conflict = saDetectConflictsForDate(dateStr);
-    if (conflict) conflicts.push({ date: dateStr, items: [conflict[0].title, conflict[1].title] });
+    for (const conflict of saDetectConflictsForDate(dateStr)) conflicts.push({ date: dateStr, items: [conflict.firstTitle, conflict.secondTitle], overlapStart: conflict.overlapStart, overlapEnd: conflict.overlapEnd });
   }
   if (!conflicts.length) return { text: "No schedule conflicts detected this week." };
-  const messages = conflicts.map(c => `${formatDateLabel(c.date)}: ${c.items[0]} overlaps with ${c.items[1]}`);
+  const messages = conflicts.map(c => `${formatDateLabel(c.date)}: ${c.items[0]} overlaps with ${c.items[1]} from ${formatTime(c.overlapStart)} to ${formatTime(c.overlapEnd)}`);
   return { text: `${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"} found.\n${messages.join("\n")}` };
 }
 
@@ -848,7 +847,7 @@ function handleDirectInterfaceAction(message) {
     const minutes = text.includes("30") ? 30 : text.includes("one hour") ? 60 : 15;
     targetItem = getDirectActionTarget();
     if (targetItem) {
-      const conflict = saDetectConflictsForDate(targetItem.date);
+      const conflict = saDetectConflictsForDate(targetItem.date)[0] || null;
       return {
         proposal: {
           id: crypto.randomUUID(),
@@ -860,7 +859,7 @@ function handleDirectInterfaceAction(message) {
             postponeMinutes: minutes
           },
           message: `Postpone "${targetItem.title}" by ${minutes} minutes?`,
-          conflict: conflict || null,
+          conflict: conflict ? { items: [conflict.firstTitle, conflict.secondTitle], overlapStart: conflict.overlapStart, overlapEnd: conflict.overlapEnd } : null,
           originalMessage: message,
           source: "local"
         }
@@ -1075,7 +1074,7 @@ async function callGeminiEndpoint(message, planningRequest = false, priorContext
     nextItem: scheduled.find(item => item.date > today || (item.date === today && item.start >= currentTime)) || null,
     durations: scheduled.map(item => ({ id: item.id, minutes: toMinutes(item.end) - toMinutes(item.start) })),
     gaps: scheduled.slice(1).filter((item, index) => item.date === scheduled[index].date).map((item, index) => ({ afterId: scheduled[index].id, beforeId: item.id, minutes: toMinutes(item.start) - toMinutes(scheduled[index].end) })),
-    conflicts: scheduled.flatMap((item, index) => scheduled.slice(index + 1).filter(next => next.date === item.date && next.start < item.end).map(next => ({ date: item.date, itemIds: [item.id, next.id] }))),
+    conflicts: [...new Set(scheduled.map(item => item.date))].flatMap(date => saDetectConflictsForDate(date, relevantItems).map(conflict => ({ date: conflict.date, itemIds: [conflict.firstItemId, conflict.secondItemId], overlapStart: conflict.overlapStart, overlapEnd: conflict.overlapEnd }))),
     postponementHistory: relevantItems.filter(item => item.postponed > 0).map(item => ({ id: item.id, count: item.postponed })),
     candidateTimeSlots: (() => {
       const byDate = new Map();
@@ -1271,8 +1270,9 @@ function buildProposalFromGeminiResponse(response) {
   if (proposedDate && (["create_item", "reschedule_item"].includes(action.type) || (action.type === "update_item" && (changes?.date || changes?.start || changes?.end)))) {
     const candidate = action.item || (target ? { ...target, ...changes } : null);
     if (candidate?.start && candidate.end) {
-      const peer = saGetItemsForDate(proposedDate).find(item => item.id !== target?.id && !["cancelled", "completed"].includes(item.status) && item.start && item.end && candidate.start < item.end && item.start < candidate.end);
-      if (peer) conflict = [candidate, peer];
+      const candidateWithId = { ...candidate, id: candidate.id || crypto.randomUUID(), date: proposedDate, status: candidate.status || "upcoming", schedulePending: false };
+      const peers = saGetItemsForDate(proposedDate).filter(item => item.id !== target?.id);
+      conflict = saDetectConflictsForDate(proposedDate, [...peers, candidateWithId]).find(record => record.firstItemId === candidateWithId.id || record.secondItemId === candidateWithId.id) || null;
     }
   }
   const proposal = {
@@ -1285,7 +1285,7 @@ function buildProposalFromGeminiResponse(response) {
       postponeMinutes: action.postponeMinutes || null
     },
     message: response.message || "",
-    conflict: conflict ? { items: [conflict[0].title, conflict[1].title] } : null,
+    conflict: conflict ? { items: [conflict.firstTitle, conflict.secondTitle], overlapStart: conflict.overlapStart, overlapEnd: conflict.overlapEnd } : null,
     originalMessage: response.message || "",
     source: "gemini"
   };
@@ -1702,15 +1702,14 @@ async function confirmProposal() {
         return;
       }
       const changes = action.changes || {};
-      const nextItem = { ...target, ...changes };
+      const nextItem = { ...target, ...changes, schedulePending: false };
       if (!nextItem.date || !nextItem.start || !nextItem.end || nextItem.start >= nextItem.end) {
         showProcessingError("Missing new schedule details.");
         return;
       }
-      const conflictCheck = saDetectConflictsForDate(nextItem.date);
-      if (conflictCheck && !conflictCheck.find(i => i.id === action.targetId)) {
-        renderProposalMessage(`Warning: ${conflictCheck[0].title} and ${conflictCheck[1].title} overlap on ${formatDateLabel(nextItem.date)}.`);
-      }
+      const conflictCheck = saDetectConflictsForDate(nextItem.date, [...items.filter(item => item.id !== action.targetId), nextItem])
+        .find(conflict => conflict.firstItemId === nextItem.id || conflict.secondItemId === nextItem.id);
+      if (conflictCheck) renderProposalMessage(`Warning: ${conflictCheck.firstTitle} and ${conflictCheck.secondTitle} overlap on ${formatDateLabel(nextItem.date)} from ${formatTime(conflictCheck.overlapStart)} to ${formatTime(conflictCheck.overlapEnd)}.`);
       result = await saRescheduleItem(action.targetId, nextItem.date, nextItem.start, nextItem.end);
       if (!result.success) {
         showProcessingError(result.error);

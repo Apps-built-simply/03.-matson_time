@@ -55,25 +55,41 @@
 
     <!-- Calendar view -->
     <div id="calendarView" hidden>
-      <header class="app-header">
+      <header class="app-header calendar-page-header">
         <div class="container">
-          <div class="calendar-header">
-            <div class="calendar-heading">
-              <p class="eyebrow" id="calendarDate"></p>
-              <h1>Calendar</h1>
-            </div>
-            <div class="month-nav">
-              <button class="icon-button secondary" id="prevMonthButton" aria-label="Previous month">‹</button>
-              <p class="month-year" id="monthYear"></p>
-              <button class="icon-button secondary" id="nextMonthButton" aria-label="Next month">›</button>
-            </div>
-          </div>
+          <h1>Calendar</h1>
           <button class="page-guidance-button" type="button" aria-label="Page guidance" data-guidance="calendar"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg></button>
         </div>
       </header>
 
-      <main class="container">
-        <div class="calendar-grid" id="calendarGrid" aria-label="Month calendar"></div>
+      <main class="container calendar-main">
+        <section class="calendar-card" id="calendarCard" aria-label="Month calendar">
+          <div class="calendar-card-header">
+            <h2 class="month-year" id="monthYear"></h2>
+            <div class="month-nav" role="group" aria-label="Month navigation">
+              <button type="button" class="month-nav-button" id="prevMonthButton" aria-label="Previous month"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
+              <button type="button" class="month-nav-button" id="nextMonthButton" aria-label="Next month"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 10 6 6 6-6"/></svg></button>
+            </div>
+          </div>
+          <div class="calendar-weekdays" aria-hidden="true">
+            <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+          </div>
+          <div class="calendar-grid" id="calendarGrid" role="group" aria-label="Dates"></div>
+        </section>
+
+        <form class="go-to-date" id="calendarDateForm" novalidate>
+          <label for="calendarDayInput">Go to date</label>
+          <div class="date-entry-control">
+            <input id="calendarDayInput" class="date-entry-day" type="text" inputmode="numeric" maxlength="2" pattern="[0-9]{1,2}" aria-label="Day" placeholder="DD" autocomplete="off">
+            <div class="month-entry-wrap">
+              <input id="calendarMonthInput" class="date-entry-month" type="text" role="combobox" aria-label="Month" aria-autocomplete="list" aria-expanded="false" aria-controls="calendarMonthSuggestions" placeholder="Month" autocomplete="off">
+              <ul class="month-suggestions" id="calendarMonthSuggestions" role="listbox" aria-label="Month suggestions" hidden></ul>
+            </div>
+            <input id="calendarYearInput" class="date-entry-year" type="text" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" aria-label="Year" placeholder="YYYY" autocomplete="off">
+            <button type="submit" class="date-entry-go" aria-label="Go to entered date"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 5v4a5 5 0 0 1-5 5H5m0 0 5-5m-5 5 5 5"/></svg></button>
+          </div>
+          <p class="date-entry-error" id="calendarDateError" role="alert" hidden></p>
+        </form>
 
         <section aria-labelledby="selectedDateTitle">
           <div class="section-heading">
@@ -85,6 +101,20 @@
         </section>
       </main>
     </div>
+
+    <dialog id="calendarEventDialog" class="guidance-dialog event-detail-dialog" aria-labelledby="eventDetailTitle" aria-describedby="eventDetailContent">
+      <div class="guidance-content">
+        <div class="dialog-header">
+          <h2 id="eventDetailTitle"></h2>
+          <button type="button" class="guidance-close" id="closeEventDetailButton" aria-label="Close event details"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+        </div>
+        <dl id="eventDetailContent" class="event-detail-list"></dl>
+        <div class="event-detail-actions">
+          <button type="button" class="secondary-button" id="closeEventDetailAction">Close</button>
+          <button type="button" class="primary-button" id="editEventDetailButton">Edit item</button>
+        </div>
+      </div>
+    </dialog>
 
     <!-- Assistant view -->
     <div id="assistantView" hidden>
