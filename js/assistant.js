@@ -4,7 +4,6 @@ const PENDING_MESSAGE_WRITES_KEY = `matson-time-pending-message-writes-${firebas
 const MAX_CONVERSATION_ENTRIES = 30;
 
 const assistantEls = {
-  date: document.querySelector("#assistantDate"),
   conversation: document.querySelector("#conversation"),
   empty: document.querySelector("#assistantEmpty"),
   starters: document.querySelector("#starterActions"),
@@ -12,16 +11,59 @@ const assistantEls = {
   send: document.querySelector("#sendButton"),
   voice: document.querySelector("#voiceButton"),
   voiceNotice: document.querySelector("#voiceNotice"),
-  clear: document.querySelector("#clearConversation"),
   nav: document.querySelector("#navAssistant"),
-  newConversation: document.querySelector("#newConversationButton"),
-  recentConversations: document.querySelector("#recentConversations"),
   saveNotice: document.querySelector("#conversationSaveNotice"),
   saveText: document.querySelector("#conversationSaveText"),
-  retrySave: document.querySelector("#retryConversationSave")
+  retrySave: document.querySelector("#retryConversationSave"),
+  scrollLatest: document.querySelector("#scrollLatestButton"),
+  historyButton: document.querySelector("#conversationHistoryButton"),
+  newConversationHeaderButton: document.querySelector("#newConversationHeaderButton"),
+  assistantGuidanceButton: document.querySelector("#assistantGuidanceButton"),
+  drawer: document.querySelector("#conversationDrawer"),
+  drawerBackdrop: document.querySelector("#drawerBackdrop"),
+  closeDrawerButton: document.querySelector("#closeDrawerButton"),
+  drawerNewConversationButton: document.querySelector("#drawerNewConversationButton"),
+  drawerSearchInput: document.querySelector("#drawerSearchInput"),
+  drawerLoading: document.querySelector("#drawerLoading"),
+  drawerError: document.querySelector("#drawerError"),
+  drawerRetryButton: document.querySelector("#drawerRetryButton"),
+  drawerEmpty: document.querySelector("#drawerEmpty"),
+  drawerNoResults: document.querySelector("#drawerNoResults"),
+  drawerConversationList: document.querySelector("#drawerConversationList"),
+  drawerLoadMoreWrap: document.querySelector("#drawerLoadMoreWrap"),
+  drawerLoadMoreButton: document.querySelector("#drawerLoadMoreButton"),
+  drawerDeleteButton: document.querySelector("#drawerDeleteConversationButton"),
+  deleteDialog: document.querySelector("#deleteConversationDialog"),
+  confirmDeleteButton: document.querySelector("#confirmDeleteConversationButton"),
+  keepDeleteButton: document.querySelector("#keepDeleteConversationButton"),
+  contextMenu: document.querySelector("#conversationContextMenu"),
+  contextRenameButton: document.querySelector("#contextRenameButton"),
+  contextDeleteButton: document.querySelector("#contextDeleteButton"),
+  renameDialog: document.querySelector("#renameConversationDialog"),
+  renameForm: document.querySelector("#renameConversationForm"),
+  renameInput: document.querySelector("#renameConversationInput"),
+  renameError: document.querySelector("#renameConversationError"),
+  closeRenameButton: document.querySelector("#closeRenameDialogButton"),
+  cancelRenameButton: document.querySelector("#cancelRenameButton"),
+  saveRenameButton: document.querySelector("#saveRenameButton")
 };
 
 let voiceNoticeTimer = null;
+const composerDrafts = new Map();
+let isComposing = false;
+let sendInProgress = false;
+let newConversationInProgress = false;
+let waitingEl = null;
+let activeRevealController = null;
+let activeRequestId = null;
+let drawerConversations = [];
+let isDrawerOpen = false;
+let drawerTriggerButton = null;
+let drawerLimit = 20;
+let contextMenuConv = null;
+let contextMenuTriggerEl = null;
+let deletingConversationId = null;
+let renamingConversationId = null;
 let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ role: message.role, text: message.text, kind: message.kind, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [], deletedItemIds: message.deletedItemIds || [] })) : [];
 let activeConversationId = window.initialConversation?.id || window.initialAssistantState?.activeConversationId || null;
 let pendingClarification = window.initialAssistantState?.pendingClarification || null;
@@ -60,31 +102,58 @@ function rememberScheduleEntity(item, lastAction = "updated", mentions = []) {
 }
 function saveConversation() { /* Conversation writes are queued by appendEntry. */ }
 
-async function ensureConversation() {
-  if (activeConversationId) return activeConversationId;
-  activeConversationId = await firebaseStore.createConversation({ title: "New conversation", status: "active" });
-  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
-  await refreshRecentConversationList();
-  return activeConversationId;
-}
+function deriveConversationTitle(rawText) {
+  if (!rawText || typeof rawText !== "string") return "New conversation";
+  let text = rawText.trim().replace(/^[\s,.;:!?]+|[\s,.;:!?]+$/g, "");
 
-async function refreshRecentConversationList(max = 15) {
-  const recent = await firebaseStore.listRecentConversations(max);
-  const selected = activeConversationId;
-  assistantEls.recentConversations.replaceChildren(new Option("Select conversation", ""));
-  for (const item of recent) {
-    const option = new Option(item.title || "Conversation", item.id);
-    assistantEls.recentConversations.add(option);
+  if (/\b(?:[a-f0-9]{16,}|ai[a-z0-9_-]{20,})\b/i.test(text)) {
+    return "Schedule request";
   }
-  if (max <= 15) assistantEls.recentConversations.add(new Option("Load older conversations…", "__load_more__"));
-  assistantEls.recentConversations.value = selected || "";
+
+  const moveMatch = text.match(/^(?:please\s+)?(?:move|reschedule)\s+(?:my\s+)?([a-z0-9\s]+?)(?:\s+(?:to|for|at|on)\b.*)?$/i);
+  if (moveMatch && moveMatch[1]?.trim()) {
+    const item = moveMatch[1].trim();
+    if (item.length <= 25) {
+      return item.charAt(0).toUpperCase() + item.slice(1) + " move";
+    }
+  }
+
+  const manageMatch = text.match(/^(?:help\s+me\s+)?manage\s+(?:the\s+)?([a-z0-9\s]+?)(?:\s+and\s+(?:the\s+)?([a-z0-9\s]+?))?$/i);
+  if (manageMatch && manageMatch[1]) {
+    const part1 = manageMatch[1].trim();
+    const part2 = manageMatch[2]?.trim();
+    if (part2) {
+      const p1 = part1.charAt(0).toUpperCase() + part1.slice(1);
+      const p2 = part2.replace(/^meeting with\s+/i, "");
+      const p2Title = p2.charAt(0).toUpperCase() + p2.slice(1);
+      return `${p1} and ${p2Title} meeting`;
+    }
+  }
+
+  text = text.replace(/^(?:can you|could you|please|help me|i want to|i need to|tell me|what do i have|what is|how about)\s+/i, "");
+  if (!text) text = rawText.trim();
+  if (text.length > 34) {
+    const cut = text.slice(0, 34);
+    const lastSpace = cut.lastIndexOf(" ");
+    text = (lastSpace > 16 ? cut.slice(0, lastSpace) : cut).trim();
+  }
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function conversationSummary(status = "active") {
   const userMessages = conversation.filter(entry => entry.role === "user").map(entry => entry.text);
-  const title = (userMessages[0] || "Matson Time conversation").slice(0, 72);
+  const firstUserMessage = userMessages[0] || "";
+  const title = firstUserMessage ? deriveConversationTitle(firstUserMessage) : "New conversation";
   const summary = conversation.slice(-6).map(entry => `${entry.role === "user" ? "Matson" : "Assistant"}: ${entry.text}`).join(" ").slice(0, 500);
   return { title, summary, keywords: firebaseStore.tokenizeKeywords(`${title} ${summary}`), status };
+}
+
+async function ensureConversation() {
+  if (activeConversationId) return activeConversationId;
+  activeConversationId = await firebaseStore.createConversation({ title: "New conversation", status: "active" });
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+  loadDrawerConversations().catch(() => {});
+  return activeConversationId;
 }
 
 function updateSummaryIfPlanningResolved() {
@@ -121,39 +190,377 @@ async function getRecallContext(text) {
   }
 }
 
-async function startNewConversation() {
-  if (activeConversationId) {
-    await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
-    await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("archived"));
+function saveEntryForConversation(convId, entry) {
+  const message = {
+    id: crypto.randomUUID(),
+    role: entry.role,
+    text: entry.text,
+    kind: entry.kind || (entry.role === "user" ? "user_message" : "assistant_message"),
+    referencedItemIds: entry.referencedItemIds || [],
+    deletedItemIds: [],
+    proposalSummary: entry.proposalSummary || null,
+    resolved: entry.resolved !== false
+  };
+  pendingMessageWrites.push({ conversationId: convId, message });
+  localStorage.setItem(PENDING_MESSAGE_WRITES_KEY, JSON.stringify(pendingMessageWrites));
+  persistenceQueue = persistenceQueue.then(persistPendingMessages);
+  firebaseStore.updateConversationSummary(convId, {
+    status: "active",
+    summary: entry.text.slice(0, 300)
+  }).catch(() => {});
+}
+
+function formatDrawerDate(val) {
+  if (!val) return "";
+  let date;
+  if (typeof val.toDate === "function") date = val.toDate();
+  else if (val instanceof Date) date = val;
+  else if (val.seconds) date = new Date(val.seconds * 1000);
+  else return "";
+
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+  if (isToday) {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }
-  activeConversationId = null;
-  conversation = [];
-  pendingClarification = null;
-  currentProposal = null;
-  activePlanningContext = null;
-  pendingOperation = null;
-  referencedSets = [];
-  entityRegistry = [];
-  await firebaseStore.clearAssistantState();
-  renderConversation();
-  await refreshRecentConversationList();
-  assistantEls.recentConversations.value = "";
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function getConversationPreview(conv) {
+  if (conv.summary && conv.summary.trim()) return conv.summary.trim();
+  if (conv.lastMessagePreview && conv.lastMessagePreview.trim()) return conv.lastMessagePreview.trim();
+  return "No messages yet";
+}
+
+function normalizeSearchTerm(str) {
+  return (str || "").toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").trim();
+}
+
+function filterDrawerConversations() {
+  const query = normalizeSearchTerm(assistantEls.drawerSearchInput?.value);
+  if (!query) return drawerConversations;
+  const terms = query.split(/\s+/).filter(Boolean);
+  return drawerConversations.filter(conv => {
+    const title = (conv.title || "").toLowerCase();
+    const summary = (conv.summary || "").toLowerCase();
+    const preview = (conv.lastMessagePreview || "").toLowerCase();
+    const keywords = (conv.keywords || []).map(k => String(k).toLowerCase());
+    return terms.every(term =>
+      title.includes(term) ||
+      summary.includes(term) ||
+      preview.includes(term) ||
+      keywords.some(k => k.includes(term))
+    );
+  });
+}
+
+function openContextMenu(conv, x, y, triggerEl) {
+  if (!assistantEls.contextMenu || !conv) return;
+  contextMenuConv = conv;
+  contextMenuTriggerEl = triggerEl || null;
+
+  assistantEls.contextMenu.hidden = false;
+  const menuWidth = 150;
+  const menuHeight = 84;
+
+  let left = x;
+  let top = y;
+
+  if (left + menuWidth > window.innerWidth - 8) {
+    left = Math.max(8, window.innerWidth - menuWidth - 8);
+  }
+  if (top + menuHeight > window.innerHeight - 8) {
+    top = Math.max(8, window.innerHeight - menuHeight - 8);
+  }
+
+  assistantEls.contextMenu.style.left = `${left}px`;
+  assistantEls.contextMenu.style.top = `${top}px`;
+
+  if (triggerEl && triggerEl.classList.contains("drawer-item-menu-button")) {
+    triggerEl.setAttribute("aria-expanded", "true");
+  }
+
+  assistantEls.contextRenameButton?.focus();
+}
+
+function closeContextMenu() {
+  if (!assistantEls.contextMenu || assistantEls.contextMenu.hidden) return;
+  assistantEls.contextMenu.hidden = true;
+  if (contextMenuTriggerEl && contextMenuTriggerEl.classList.contains("drawer-item-menu-button")) {
+    contextMenuTriggerEl.removeAttribute("aria-expanded");
+  }
+  if (contextMenuTriggerEl && contextMenuTriggerEl.isConnected) {
+    contextMenuTriggerEl.focus();
+  }
+  contextMenuConv = null;
+  contextMenuTriggerEl = null;
+}
+
+function renderDrawerList(items) {
+  if (!assistantEls.drawerConversationList) return;
+  assistantEls.drawerConversationList.replaceChildren();
+  if (!items.length) {
+    if (assistantEls.drawerSearchInput?.value.trim()) {
+      assistantEls.drawerNoResults.hidden = false;
+    } else {
+      assistantEls.drawerEmpty.hidden = false;
+    }
+    return;
+  }
+  assistantEls.drawerNoResults.hidden = true;
+  assistantEls.drawerEmpty.hidden = true;
+
+  for (const conv of items) {
+    const row = document.createElement("div");
+    row.className = "drawer-conversation-item" + (conv.id === activeConversationId ? " active" : "");
+    row.dataset.id = conv.id;
+    row.setAttribute("role", "listitem");
+    row.tabIndex = 0;
+
+    const title = document.createElement("span");
+    title.className = "drawer-item-title";
+    title.textContent = conv.title || "New conversation";
+    row.appendChild(title);
+
+    const menuBtn = document.createElement("button");
+    menuBtn.type = "button";
+    menuBtn.className = "drawer-item-menu-button";
+    menuBtn.setAttribute("aria-label", `Conversation options for ${conv.title || "New conversation"}`);
+    menuBtn.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>`;
+    row.appendChild(menuBtn);
+
+    let pressTimer = null;
+    let startX = 0;
+    let startY = 0;
+    let longPressTriggered = false;
+
+    function clearPressTimer() {
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    }
+
+    row.addEventListener("pointerdown", event => {
+      if (event.button !== 0) return;
+      if (event.target.closest(".drawer-item-menu-button")) return;
+      startX = event.clientX;
+      startY = event.clientY;
+      longPressTriggered = false;
+      clearPressTimer();
+      pressTimer = setTimeout(() => {
+        longPressTriggered = true;
+        openContextMenu(conv, startX, startY, row);
+      }, 550);
+    });
+
+    row.addEventListener("pointermove", event => {
+      if (!pressTimer) return;
+      const dx = Math.abs(event.clientX - startX);
+      const dy = Math.abs(event.clientY - startY);
+      if (dx > 8 || dy > 8) {
+        clearPressTimer();
+      }
+    });
+
+    row.addEventListener("pointerup", () => {
+      clearPressTimer();
+    });
+
+    row.addEventListener("pointercancel", () => {
+      clearPressTimer();
+    });
+
+    row.addEventListener("contextmenu", event => {
+      event.preventDefault();
+      clearPressTimer();
+      openContextMenu(conv, event.clientX, event.clientY, row);
+    });
+
+    row.addEventListener("click", event => {
+      if (longPressTriggered) {
+        longPressTriggered = false;
+        return;
+      }
+      if (event.target.closest(".drawer-item-menu-button")) return;
+      openConversation(conv.id);
+    });
+
+    row.addEventListener("keydown", event => {
+      if (event.target !== row) return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openConversation(conv.id);
+      } else if ((event.shiftKey && event.key === "F10") || event.key === "ContextMenu") {
+        event.preventDefault();
+        const rect = row.getBoundingClientRect();
+        openContextMenu(conv, rect.left + 40, rect.bottom, row);
+      }
+    });
+
+    menuBtn.addEventListener("click", event => {
+      event.stopPropagation();
+      const rect = menuBtn.getBoundingClientRect();
+      openContextMenu(conv, rect.left, rect.bottom + 4, menuBtn);
+    });
+
+    assistantEls.drawerConversationList.appendChild(row);
+  }
+}
+
+function updateDrawerActiveItem() {
+  if (!assistantEls.drawerConversationList) return;
+  assistantEls.drawerConversationList.querySelectorAll(".drawer-conversation-item").forEach(item => {
+    item.classList.toggle("active", item.dataset.id === activeConversationId);
+  });
+}
+
+async function loadDrawerConversations() {
+  if (!assistantEls.drawerLoading) return;
+  assistantEls.drawerLoading.hidden = false;
+  assistantEls.drawerError.hidden = true;
+  assistantEls.drawerEmpty.hidden = true;
+  assistantEls.drawerNoResults.hidden = true;
+
+  try {
+    const list = await firebaseStore.listRecentConversations(drawerLimit);
+    drawerConversations = list;
+    assistantEls.drawerLoading.hidden = true;
+    if (!list.length) {
+      assistantEls.drawerEmpty.hidden = false;
+      assistantEls.drawerConversationList.replaceChildren();
+      if (assistantEls.drawerLoadMoreWrap) assistantEls.drawerLoadMoreWrap.hidden = true;
+      return;
+    }
+    renderDrawerList(filterDrawerConversations());
+    if (assistantEls.drawerLoadMoreWrap) {
+      assistantEls.drawerLoadMoreWrap.hidden = list.length < drawerLimit;
+    }
+  } catch (error) {
+    assistantEls.drawerLoading.hidden = true;
+    assistantEls.drawerError.hidden = false;
+    console.error("Drawer conversation load failed", error);
+  }
+}
+
+function openDrawer() {
+  if (isDrawerOpen) return;
+  isDrawerOpen = true;
+  drawerTriggerButton = document.activeElement;
+  assistantEls.drawerBackdrop.hidden = false;
+  assistantEls.drawer.hidden = false;
+  requestAnimationFrame(() => {
+    assistantEls.drawer.classList.add("open");
+  });
+  document.body.style.overflow = "hidden";
+  loadDrawerConversations();
+  assistantEls.drawerSearchInput?.focus();
+}
+
+function closeDrawer() {
+  if (!isDrawerOpen) return;
+  isDrawerOpen = false;
+  assistantEls.drawer.classList.remove("open");
+  document.body.style.overflow = "";
+  setTimeout(() => {
+    if (!isDrawerOpen) {
+      assistantEls.drawer.hidden = true;
+      assistantEls.drawerBackdrop.hidden = true;
+    }
+  }, 220);
+  if (drawerTriggerButton && drawerTriggerButton.isConnected) {
+    drawerTriggerButton.focus();
+  } else {
+    assistantEls.historyButton?.focus();
+  }
+}
+
+async function startNewConversation() {
+  if (newConversationInProgress) return;
+  newConversationInProgress = true;
+  if (assistantEls.newConversationHeaderButton) assistantEls.newConversationHeaderButton.disabled = true;
+  if (assistantEls.drawerNewConversationButton) assistantEls.drawerNewConversationButton.disabled = true;
+
+  try {
+    activeRevealController?.abort();
+    removeWaitingState();
+
+    const isCurrentEmpty = conversation.length === 0;
+    if (isCurrentEmpty && activeConversationId) {
+      closeDrawer();
+      renderConversation();
+      assistantEls.input.value = composerDrafts.get(activeConversationId) || "";
+      updateComposerHeight();
+      updateSendButtonState();
+      assistantEls.input.focus();
+      return;
+    }
+
+    if (activeConversationId) {
+      composerDrafts.set(activeConversationId, assistantEls.input.value);
+      await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+      await firebaseStore.updateConversationSummary(activeConversationId, { status: "archived" }).catch(() => {});
+    }
+
+    const newId = await firebaseStore.createConversation({ title: "New conversation", status: "active" });
+    activeConversationId = newId;
+    conversation = [];
+    currentProposal = null;
+    pendingClarification = null;
+    activePlanningContext = null;
+    pendingOperation = null;
+    referencedSets = [];
+    entityRegistry = [];
+
+    await firebaseStore.saveAssistantState({
+      activeConversationId: newId,
+      pendingClarification: null,
+      planningContext: null,
+      entityRegistry: [],
+      pendingOperation: null,
+      referencedSets: [],
+      lastConfirmedAction: null
+    }).catch(showPersistenceFailure);
+
+    renderConversation();
+
+    assistantEls.input.value = "";
+    updateComposerHeight();
+    updateSendButtonState();
+
+    closeDrawer();
+    loadDrawerConversations().catch(() => {});
+    assistantEls.input.focus();
+  } catch (error) {
+    if (assistantEls.saveNotice && assistantEls.saveText) {
+      assistantEls.saveText.textContent = "A new conversation could not be started. Try again.";
+      assistantEls.saveNotice.hidden = false;
+    }
+    console.error("New conversation creation failed", error);
+  } finally {
+    newConversationInProgress = false;
+    if (assistantEls.newConversationHeaderButton) assistantEls.newConversationHeaderButton.disabled = false;
+    if (assistantEls.drawerNewConversationButton) assistantEls.drawerNewConversationButton.disabled = false;
+  }
 }
 
 async function openConversation(id) {
   if (!id) return;
-  if (id === "__load_more__") {
-    await refreshRecentConversationList(1000);
-    assistantEls.recentConversations.value = activeConversationId || "";
-    return;
-  }
+  activeRevealController?.abort();
+  removeWaitingState();
+
   try {
-    if (activeConversationId && activeConversationId !== id) {
-      await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("archived"));
+    if (activeConversationId) {
+      composerDrafts.set(activeConversationId, assistantEls.input.value);
+      if (activeConversationId !== id) {
+        await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("archived")).catch(() => {});
+      }
     }
-    const loaded = await firebaseStore.loadConversation(id, 50);
-    await firebaseStore.updateConversationSummary(id, { status: "active" });
+
     activeConversationId = id;
+    const loaded = await firebaseStore.loadConversation(id, 50);
+    await firebaseStore.updateConversationSummary(id, { status: "active" }).catch(() => {});
+
     conversation = loaded.messages.map(message => ({
       role: message.role,
       text: message.text,
@@ -162,7 +569,9 @@ async function openConversation(id) {
       referencedItemIds: message.referencedItemIds || [],
       deletedItemIds: message.deletedItemIds || []
     }));
+
     currentProposal = null;
+
     const state = await firebaseStore.loadAssistantState();
     const isActive = state.activeConversationId === id;
     pendingClarification = isActive ? state.pendingClarification : null;
@@ -171,8 +580,25 @@ async function openConversation(id) {
     pendingOperation = isActive ? state.pendingOperation || null : null;
     referencedSets = isActive && Array.isArray(state.referencedSets) ? state.referencedSets.slice(-5) : [];
     lastConfirmedAction = isActive ? state.lastConfirmedAction || null : null;
-    await firebaseStore.saveAssistantState({ activeConversationId: id, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
-    renderConversation();
+
+    await firebaseStore.saveAssistantState({
+      activeConversationId: id,
+      pendingClarification,
+      planningContext: activePlanningContext,
+      entityRegistry,
+      pendingOperation,
+      referencedSets,
+      lastConfirmedAction
+    }).catch(showPersistenceFailure);
+
+    assistantEls.input.value = composerDrafts.get(id) || "";
+    updateComposerHeight();
+    updateSendButtonState();
+
+    closeDrawer();
+    renderConversation({ restoring: true });
+    scrollToBottom();
+    updateDrawerActiveItem();
   } catch (error) {
     showPersistenceFailure();
     console.error("Conversation load failed", { name: error?.name || "Error", message: String(error?.message || error) });
@@ -204,9 +630,111 @@ async function persistPendingMessages() {
   }
 }
 
-function appendEntry(entry) {
+function isNearBottom(threshold = 80) {
+  const el = assistantEls.conversation;
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+}
+
+function scrollToBottom() {
+  if (!assistantEls.conversation) return;
+  assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
+  if (assistantEls.scrollLatest) assistantEls.scrollLatest.hidden = true;
+}
+
+function showWaitingState() {
+  if (waitingEl) return;
+  const msg = document.createElement("div");
+  msg.className = "message assistant-message waiting-message";
+  msg.id = "assistantWaiting";
+  msg.setAttribute("role", "status");
+  msg.setAttribute("aria-live", "polite");
+
+  const sr = document.createElement("span");
+  sr.className = "sr-only";
+  sr.textContent = "Matson Time is preparing a response.";
+  msg.appendChild(sr);
+
+  const content = document.createElement("div");
+  content.className = "waiting-content";
+  content.setAttribute("aria-hidden", "true");
+
+  const text = document.createElement("span");
+  text.className = "waiting-text";
+  text.textContent = "Just a moment";
+  content.appendChild(text);
+
+  const dots = document.createElement("span");
+  dots.className = "waiting-dots";
+  for (let i = 0; i < 3; i++) {
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dots.appendChild(dot);
+  }
+  content.appendChild(dots);
+  msg.appendChild(content);
+
+  assistantEls.conversation.appendChild(msg);
+  waitingEl = msg;
+  if (isNearBottom()) {
+    scrollToBottom();
+  }
+}
+
+function removeWaitingState() {
+  if (waitingEl) {
+    waitingEl.remove();
+    waitingEl = null;
+  }
+}
+
+function revealAssistantMessage(targetElement, fullText, { onUpdate, signal } = {}) {
+  return new Promise(resolve => {
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (prefersReducedMotion || !fullText) {
+      targetElement.textContent = fullText;
+      if (onUpdate) onUpdate();
+      resolve();
+      return;
+    }
+
+    targetElement.textContent = "";
+    const textNode = document.createTextNode("");
+    targetElement.appendChild(textNode);
+
+    const length = fullText.length;
+    const totalDuration = Math.min(1200, Math.max(200, Math.round(length * 2.5)));
+    const startTime = performance.now();
+
+    function frame(now) {
+      if (signal?.aborted) {
+        resolve();
+        return;
+      }
+      const elapsed = now - startTime;
+      const progress = Math.min(1, elapsed / totalDuration);
+      const currentLength = Math.max(1, Math.min(length, Math.floor(progress * length)));
+      textNode.nodeValue = fullText.slice(0, currentLength);
+      if (onUpdate) onUpdate();
+
+      if (progress < 1) {
+        requestAnimationFrame(frame);
+      } else {
+        textNode.nodeValue = fullText;
+        if (onUpdate) onUpdate();
+        resolve();
+      }
+    }
+
+    requestAnimationFrame(frame);
+  });
+}
+
+function appendEntry(entry, options = {}) {
   conversation.push(entry);
-  renderConversationEntry(entry);
+  if (!options.skipRender) {
+    renderConversationEntry(entry, options);
+  }
   const message = {
     id: crypto.randomUUID(),
     role: entry.role, text: entry.text, kind: entry.kind || (entry.role === "user" ? "user_message" : "assistant_message"),
@@ -223,46 +751,81 @@ function appendEntry(entry) {
   }
 }
 
-function renderConversationEntry(entry) {
+function renderConversationEntry(entry, options = {}) {
   const message = document.createElement("div");
   message.className = entry.role === "user" ? "message user-message" : "message assistant-message";
-  const text = document.createElement("p");
-  text.textContent = entry.text;
-  message.appendChild(text);
-  if (entry.items && entry.items.length) {
-    const list = document.createElement("ul");
-    list.className = "response-list";
-    for (const item of entry.items) {
-      const row = document.createElement("li");
-      const time = document.createElement("span");
-      time.className = "response-time";
-      time.textContent = item.time;
-      const title = document.createElement("span");
-      title.className = "response-title";
-      title.textContent = item.title;
-      const status = document.createElement("span");
-      status.className = "response-status";
-      status.textContent = item.status;
-      row.append(time, title, status);
-      list.appendChild(row);
+
+  if (entry.role === "user") {
+    const bubble = document.createElement("div");
+    bubble.className = "user-bubble";
+    bubble.textContent = entry.text;
+    message.appendChild(bubble);
+  } else {
+    const text = document.createElement("p");
+    text.className = "assistant-text";
+    message.appendChild(text);
+
+    if (entry.items && entry.items.length) {
+      const list = document.createElement("ul");
+      list.className = "response-list";
+      for (const item of entry.items) {
+        const row = document.createElement("li");
+        const time = document.createElement("span");
+        time.className = "response-time";
+        time.textContent = item.time;
+        const title = document.createElement("span");
+        title.className = "response-title";
+        title.textContent = item.title;
+        const status = document.createElement("span");
+        status.className = "response-status";
+        status.textContent = item.status;
+        row.append(time, title, status);
+        list.appendChild(row);
+      }
+      message.appendChild(list);
     }
-    message.appendChild(list);
+
+    if (options.reveal && !options.restoring) {
+      activeRevealController?.abort();
+      const controller = new AbortController();
+      activeRevealController = controller;
+      const shouldKeepBottom = isNearBottom();
+      assistantEls.conversation.appendChild(message);
+      if (shouldKeepBottom) scrollToBottom();
+
+      return revealAssistantMessage(text, entry.text, {
+        signal: controller.signal,
+        onUpdate: () => {
+          if (shouldKeepBottom) scrollToBottom();
+        }
+      });
+    } else {
+      text.textContent = entry.text;
+    }
   }
+
   assistantEls.conversation.appendChild(message);
-  assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
+  if (options.scrollToBottom !== false) {
+    if (isNearBottom() || options.forceScroll) {
+      scrollToBottom();
+    }
+  }
+  return Promise.resolve();
 }
 
-function renderConversation() {
+function renderConversation(options = {}) {
+  activeRevealController?.abort();
+  removeWaitingState();
   assistantEls.conversation.replaceChildren();
   for (const entry of conversation) {
     const displayEntry = entry.resolved === false
       ? { ...entry, text: `${entry.text} (This earlier proposal expired when you left the conversation; request it again to review it.)` }
       : entry;
-    renderConversationEntry(displayEntry);
+    renderConversationEntry(displayEntry, { restoring: true, scrollToBottom: false });
   }
   assistantEls.empty.hidden = conversation.length > 0;
   if (conversation.length > 0) {
-    assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
+    scrollToBottom();
   }
 }
 
@@ -1519,98 +2082,182 @@ function bulkProposalMessage(operation, scope, count) {
 
 async function sendMessage(rawText) {
   const text = rawText.trim();
-  if (!text) return;
+  if (!text || sendInProgress) return;
+  sendInProgress = true;
+  updateSendButtonState();
 
-  try { await ensureConversation(); }
-  catch { /* The message is retained locally and a retry notice is shown below. */ }
-  appendEntry({ role: "user", text });
-
-  if (/^(?:never mind|forget (?:it|that|the plan)|drop the plan|cancel (?:this|the) plan|abandon (?:this|the) plan)$/i.test(text.trim())) {
-    activePlanningContext = null;
-    pendingClarification = null;
-    pendingOperation = null;
-    currentProposal = null;
-    savePlanningContext();
-    appendEntry({ role: "assistant", text: "Okay, I’ve cleared that planning topic." });
-    updateSummaryIfPlanningResolved();
-    renderConversation();
+  let requestConvId = activeConversationId;
+  try {
+    requestConvId = await ensureConversation();
+  } catch (err) {
+    console.error("Failed to ensure conversation", err);
+    sendInProgress = false;
+    updateSendButtonState();
+    showPersistenceFailure();
     return;
   }
 
-  if (routePendingOperation(text)) { saveConversation(); return; }
-  if (routeBulkCommand(text)) { saveConversation(); return; }
-
-  const recallContext = await getRecallContext(text);
-  if (recallContext) {
-    const normalizedRecallText = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
-    const recallItems = saGetRelevantItemsForContext(text, 20).filter(item => item.title && normalizedRecallText.includes(item.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()));
-    recallItems.forEach(item => rememberScheduleEntity(item, "recalled", [item.title, "that", "it"]));
-    if (recallItems.length) await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+  if (assistantEls.input) {
+    assistantEls.input.value = "";
   }
-  const classification = recallContext ? "analytical_query" : classifyRequest(text);
+  if (requestConvId) {
+    composerDrafts.delete(requestConvId);
+  }
+  updateComposerHeight();
+  updateSendButtonState();
 
-  let result;
+  const requestId = crypto.randomUUID();
+  activeRequestId = requestId;
 
-  if (classification === "deterministic_query") {
-    result = handleDeterministicQuery(text);
-    if (result) {
-      appendEntry({ role: "assistant", text: result.text, items: result.items || [] });
-      if (result.proposal || result.clarification) {
-        handleProposalOrClarification(result, text);
+  try {
+    const userMessages = conversation.filter(m => m.role === "user");
+    if (userMessages.length === 0 && requestConvId) {
+      const derivedTitle = deriveConversationTitle(text);
+      firebaseStore.updateConversationSummary(requestConvId, { title: derivedTitle }).catch(() => {});
+    }
+
+    appendEntry({ role: "user", text });
+
+    if (/^(?:never mind|forget (?:it|that|the plan)|drop the plan|cancel (?:this|the) plan|abandon (?:this|the) plan)$/i.test(text.trim())) {
+      activePlanningContext = null;
+      pendingClarification = null;
+      pendingOperation = null;
+      currentProposal = null;
+      savePlanningContext();
+      appendEntry({ role: "assistant", text: "Okay, I’ve cleared that planning topic." });
+      updateSummaryIfPlanningResolved();
+      renderConversation();
+      return;
+    }
+
+    if (routePendingOperation(text)) {
+      saveConversation();
+      return;
+    }
+    if (routeBulkCommand(text)) {
+      saveConversation();
+      return;
+    }
+
+    const recallContext = await getRecallContext(text);
+    if (recallContext) {
+      const normalizedRecallText = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+      const recallItems = saGetRelevantItemsForContext(text, 20).filter(item => item.title && normalizedRecallText.includes(item.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()));
+      recallItems.forEach(item => rememberScheduleEntity(item, "recalled", [item.title, "that", "it"]));
+      if (recallItems.length) await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+    }
+    const classification = recallContext ? "analytical_query" : classifyRequest(text);
+
+    let result;
+
+    if (classification === "deterministic_query") {
+      result = handleDeterministicQuery(text);
+      if (result) {
+        appendEntry({ role: "assistant", text: result.text, items: result.items || [] });
+        if (result.proposal || result.clarification) {
+          handleProposalOrClarification(result, text);
+        }
+        saveConversation();
+        return;
       }
-      saveConversation();
-      return;
     }
-  }
 
-  currentProposal = null;
+    currentProposal = null;
 
-  if (classification === "direct_interface_action") {
-    const directResult = handleDirectInterfaceAction(text);
-    if (directResult.proposal) {
-      currentProposal = directResult.proposal;
-      appendEntry({ role: "assistant", text: directResult.proposal.message, kind: "proposal_summary", proposalSummary: directResult.proposal.message, resolved: false });
-      renderProposal(currentProposal);
+    if (classification === "direct_interface_action") {
+      const directResult = handleDirectInterfaceAction(text);
+      if (directResult.proposal) {
+        currentProposal = directResult.proposal;
+        appendEntry({ role: "assistant", text: directResult.proposal.message, kind: "proposal_summary", proposalSummary: directResult.proposal.message, resolved: false });
+        renderProposal(currentProposal);
+        saveConversation();
+        return;
+      }
+      if (directResult.clarification) {
+        pendingClarification = { intent: "unknown", knownFields: {}, missingFields: ["target"] };
+        appendEntry({ role: "assistant", text: directResult.clarification });
+        saveConversation();
+        return;
+      }
+      appendEntry({ role: "assistant", text: "I couldn't understand that action." });
       saveConversation();
       return;
     }
-    if (directResult.clarification) {
-      pendingClarification = { intent: "unknown", knownFields: {}, missingFields: ["target"] };
-      appendEntry({ role: "assistant", text: directResult.clarification });
+
+    if (classification === "analytical_query" || classification === "analytical_planning" || classification === "natural_language_action" || classification === "clarification_reply") {
+      if (activeConversationId === requestConvId) {
+        showWaitingState();
+      }
+      let geminiResponse;
+      try {
+        geminiResponse = await callGeminiEndpoint(text, classification === "analytical_planning", recallContext);
+      } catch {
+        if (activeConversationId === requestConvId) {
+          removeWaitingState();
+          appendEntry({ role: "assistant", text: "The schedule assistant is temporarily busy. Please try again." });
+        }
+        return;
+      }
+
+      if (activeConversationId === requestConvId) {
+        removeWaitingState();
+      }
+
+      result = processGeminiResponse(geminiResponse);
+
+      if (result.proposal) {
+        currentProposal = result.proposal;
+        const explanation = result.message || "Here's a proposed action.";
+        const entry = { role: "assistant", text: explanation, kind: "proposal_summary", proposalSummary: explanation, resolved: false };
+        if (activeConversationId === requestConvId) {
+          appendEntry(entry, { skipRender: true });
+          await renderConversationEntry(entry, { reveal: true });
+          if (activeConversationId === requestConvId) {
+            renderProposal(currentProposal);
+          }
+        } else {
+          saveEntryForConversation(requestConvId, entry);
+        }
+        saveConversation();
+        return;
+      }
+
+      if (result.clarification) {
+        const entry = { role: "assistant", text: result.message };
+        if (activeConversationId === requestConvId) {
+          appendEntry(entry, { skipRender: true });
+          await renderConversationEntry(entry, { reveal: true });
+        } else {
+          saveEntryForConversation(requestConvId, entry);
+        }
+        saveConversation();
+        return;
+      }
+
+      const entry = { role: "assistant", text: result.message, items: result.items || [] };
+      if (activeConversationId === requestConvId) {
+        appendEntry(entry, { skipRender: true });
+        await renderConversationEntry(entry, { reveal: true });
+      } else {
+        saveEntryForConversation(requestConvId, entry);
+      }
+      updateSummaryIfPlanningResolved();
       saveConversation();
       return;
     }
-    appendEntry({ role: "assistant", text: "I couldn't understand that action." });
+
+    appendEntry({ role: "assistant", text: "I can't help with that yet." });
     saveConversation();
-    return;
-  }
-
-  if (classification === "analytical_query" || classification === "analytical_planning" || classification === "natural_language_action" || classification === "clarification_reply") {
-    const geminiResponse = await callGeminiEndpoint(text, classification === "analytical_planning", recallContext);
-    result = processGeminiResponse(geminiResponse);
-
-    if (result.proposal) {
-      currentProposal = result.proposal;
-      appendEntry({ role: "assistant", text: result.message || "Here's a proposed action.", kind: "proposal_summary", proposalSummary: result.message || "", resolved: false });
-      renderProposal(currentProposal);
-      saveConversation();
-      return;
+  } catch (err) {
+    console.error("Assistant message handling error", err);
+    if (activeConversationId === requestConvId) {
+      removeWaitingState();
+      appendEntry({ role: "assistant", text: "An error occurred while processing your request. Please try again." });
     }
-
-    if (result.clarification) {
-      appendEntry({ role: "assistant", text: result.message });
-      saveConversation();
-      return;
-    }
-
-    appendEntry({ role: "assistant", text: result.message, items: result.items || [] });
-    updateSummaryIfPlanningResolved();
-    saveConversation();
-    return;
+  } finally {
+    sendInProgress = false;
+    updateSendButtonState();
   }
-
-  appendEntry({ role: "assistant", text: "I can't help with that yet." });
-  saveConversation();
 }
 
 function handleProposalOrClarification(result, message) {
@@ -1944,11 +2591,76 @@ function showProcessingError(message) {
   }
 }
 
+function updateComposerHeight() {
+  if (!assistantEls.input) return;
+  assistantEls.input.style.height = "auto";
+  const newHeight = Math.min(assistantEls.input.scrollHeight, 130);
+  assistantEls.input.style.height = newHeight + "px";
+}
+
+// ── Context menu ──────────────────────────────────────────────────────────────
+
+function openContextMenu(conv, x, y, triggerEl) {
+  if (!assistantEls.contextMenu || !conv) return;
+  contextMenuConv = conv;
+  contextMenuTriggerEl = triggerEl || null;
+
+  const menu = assistantEls.contextMenu;
+  menu.hidden = false;
+
+  // Position the menu; keep it within the viewport
+  const menuWidth = 180;
+  const menuHeight = 88;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const left = Math.min(x, vw - menuWidth - 8);
+  const top  = Math.min(y, vh - menuHeight - 8);
+  menu.style.left = Math.max(8, left) + "px";
+  menu.style.top  = Math.max(8, top) + "px";
+}
+
+function closeContextMenu() {
+  if (!assistantEls.contextMenu) return;
+  assistantEls.contextMenu.hidden = true;
+  const restore = contextMenuTriggerEl;
+  contextMenuConv = null;
+  contextMenuTriggerEl = null;
+  // Return focus to the trigger button so keyboard users don't lose position
+  restore?.focus();
+}
+
+// ── Rename dialog ─────────────────────────────────────────────────────────────
+
+function openRenameDialog(conv) {
+  if (!assistantEls.renameDialog || !conv) return;
+  renamingConversationId = conv.id;
+  if (assistantEls.renameInput) {
+    assistantEls.renameInput.value = conv.title || "New conversation";
+  }
+  if (assistantEls.renameError) assistantEls.renameError.hidden = true;
+  assistantEls.renameDialog.showModal();
+  assistantEls.renameInput?.select();
+}
+
+function closeRenameDialog() {
+  renamingConversationId = null;
+  assistantEls.renameDialog?.close();
+}
+
+function updateSendButtonState() {
+  if (!assistantEls.send || !assistantEls.input) return;
+  const text = (assistantEls.input.value || "").trim();
+  const canSend = text.length > 0 && !isComposing && !sendInProgress;
+  assistantEls.send.disabled = !canSend;
+}
+
 function submitInput() {
   const value = assistantEls.input.value;
+  if (!value.trim() || sendInProgress) return;
   sendMessage(value);
   assistantEls.input.value = "";
-  assistantEls.input.style.height = "auto";
+  updateComposerHeight();
+  updateSendButtonState();
   assistantEls.input.focus();
 }
 
@@ -1964,51 +2676,219 @@ function renderProposalButton(button, action) {
   });
 }
 
-assistantEls.nav.addEventListener("click", () => {
-  assistantEls.date.textContent = formatDateLabel(localDateString(new Date()));
+assistantEls.nav?.addEventListener("click", () => {
   setView("assistant");
-  assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
+  scrollToBottom();
+  updateComposerHeight();
+  updateSendButtonState();
 });
 
-assistantEls.send.addEventListener("click", submitInput);
+assistantEls.send?.addEventListener("click", submitInput);
 
-assistantEls.input.addEventListener("keydown", event => {
+assistantEls.input?.addEventListener("compositionstart", () => {
+  isComposing = true;
+});
+assistantEls.input?.addEventListener("compositionend", () => {
+  isComposing = false;
+  updateSendButtonState();
+});
+
+assistantEls.input?.addEventListener("keydown", event => {
   if (event.key === "Enter" && !event.shiftKey) {
+    if (event.isComposing || isComposing) return;
     event.preventDefault();
-    submitInput();
+    if (!assistantEls.send.disabled) {
+      submitInput();
+    }
   }
 });
 
-assistantEls.input.addEventListener("input", () => {
-  assistantEls.input.style.height = "auto";
-  assistantEls.input.style.height = Math.min(assistantEls.input.scrollHeight, 120) + "px";
+assistantEls.input?.addEventListener("input", () => {
+  updateComposerHeight();
+  updateSendButtonState();
+  if (activeConversationId) {
+    composerDrafts.set(activeConversationId, assistantEls.input.value);
+  }
 });
 
-assistantEls.starters.addEventListener("click", event => {
+assistantEls.input?.addEventListener("paste", () => {
+  requestAnimationFrame(updateSendButtonState);
+});
+assistantEls.input?.addEventListener("cut", () => {
+  requestAnimationFrame(updateSendButtonState);
+});
+
+assistantEls.starters?.addEventListener("click", event => {
   const starter = event.target.closest("[data-starter]");
   if (!starter) return;
   if (starter.dataset.starter === "add") { openAddDialog(); return; }
   sendMessage(starter.dataset.starter);
 });
 
-assistantEls.voice.addEventListener("click", () => {
+assistantEls.voice?.addEventListener("click", () => {
+  if (!assistantEls.voiceNotice) return;
   assistantEls.voiceNotice.hidden = false;
   clearTimeout(voiceNoticeTimer);
   voiceNoticeTimer = setTimeout(() => { assistantEls.voiceNotice.hidden = true; }, 3000);
 });
 
-assistantEls.clear.addEventListener("click", () => {
+assistantEls.historyButton?.addEventListener("click", openDrawer);
+assistantEls.newConversationHeaderButton?.addEventListener("click", () => startNewConversation().catch(showPersistenceFailure));
+
+assistantEls.closeDrawerButton?.addEventListener("click", closeDrawer);
+assistantEls.drawerBackdrop?.addEventListener("click", closeDrawer);
+assistantEls.drawerNewConversationButton?.addEventListener("click", () => {
+  closeDrawer();
   startNewConversation().catch(showPersistenceFailure);
-  assistantEls.input.focus();
 });
 
-assistantEls.newConversation.addEventListener("click", () => startNewConversation().catch(showPersistenceFailure));
-assistantEls.recentConversations.addEventListener("change", event => openConversation(event.target.value));
-assistantEls.retrySave.addEventListener("click", () => {
+assistantEls.drawerSearchInput?.addEventListener("input", () => {
+  const filtered = filterDrawerConversations();
+  renderDrawerList(filtered);
+});
+
+assistantEls.drawerRetryButton?.addEventListener("click", loadDrawerConversations);
+
+assistantEls.drawerLoadMoreButton?.addEventListener("click", async () => {
+  drawerLimit += 25;
+  await loadDrawerConversations();
+});
+
+// ── Context menu handlers ─────────────────────────────────────────────────────
+
+assistantEls.contextRenameButton?.addEventListener("click", () => {
+  if (!contextMenuConv) return;
+  const conv = contextMenuConv;
+  closeContextMenu();
+  openRenameDialog(conv);
+});
+
+assistantEls.contextDeleteButton?.addEventListener("click", () => {
+  if (!contextMenuConv) return;
+  deletingConversationId = contextMenuConv.id;
+  closeContextMenu();
+  assistantEls.deleteDialog?.showModal();
+});
+
+// Dismiss context menu when clicking outside it
+document.addEventListener("click", event => {
+  if (assistantEls.contextMenu && !assistantEls.contextMenu.hidden &&
+      !event.target.closest("#conversationContextMenu")) {
+    closeContextMenu();
+  }
+}, true /* capture so it fires before any inner click handlers */);
+
+// ── Rename dialog handlers ────────────────────────────────────────────────────
+
+assistantEls.renameForm?.addEventListener("submit", async event => {
+  event.preventDefault();
+  const title = (assistantEls.renameInput?.value || "").trim();
+  if (!title) {
+    if (assistantEls.renameError) {
+      assistantEls.renameError.textContent = "Please enter a title.";
+      assistantEls.renameError.hidden = false;
+    }
+    return;
+  }
+  if (title.length > 80) {
+    if (assistantEls.renameError) {
+      assistantEls.renameError.textContent = "Title must be 80 characters or fewer.";
+      assistantEls.renameError.hidden = false;
+    }
+    return;
+  }
+  const id = renamingConversationId;
+  if (!id) { assistantEls.renameDialog?.close(); return; }
+  if (assistantEls.saveRenameButton) assistantEls.saveRenameButton.disabled = true;
+  try {
+    await firebaseStore.updateConversationSummary(id, { title });
+    // Update cached list so the drawer reflects the new title immediately
+    const cached = drawerConversations.find(c => c.id === id);
+    if (cached) cached.title = title;
+    renderDrawerList(filterDrawerConversations());
+    updateDrawerActiveItem();
+    renamingConversationId = null;
+    assistantEls.renameDialog?.close();
+  } catch (err) {
+    if (assistantEls.renameError) {
+      assistantEls.renameError.textContent = "The conversation could not be renamed. Try again.";
+      assistantEls.renameError.hidden = false;
+    }
+    console.error("Rename conversation failed", err);
+  } finally {
+    if (assistantEls.saveRenameButton) assistantEls.saveRenameButton.disabled = false;
+  }
+});
+
+assistantEls.closeRenameButton?.addEventListener("click", closeRenameDialog);
+assistantEls.cancelRenameButton?.addEventListener("click", closeRenameDialog);
+
+
+
+assistantEls.keepDeleteButton?.addEventListener("click", () => {
+  assistantEls.deleteDialog?.close();
+});
+
+assistantEls.confirmDeleteButton?.addEventListener("click", async () => {
+  const targetId = deletingConversationId || activeConversationId;
+  if (!targetId) {
+    assistantEls.deleteDialog?.close();
+    return;
+  }
+  const wasActive = targetId === activeConversationId;
+  assistantEls.confirmDeleteButton.disabled = true;
+
+  try {
+    await firebaseStore.deleteConversation(targetId);
+    composerDrafts.delete(targetId);
+    deletingConversationId = null;
+
+    if (wasActive) {
+      const remaining = await firebaseStore.listRecentConversations(20);
+      if (remaining.length > 0) {
+        await openConversation(remaining[0].id);
+      } else {
+        activeConversationId = null;
+        await startNewConversation();
+      }
+    }
+    await loadDrawerConversations();
+  } catch (error) {
+    showPersistenceFailure();
+    console.error("Delete conversation failed", error);
+  } finally {
+    assistantEls.confirmDeleteButton.disabled = false;
+    assistantEls.deleteDialog?.close();
+  }
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") {
+    if (assistantEls.contextMenu && !assistantEls.contextMenu.hidden) {
+      closeContextMenu();
+      return;
+    }
+    if (isDrawerOpen) {
+      closeDrawer();
+    }
+  }
+});
+
+assistantEls.conversation?.addEventListener("scroll", () => {
+  if (!assistantEls.scrollLatest) return;
+  if (isNearBottom(60)) {
+    assistantEls.scrollLatest.hidden = true;
+  } else if (assistantEls.conversation.scrollHeight - assistantEls.conversation.scrollTop - assistantEls.conversation.clientHeight > 140) {
+    assistantEls.scrollLatest.hidden = false;
+  }
+});
+assistantEls.scrollLatest?.addEventListener("click", scrollToBottom);
+
+assistantEls.retrySave?.addEventListener("click", () => {
   persistenceQueue = persistenceQueue.then(persistPendingMessages);
 });
 
-assistantEls.conversation.addEventListener("click", event => {
+assistantEls.conversation?.addEventListener("click", event => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   const proposalEl = button.closest(".proposal");
@@ -2027,7 +2907,9 @@ assistantEls.conversation.addEventListener("click", event => {
 });
 
 renderConversation();
-refreshRecentConversationList().catch(showPersistenceFailure);
+loadDrawerConversations().catch(showPersistenceFailure);
+updateComposerHeight();
+updateSendButtonState();
 if (pendingMessageWrites.length) showPersistenceFailure();
 
 function openAddDialog() {

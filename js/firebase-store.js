@@ -50,8 +50,9 @@ function normalizeScheduleItem(entry) {
 function normalizeConversation(entry) {
   const value = entry.data();
   return {
-    id: entry.id, title: typeof value.title === "string" ? value.title.slice(0, 100) : "Conversation",
+    id: entry.id, title: typeof value.title === "string" ? value.title.slice(0, 100) : "New conversation",
     summary: typeof value.summary === "string" ? value.summary.slice(0, 600) : "",
+    lastMessagePreview: typeof value.lastMessagePreview === "string" ? value.lastMessagePreview.slice(0, 300) : "",
     keywords: Array.isArray(value.keywords) ? value.keywords.filter(word => typeof word === "string").slice(0, 40) : [],
     status: value.status === "archived" ? "archived" : "active",
     createdAt: value.createdAt || null, updatedAt: value.updatedAt || null
@@ -144,9 +145,28 @@ export async function createConversation(data = {}) {
   conversationMessageCache.set(ref.id, []);
   return ref.id;
 }
-export async function listRecentConversations(max = 15) {
-  const snapshot = await getDocs(query(userCollection("conversations"), orderBy("updatedAt", "desc"), limit(max)));
-  return snapshot.docs.map(normalizeConversation);
+export async function listRecentConversations(max = 20) {
+  function getMillis(val) {
+    if (!val) return 0;
+    if (typeof val.toMillis === "function") return val.toMillis();
+    if (typeof val.getTime === "function") return val.getTime();
+    if (typeof val.seconds === "number") return val.seconds * 1000;
+    return 0;
+  }
+  function sortConversations(list) {
+    return list.sort((a, b) => {
+      const aTime = getMillis(a.updatedAt) || getMillis(a.createdAt);
+      const bTime = getMillis(b.updatedAt) || getMillis(b.createdAt);
+      return bTime - aTime;
+    });
+  }
+  try {
+    const snapshot = await getDocs(query(userCollection("conversations"), orderBy("updatedAt", "desc"), limit(max)));
+    return sortConversations(snapshot.docs.map(normalizeConversation));
+  } catch {
+    const snapshot = await getDocs(query(userCollection("conversations"), limit(max)));
+    return sortConversations(snapshot.docs.map(normalizeConversation));
+  }
 }
 export async function loadConversation(id, max = 50) {
   const conversationRef = userDoc("conversations", id);
@@ -180,9 +200,24 @@ export async function addConversationMessage(conversationId, message) {
   if (message.role === "user" && previous.length === 0) metadata.title = String(message.text).slice(0, 72);
   const words = tokenizeKeywords([...previous.map(item => item.text), message.text].join(" "));
   metadata.keywords = words;
+  metadata.lastMessagePreview = String(message.text || "").slice(0, 200);
   metadata.updatedAt = serverTimestamp();
   await updateDoc(userDoc("conversations", conversationId), metadata);
   return ref.id;
+}
+export async function deleteConversation(conversationId) {
+  if (!conversationId) return;
+  const messagesCollection = collection(userDoc("conversations", conversationId), "messages");
+  while (true) {
+    const snapshot = await getDocs(query(messagesCollection, limit(450)));
+    if (snapshot.empty) break;
+    const batch = writeBatch(db);
+    snapshot.docs.forEach(entry => batch.delete(entry.ref));
+    await batch.commit();
+    if (snapshot.docs.length < 450) break;
+  }
+  await deleteDoc(userDoc("conversations", conversationId));
+  conversationMessageCache.delete(conversationId);
 }
 export async function resolveUnresolvedProposals(conversationId) {
   const messages = await getDocs(query(collection(userDoc("conversations", conversationId), "messages"), where("resolved", "==", false), limit(20)));
@@ -335,7 +370,7 @@ export function tokenizeKeywords(text) {
 export const firebaseStore = {
   observeAuthState, signInAnonymouslyWhenNeeded, getCurrentUser,
   loadScheduleItems, createScheduleItem, updateScheduleItem, deleteScheduleItem, writeSchedulePlanBatch, loadCategories, createCategory, updateCategory,
-  createConversation, listRecentConversations, loadConversation, addConversationMessage, resolveUnresolvedProposals, markConversationItemDeleted, markConversationItemsDeleted, updateConversationSummary, searchConversationSummaries,
+  createConversation, listRecentConversations, loadConversation, addConversationMessage, deleteConversation, resolveUnresolvedProposals, markConversationItemDeleted, markConversationItemsDeleted, updateConversationSummary, searchConversationSummaries,
   loadAssistantState, saveAssistantState, clearAssistantState,
   createMemory, updateMemory, listActiveMemories, searchMemories, tokenizeKeywords
 };

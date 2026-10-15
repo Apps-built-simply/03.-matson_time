@@ -867,7 +867,14 @@ let guidanceTrigger = null;
 const guidanceCopy = {
   today: ["Today", ["See what needs attention now.", "Move through attention items using the arrows.", "Mark an item done, postpone it, or cancel it.", "Review the complete schedule below."]],
   calendar: ["Calendar", ["Select a date to see its schedule.", "Use the month controls to move between months.", "Dates with scheduled items show the existing calendar indicators."]],
-  assistant: ["Assistant", ["Ask questions about the schedule.", "Give natural instructions to create or change items.", "Review and confirm proposed changes before they are saved."]],
+  assistant: ["Assistant", [
+    "Ask questions about your schedule.",
+    "Give natural instructions to create, change, postpone, cancel, or complete items.",
+    "Review proposed changes before they are saved.",
+    "Open Chats to return to an earlier conversation.",
+    "Start a new conversation for a separate topic.",
+    "Voice input will be added later."
+  ]],
   progress: ["Progress", ["Review daily and weekly completion.", "See completed, missed, remaining, and unresolved items."]]
 };
 document.addEventListener("click", event => {
