@@ -20,6 +20,7 @@
       <header class="app-header today-header">
         <div class="container">
           <h1>Today</h1>
+          <button class="page-guidance-button" type="button" aria-label="Page guidance" data-guidance="today"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg></button>
         </div>
       </header>
 
@@ -57,7 +58,7 @@
       <header class="app-header">
         <div class="container">
           <div class="calendar-header">
-            <div>
+            <div class="calendar-heading">
               <p class="eyebrow" id="calendarDate"></p>
               <h1>Calendar</h1>
             </div>
@@ -67,6 +68,7 @@
               <button class="icon-button secondary" id="nextMonthButton" aria-label="Next month">›</button>
             </div>
           </div>
+          <button class="page-guidance-button" type="button" aria-label="Page guidance" data-guidance="calendar"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg></button>
         </div>
       </header>
 
@@ -90,6 +92,7 @@
         <div class="container">
           <p class="eyebrow" id="assistantDate"></p>
           <h1>Assistant</h1>
+          <button class="page-guidance-button" type="button" aria-label="Page guidance" data-guidance="assistant"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg></button>
         </div>
       </header>
 
@@ -140,6 +143,7 @@
         <div class="container">
           <p class="eyebrow" id="progressDate"></p>
           <h1>Progress</h1>
+          <button class="page-guidance-button" type="button" aria-label="Page guidance" data-guidance="progress"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg></button>
         </div>
       </header>
 
@@ -220,7 +224,7 @@
       <div class="dialog-header">
         <div>
           <p class="eyebrow">Create</p>
-          <h2>Add new item</h2>
+          <h2 id="addDialogTitle">Add new item</h2>
         </div>
         <button type="button" class="icon-button secondary" id="closeAddButton" aria-label="Close">×</button>
       </div>
@@ -238,6 +242,20 @@
         <label>Start time<input name="start" type="time"></label>
         <label>End time<input name="end" type="time"></label>
       </div>
+      <fieldset class="recurrence-fields" id="recurrenceFields">
+        <legend>Repeat</legend>
+        <label>Frequency
+          <select name="recurrenceFrequency" id="recurrenceFrequency">
+            <option value="">Does not repeat</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+          </select>
+        </label>
+        <label>Every<input name="recurrenceInterval" type="number" min="1" max="365" value="1"></label>
+        <label>Days of week (weekly)<input name="recurrenceDays" type="text" placeholder="1, 3, 5" aria-describedby="recurrenceDaysHint"></label>
+        <small id="recurrenceDaysHint">Use 0 for Sunday through 6 for Saturday.</small>
+      </fieldset>
       <label>Category
         <select name="category">
           <option>Music</option><option>Health</option><option>Personal</option><option>Meetings</option><option>Travel</option>
@@ -246,6 +264,65 @@
       <label>Notes<textarea name="notes" rows="3" placeholder="Optional notes"></textarea></label>
       <button class="primary-button" type="submit">Save item</button>
     </form>
+  </dialog>
+
+  <dialog id="postponeDialog" class="guidance-dialog postpone-dialog" aria-labelledby="postponeTitle" aria-describedby="postponeItemSummary">
+    <form id="postponeForm" class="guidance-content" novalidate>
+      <div class="dialog-header">
+        <h2 id="postponeTitle">Postpone item</h2>
+        <button type="button" class="guidance-close" id="closePostponeButton" aria-label="Close postponement"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </div>
+      <dl class="cancel-item-summary" id="postponeItemSummary">
+        <div><dt>Item</dt><dd id="postponeItemTitle"></dd></div>
+        <div><dt>Current date</dt><dd id="postponeCurrentDate"></dd></div>
+        <div><dt>Current time</dt><dd id="postponeCurrentTime"></dd></div>
+      </dl>
+      <label class="postpone-unknown"><input id="postponeUnknown" type="checkbox"> Date and time not decided</label>
+      <div id="postponeKnownFields" class="postpone-fields">
+        <label>New date<input name="newDate" id="postponeNewDate" type="date" aria-describedby="postponeError" required></label>
+        <div id="postponeTimeFields" class="postpone-fields">
+          <label>New start time<input name="newStart" id="postponeNewStart" type="time" aria-describedby="postponeError"></label>
+          <label class="postpone-duration" id="postponeDurationLabel"><input name="keepDuration" id="postponeKeepDuration" type="checkbox" checked> Keep current duration</label>
+          <label id="postponeNewEndLabel" hidden>New end time<input name="newEnd" id="postponeNewEnd" type="time" aria-describedby="postponeError"></label>
+        </div>
+      </div>
+      <p id="postponeConflict" class="postpone-conflict" role="alert" hidden></p>
+      <p id="postponeError" class="cancel-item-error" role="alert" hidden></p>
+      <div class="postpone-links"><button type="button" class="text-button" id="editPostponedItem">Edit full item</button></div>
+      <div class="cancel-confirm-actions">
+        <button type="button" class="secondary-button" id="cancelPostponeButton">Cancel</button>
+        <button type="submit" class="primary-button" id="savePostponeButton" disabled>Save postponement</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="guidanceDialog" class="guidance-dialog" aria-labelledby="guidanceTitle">
+    <div class="guidance-content">
+      <div class="dialog-header">
+        <h2 id="guidanceTitle"></h2>
+        <button type="button" class="guidance-close" id="closeGuidanceButton" aria-label="Close guidance"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </div>
+      <ul id="guidanceList"></ul>
+    </div>
+  </dialog>
+
+  <dialog id="attentionCancelDialog" class="guidance-dialog cancel-confirm-dialog" aria-labelledby="cancelConfirmTitle" aria-describedby="cancelItemSummary">
+    <div class="guidance-content">
+      <div class="dialog-header">
+        <h2 id="cancelConfirmTitle">Cancel this item?</h2>
+      </div>
+      <dl class="cancel-item-summary" id="cancelItemSummary">
+        <div><dt>Item</dt><dd id="cancelItemTitle"></dd></div>
+        <div><dt>Date</dt><dd id="cancelItemDate"></dd></div>
+        <div><dt>Time</dt><dd id="cancelItemTime"></dd></div>
+        <div><dt>Category</dt><dd id="cancelItemCategory"></dd></div>
+      </dl>
+      <p id="cancelItemError" class="cancel-item-error" role="status" hidden></p>
+      <div class="cancel-confirm-actions">
+        <button type="button" class="primary-button" id="confirmCancelItem">Cancel item</button>
+        <button type="button" class="secondary-button" id="keepCancelItem">Keep item</button>
+      </div>
+    </div>
   </dialog>
 
   <script type="module" src="js/bootstrap.js"></script>

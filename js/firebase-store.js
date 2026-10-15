@@ -33,6 +33,8 @@ function normalizeScheduleItem(entry) {
     notes: typeof value.notes === "string" ? value.notes.slice(0, 2000) : "",
     status: ["upcoming", "in-progress", "overdue", "completed", "missed", "cancelled", "postponed", "awaiting-check-in"].includes(value.status) ? value.status : "upcoming",
     postponed: Number.isInteger(value.postponed) && value.postponed >= 0 ? value.postponed : 0,
+    schedulePending: value.schedulePending === true,
+    postponementHistory: Array.isArray(value.postponementHistory) ? value.postponementHistory.filter(entry => entry && typeof entry === "object").slice(-20) : [],
     createdAt: value.createdAt || null, updatedAt: value.updatedAt || null
   };
   const recurrence = value.recurrence;
@@ -57,10 +59,13 @@ function normalizeConversation(entry) {
 }
 function itemPayload(item, creating = false) {
   const payload = {
-    id: item.id, type: item.type, title: item.title, date: item.date,
+    id: item.id, type: item.type, title: item.title, date: item.schedulePending ? null : item.date,
     start: item.start || "", end: item.end || "", category: item.category || "Personal",
     notes: item.notes || "", status: item.status || "upcoming", recurrence: item.recurrence || null,
-    postponed: Number.isInteger(item.postponed) ? item.postponed : 0, updatedAt: serverTimestamp()
+    postponed: Number.isInteger(item.postponed) ? item.postponed : 0,
+    schedulePending: item.schedulePending === true,
+    postponementHistory: Array.isArray(item.postponementHistory) ? item.postponementHistory.slice(-20) : [],
+    updatedAt: serverTimestamp()
   };
   if (creating && !item.createdAt) payload.createdAt = serverTimestamp();
   else if (item.createdAt) payload.createdAt = item.createdAt;
@@ -94,7 +99,7 @@ export async function createScheduleItem(item) {
 }
 export async function updateScheduleItem(id, changes) {
   const ref = userDoc("scheduleItems", id);
-  const allowed = ["type", "title", "date", "start", "end", "category", "notes", "status", "recurrence", "postponed"];
+  const allowed = ["type", "title", "date", "start", "end", "category", "notes", "status", "recurrence", "postponed", "schedulePending", "postponementHistory"];
   const safeChanges = Object.fromEntries(Object.entries(changes).filter(([key]) => allowed.includes(key)));
   await updateDoc(ref, { ...safeChanges, id, updatedAt: serverTimestamp() });
 }

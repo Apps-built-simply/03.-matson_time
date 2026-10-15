@@ -1,7 +1,10 @@
 /* Central schedule action engine — single source of truth for schedule mutations */
 
 function scheduleValidateDate(value) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value) && !isNaN(parseLocalDate(value).getTime());
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = parseLocalDate(value);
+  const [year, month, day] = value.split("-").map(Number);
+  return !isNaN(date.getTime()) && date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
 }
 
 function scheduleValidateTime(value) {
@@ -11,11 +14,13 @@ function scheduleValidateTime(value) {
 function scheduleValidateItem(item) {
   if (!item || !["activity", "task", "routine"].includes(item.type)) return "Item type is invalid";
   if (!item.title || !item.title.trim()) return "Title is required";
-  if (!scheduleValidateDate(item.date)) return "Valid date (YYYY-MM-DD) is required";
+  const pendingSchedule = item.status === "postponed" && item.schedulePending === true;
+  if (!pendingSchedule && !scheduleValidateDate(item.date)) return "Valid date (YYYY-MM-DD) is required";
+  if (pendingSchedule && (item.date || item.start || item.end)) return "An undecided schedule cannot include a date or time";
   if (item.start && !scheduleValidateTime(item.start)) return "Valid start time (HH:mm) is required";
   if (item.end && !scheduleValidateTime(item.end)) return "Valid end time (HH:mm) is required";
   if (item.start && item.end && item.start >= item.end) return "End time must be after start time";
-  if (item.type === "activity") {
+  if (item.type === "activity" && !pendingSchedule) {
     if (!scheduleValidateTime(item.start)) return "Valid start time (HH:mm) is required for activities";
     if (!scheduleValidateTime(item.end)) return "Valid end time (HH:mm) is required for activities";
     if (item.start >= item.end) return "End time must be after start time";
@@ -75,10 +80,12 @@ function saFindItemsByTitle(title, dateFilter = null) {
 async function saUpdateItem(id, updates) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
-  const updated = { ...items[index], ...updates };
+  const normalizedUpdates = { ...updates };
+  if (items[index].schedulePending && (normalizedUpdates.date || normalizedUpdates.start || normalizedUpdates.end)) normalizedUpdates.schedulePending = false;
+  const updated = { ...items[index], ...normalizedUpdates };
   const error = scheduleValidateItem(updated);
   if (error) return { success: false, error };
-  try { await firebaseStore.updateScheduleItem(id, updates); }
+  try { await firebaseStore.updateScheduleItem(id, normalizedUpdates); }
   catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
   items[index] = updated;
   triggerScheduleRender();
@@ -94,42 +101,69 @@ async function saRescheduleItem(id, newDate, newStart, newEnd) {
   if (!scheduleValidateTime(newStart)) return { success: false, error: "Valid start time (HH:mm) is required" };
   if (!scheduleValidateTime(newEnd)) return { success: false, error: "Valid end time (HH:mm) is required" };
   if (newStart >= newEnd) return { success: false, error: "End time must be after start time" };
-  const updated = { ...item, date: newDate, start: newStart, end: newEnd };
-  try { await firebaseStore.updateScheduleItem(id, { date: newDate, start: newStart, end: newEnd }); }
+  const updated = { ...item, date: newDate, start: newStart, end: newEnd, schedulePending: false };
+  try { await firebaseStore.updateScheduleItem(id, { date: newDate, start: newStart, end: newEnd, schedulePending: false }); }
   catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
   items[index] = updated;
   triggerScheduleRender();
   return { success: true, item: updated };
 }
 
-async function saPostponeItem(id, minutes = 15) {
+async function saPostponeItem(id, schedule) {
   const index = items.findIndex(item => item.id === id);
   if (index === -1) return { success: false, error: "Item not found" };
   const item = items[index];
-  if (!item.start || !item.end) return { success: false, error: "Only timed items can be postponed" };
-  const startDate = parseLocalDate(item.date);
-  const [sh, sm] = item.start.split(":").map(Number);
-  const [eh, em] = item.end.split(":").map(Number);
-  const startMs = startDate.getTime() + sh * 3600000 + sm * 60000 + minutes * 60000;
-  const endMs = startDate.getTime() + eh * 3600000 + em * 60000 + minutes * 60000;
-  const newStart = new Date(startMs);
-  const newEnd = new Date(endMs);
-  const newDate = localDateString(newStart);
-  const newStartTime = `${String(newStart.getHours()).padStart(2, "0")}:${String(newStart.getMinutes()).padStart(2, "0")}`;
-  const newEndTime = `${String(newEnd.getHours()).padStart(2, "0")}:${String(newEnd.getMinutes()).padStart(2, "0")}`;
+  if (typeof schedule === "number") {
+    if (!item.date || !item.start || !item.end) return { success: false, error: "Only timed items can be postponed" };
+    const baseDate = parseLocalDate(item.date);
+    const [startHour, startMinute] = item.start.split(":").map(Number);
+    const [endHour, endMinute] = item.end.split(":").map(Number);
+    const startDate = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), startHour, startMinute + schedule);
+    const endDate = new Date(baseDate.getFullYear(), baseDate.getMonth(), baseDate.getDate(), endHour, endMinute + schedule);
+    schedule = {
+      date: localDateString(startDate),
+      start: `${String(startDate.getHours()).padStart(2, "0")}:${String(startDate.getMinutes()).padStart(2, "0")}`,
+      end: `${String(endDate.getHours()).padStart(2, "0")}:${String(endDate.getMinutes()).padStart(2, "0")}`,
+      schedulePending: false
+    };
+  }
+  if (!schedule || typeof schedule !== "object") return { success: false, error: "Choose a postponement schedule." };
+  const pending = schedule.schedulePending === true;
   const updated = {
     ...item,
-    date: newDate,
-    start: newStartTime,
-    end: newEndTime,
+    date: pending ? "" : schedule.date,
+    start: pending ? "" : (schedule.start || ""),
+    end: pending ? "" : (schedule.end || ""),
+    schedulePending: pending,
     status: "postponed",
-    postponed: (item.postponed || 0) + 1
+    postponed: (item.postponed || 0) + 1,
+    postponementHistory: [...(Array.isArray(item.postponementHistory) ? item.postponementHistory : []), {
+      previousDate: item.date || null,
+      previousStart: item.start || null,
+      previousEnd: item.end || null,
+      newDate: pending ? null : (schedule.date || null),
+      newStart: pending ? null : (schedule.start || null),
+      newEnd: pending ? null : (schedule.end || null),
+      schedulePending: pending,
+      postponedAt: new Date().toISOString()
+    }].slice(-20)
   };
-  try { await firebaseStore.updateScheduleItem(id, updated); }
+  const validationError = scheduleValidateItem(updated);
+  if (validationError) return { success: false, error: validationError };
+  const changes = {
+    date: pending ? null : updated.date,
+    start: updated.start,
+    end: updated.end,
+    schedulePending: pending,
+    status: updated.status,
+    postponed: updated.postponed,
+    postponementHistory: updated.postponementHistory
+  };
+  try { await firebaseStore.updateScheduleItem(id, changes); }
   catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
   items[index] = updated;
   triggerScheduleRender();
-  return { success: true, item: items[index], postponedMinutes: minutes };
+  return { success: true, item: items[index] };
 }
 
 async function saCompleteItem(id) {
@@ -188,7 +222,7 @@ async function saDeleteItem(id) {
 }
 
 function saGetItemsForDate(dateStr) {
-  return items.filter(item => item.date === dateStr);
+  return items.filter(item => item.date === dateStr && !item.schedulePending);
 }
 
 function saGetTodayItems() {
@@ -197,7 +231,7 @@ function saGetTodayItems() {
 
 function saGetUpcomingItems() {
   const today = localDateString(new Date());
-  return items.filter(item => item.date && item.date >= today && item.status !== "completed" && item.status !== "cancelled");
+  return items.filter(item => item.date && !item.schedulePending && item.date >= today && item.status !== "completed" && item.status !== "cancelled");
 }
 
 function saGetCurrentOrNextItem() {

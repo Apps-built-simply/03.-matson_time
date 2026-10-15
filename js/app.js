@@ -3,9 +3,40 @@ var items = loadItems();
 // View state: the month being displayed and the selected date (YYYY-MM-DD)
 let calendarCursor = new Date();
 let selectedDate = localDateString(new Date());
+let attentionCarouselIndex = 0;
+let attentionCarouselInitialized = false;
+let attentionSelectedItemId = null;
+let attentionItems = [];
+let cancelTargetId = null;
+let cancelTrigger = null;
+let cancellationCommitted = false;
+let cancelWriteInProgress = false;
+let postponeTargetId = null;
+let postponeTrigger = null;
+let postponeWriteInProgress = false;
+let postponeConflictConfirmed = "";
+let editingItemId = null;
+
+const scheduleStatusPresentation = {
+  upcoming: { label: "Upcoming", className: "upcoming" },
+  "in-progress": { label: "In progress", className: "in-progress" },
+  completed: { label: "Completed", className: "completed" },
+  postponed: { label: "Postponed", className: "postponed" },
+  "awaiting-check-in": { label: "Awaiting check-in", className: "awaiting-check-in" },
+  overdue: { label: "Overdue", className: "overdue" },
+  missed: { label: "Missed", className: "missed" },
+  cancelled: { label: "Cancelled", className: "cancelled" }
+};
 
 const categoryColors = Object.fromEntries((window.cloudCategories || []).map(category => [category.name, /^#[0-9a-f]{6}$/i.test(category.color || "") ? category.color : "#2563EB"]));
 function getCategoryColor(categoryName) { return categoryColors[categoryName] || "#2563EB"; }
+const attentionVisuals = {
+  Health: { className: "health", image: "assets/illustrations/health.png" },
+  Music: { className: "music", image: "assets/illustrations/music.png" },
+  Meetings: { className: "meetings", image: "assets/illustrations/meetings.png" },
+  Personal: { className: "personal", image: "assets/illustrations/personal.png" },
+  Travel: { className: "travel", image: "assets/illustrations/travel.png" }
+};
 
 const els = {
   todayView: document.querySelector("#todayView"), calendarView: document.querySelector("#calendarView"), assistantView: document.querySelector("#assistantView"), progressView: document.querySelector("#progressView"),
@@ -18,7 +49,21 @@ const els = {
   dialog: document.querySelector("#addDialog"), form: document.querySelector("#addForm"),
   type: document.querySelector("#itemType"), timeFields: document.querySelector("#timeFields"),
   navToday: document.querySelector("#navToday"), navCalendar: document.querySelector("#navCalendar"), navAssistant: document.querySelector("#navAssistant"), navProgress: document.querySelector("#navProgress"), navAdd: document.querySelector("#navAddButton"),
-  prevMonth: document.querySelector("#prevMonthButton"), nextMonth: document.querySelector("#nextMonthButton")
+  prevMonth: document.querySelector("#prevMonthButton"), nextMonth: document.querySelector("#nextMonthButton"),
+  cancelDialog: document.querySelector("#attentionCancelDialog"), cancelItemTitle: document.querySelector("#cancelItemTitle"),
+  cancelItemDate: document.querySelector("#cancelItemDate"), cancelItemTime: document.querySelector("#cancelItemTime"),
+  cancelItemCategory: document.querySelector("#cancelItemCategory"), cancelError: document.querySelector("#cancelItemError"),
+  confirmCancel: document.querySelector("#confirmCancelItem"), keepCancel: document.querySelector("#keepCancelItem"),
+  addDialogTitle: document.querySelector("#addDialogTitle"), recurrenceFrequency: document.querySelector("#recurrenceFrequency"),
+  postponeDialog: document.querySelector("#postponeDialog"), postponeForm: document.querySelector("#postponeForm"),
+  postponeItemTitle: document.querySelector("#postponeItemTitle"), postponeCurrentDate: document.querySelector("#postponeCurrentDate"),
+  postponeCurrentTime: document.querySelector("#postponeCurrentTime"), postponeUnknown: document.querySelector("#postponeUnknown"),
+  postponeKnownFields: document.querySelector("#postponeKnownFields"), postponeNewDate: document.querySelector("#postponeNewDate"),
+  postponeTimeFields: document.querySelector("#postponeTimeFields"),
+  postponeNewStart: document.querySelector("#postponeNewStart"), postponeKeepDuration: document.querySelector("#postponeKeepDuration"),
+  postponeNewEnd: document.querySelector("#postponeNewEnd"), postponeNewEndLabel: document.querySelector("#postponeNewEndLabel"),
+  postponeDurationLabel: document.querySelector("#postponeDurationLabel"), postponeConflict: document.querySelector("#postponeConflict"),
+  postponeError: document.querySelector("#postponeError"), savePostpone: document.querySelector("#savePostponeButton")
 };
 
 const categorySelect = document.querySelector('#addForm select[name="category"]');
@@ -33,22 +78,46 @@ function parseLocalDate(value) {
 }
 
 function formatDateLabel(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return "Date not set";
   return new Intl.DateTimeFormat("en", { weekday: "long", day: "numeric", month: "long", year: "numeric" }).format(parseLocalDate(value));
 }
 
 function formatTime(value) {
-  if (!value) return "Anytime today";
+  if (!value || !/^\d{2}:\d{2}$/.test(value)) return "Time not set";
   const [hour, minute] = value.split(":").map(Number);
   return new Intl.DateTimeFormat("en", { hour: "numeric", minute: "2-digit" }).format(new Date(2000, 0, 1, hour, minute));
 }
 
 function itemTime(item) {
+  if (item.schedulePending || (!item.date && item.status === "postponed")) return "Time not set";
+  if (!item.start) return "Anytime today";
   return item.start ? `${formatTime(item.start)}${item.end ? ` – ${formatTime(item.end)}` : ""}` : "Anytime today";
 }
 
 function getAttentionItem(dateItems) {
-  const activeItems = dateItems.filter(item => !["completed", "cancelled"].includes(item.status));
+  const activeItems = dateItems.filter(item => !item.schedulePending && !["completed", "cancelled", "missed"].includes(item.status));
   return activeItems.find(item => item.status === "in-progress") || activeItems.find(item => item.status === "overdue") || activeItems[0] || null;
+}
+
+function getAttentionItems(dateItems) {
+  const eligibleStatuses = ["in-progress", "overdue", "awaiting-check-in", "upcoming", "postponed"];
+  return sortTodayItems(dateItems.filter(item => !item.schedulePending && eligibleStatuses.includes(item.status)));
+}
+
+function getInitialTodayHeroItem(heroItems) {
+  return heroItems.find(item => item.status === "in-progress")
+    || heroItems.find(item => item.status === "overdue")
+    || heroItems.find(item => item.status === "awaiting-check-in")
+    || heroItems.find(item => item.status === "upcoming" && item.start)
+    || heroItems.find(item => item.status === "postponed")
+    || heroItems.find(item => !item.start)
+    || heroItems[0]
+    || null;
+}
+
+function resolveTodayState(todayItems, heroItems) {
+  if (!todayItems.length) return "empty_day";
+  return heroItems.length ? "active_day" : "resolved_day";
 }
 
 // Overlapping timed activities within a single date
@@ -60,20 +129,44 @@ function detectConflict(dateItems) {
   return null;
 }
 
-function getTodayCategoryColor(category) {
-  const colors = {
-    Health: "#C77F9F",
-    Meetings: "#C98A5D",
-    Music: "#A18ACB",
-    Personal: "#68AAA0",
-    Travel: "#8294C9"
-  };
-  return colors[category] || "#68AAA0";
+function timestampOrder(value) {
+  if (!value) return Number.MAX_SAFE_INTEGER;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
+}
+
+function stableItemId(item) {
+  return String(item.id || "");
+}
+
+function sortTodayItems(dateItems) {
+    return [...dateItems].sort((a, b) => {
+    const aPending = a.schedulePending === true || (!a.date && a.status === "postponed");
+    const bPending = b.schedulePending === true || (!b.date && b.status === "postponed");
+    if (aPending !== bPending) return aPending ? 1 : -1;
+    if (a.date !== b.date) return String(a.date || "9999-12-31").localeCompare(String(b.date || "9999-12-31"));
+    const aTimed = Boolean(a.start), bTimed = Boolean(b.start);
+    if (aTimed !== bTimed) return aTimed ? -1 : 1;
+    if (aTimed && a.start !== b.start) return a.start.localeCompare(b.start);
+    if (aTimed && (a.end || "").localeCompare(b.end || "")) return (a.end || "").localeCompare(b.end || "");
+    const createdDiff = timestampOrder(a.createdAt) - timestampOrder(b.createdAt);
+    if (createdDiff) return createdDiff;
+    return stableItemId(a).localeCompare(stableItemId(b));
+  });
 }
 
 function scheduleItemNode(item, todayStyle = false) {
   const article = document.createElement("article");
-  article.className = "schedule-item";
+  const activeStatuses = ["upcoming", "in-progress", "overdue", "awaiting-check-in", "postponed"];
+  const selectable = todayStyle && activeStatuses.includes(item.status) && !item.schedulePending;
+  article.className = `schedule-item${selectable ? " is-selectable" : ""}${attentionSelectedItemId === item.id ? " is-hero-selected" : ""}`;
+  if (selectable) {
+    article.tabIndex = 0;
+    article.setAttribute("role", "button");
+    article.setAttribute("aria-label", `Show ${item.title} in Today focus`);
+    article.dataset.todayHeroItem = item.id;
+  }
   const categoryMarker = todayStyle ? null : document.createElement("span");
   if (categoryMarker) {
     categoryMarker.className = "category-dot";
@@ -88,58 +181,82 @@ function scheduleItemNode(item, todayStyle = false) {
     const time = document.createElement("span");
     time.className = "schedule-time";
     time.textContent = itemTime(item);
-    const separator = document.createElement("span");
-    separator.className = "schedule-separator";
-    separator.textContent = " · ";
-    const category = document.createElement("span");
-    const categoryName = item.category || "Personal";
-    category.className = "schedule-category";
-    category.textContent = categoryName;
-      category.style.color = getTodayCategoryColor(categoryName);
-    detail.append(time, separator, category);
+    detail.append(time);
   } else {
     detail.textContent = `${itemTime(item)} · ${item.category}`;
   }
 
   content.append(title, detail);
   const status = document.createElement("span");
-  status.className = `item-status status-${String(item.status || "upcoming").replace(/[^a-z-]/gi, "")}`;
-  status.textContent = todayStyle ? readableStatus(item.status) : String(item.status || "upcoming").replaceAll("-", " ");
+  const statusStyle = scheduleStatusPresentation[item.status] || scheduleStatusPresentation.upcoming;
+  const statusClass = todayStyle ? statusStyle.className : String(item.status || "upcoming").replace(/[^a-z-]/gi, "");
+  status.className = `item-status status-${statusClass}`;
+  status.textContent = todayStyle ? statusStyle.label : String(item.status || "upcoming").replaceAll("-", " ");
   if (categoryMarker) article.append(categoryMarker);
   article.append(content, status);
   return article;
 }
 
-function readableStatus(status) {
-  const value = String(status || "upcoming").replaceAll("-", " ");
-  if (value === "in progress") return "In progress";
-  if (value === "awaiting check in") return "Awaiting check-in";
-  return value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-function renderAttention(dateItems) {
-  const attention = getAttentionItem(dateItems);
-  if (!attention) {
+function renderAttention(dateItems, heroItems = getAttentionItems(dateItems)) {
+  attentionItems = heroItems;
+  if (!attentionItems.length) {
+    attentionCarouselIndex = 0;
+    attentionSelectedItemId = null;
+    attentionCarouselInitialized = false;
     const empty = document.createElement("div");
     empty.className = "attention-empty";
     empty.textContent = "Nothing needs attention right now.";
     els.now.replaceChildren(empty);
     return;
   }
+  if (!attentionCarouselInitialized) {
+    const current = getInitialTodayHeroItem(attentionItems);
+    attentionCarouselIndex = Math.max(0, attentionItems.findIndex(item => item.id === current?.id));
+    attentionCarouselInitialized = true;
+  } else {
+    const selectedIndex = attentionItems.findIndex(item => item.id === attentionSelectedItemId);
+    if (selectedIndex >= 0) attentionCarouselIndex = selectedIndex;
+    else attentionCarouselIndex = Math.max(0, Math.min(attentionCarouselIndex, attentionItems.length - 1));
+  }
+  attentionCarouselIndex = Math.max(0, Math.min(attentionCarouselIndex, attentionItems.length - 1));
+  const attention = attentionItems[attentionCarouselIndex];
+  attentionSelectedItemId = attention.id;
+  const categoryName = attention.category || "Personal";
+  const visual = attentionVisuals[categoryName] || attentionVisuals.Personal;
+  const stage = document.createElement("div");
+  stage.className = `attention-hero-stage category-${visual.className}`;
   const article = document.createElement("article");
-  article.className = "attention-item";
-  const illustration = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  illustration.setAttribute("class", "attention-illustration");
-  illustration.setAttribute("viewBox", "0 0 240 180");
+  article.className = `attention-item attention-hero-card category-${visual.className}`;
+  const illustration = document.createElement("img");
+  illustration.className = "attention-illustration";
+  illustration.src = visual.image;
+  illustration.alt = "";
   illustration.setAttribute("aria-hidden", "true");
-  illustration.setAttribute("focusable", "false");
-  illustration.innerHTML = '<circle cx="151" cy="91" r="70" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="151" cy="91" r="4" fill="currentColor"/><path d="M151 48v43l28 18" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><rect x="19" y="31" width="60" height="13" rx="6.5" fill="currentColor"/><rect x="7" y="57" width="88" height="13" rx="6.5" fill="currentColor"/><rect x="34" y="83" width="45" height="13" rx="6.5" fill="currentColor"/>';
+  illustration.addEventListener("error", () => { illustration.hidden = true; });
+  const information = document.createElement("div");
+  information.className = "attention-information";
   const title = document.createElement("h3");
   title.textContent = attention.title;
+  title.tabIndex = -1;
   const time = document.createElement("p");
   time.textContent = itemTime(attention);
+  const pill = document.createElement("span");
+  pill.className = "attention-category";
+  pill.textContent = categoryName;
+  information.append(title, time, pill);
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "attention-cancel";
+  cancel.setAttribute("aria-label", "Cancel schedule item");
+  cancel.dataset.attentionCancel = attention.id;
+  cancel.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>';
+  article.append(information, cancel);
+  stage.append(article, illustration);
+
   const actions = document.createElement("div");
-  actions.className = "actions";
+  actions.className = "attention-controls";
+  const actionGroup = document.createElement("div");
+  actionGroup.className = "attention-actions";
   for (const [action, label, className] of [["complete", "Done", "primary-button"], ["postpone", "Postpone", "secondary-button"]]) {
     const button = document.createElement("button");
     button.type = "button";
@@ -147,10 +264,23 @@ function renderAttention(dateItems) {
     button.dataset.action = action;
     button.dataset.id = attention.id;
     button.textContent = label;
-    actions.appendChild(button);
+    actionGroup.appendChild(button);
   }
-  article.append(illustration, title, time, actions);
-  els.now.replaceChildren(article);
+  actions.appendChild(actionGroup);
+  const arrows = document.createElement("div");
+  arrows.className = "attention-arrows";
+  for (const [direction, label, path] of [["previous", "Previous schedule item", "m15 18-6-6 6-6"], ["next", "Next schedule item", "m9 18 6-6-6-6"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "attention-arrow";
+    button.setAttribute("aria-label", label);
+    button.hidden = attentionItems.length < 2;
+    button.dataset.attentionDirection = direction;
+    button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${path}"/></svg>`;
+    arrows.appendChild(button);
+  }
+  actions.appendChild(arrows);
+  els.now.replaceChildren(stage, actions);
 }
 
 function renderSchedule(dateItems, listEl, conflictEl, emptyText, todayStyle = false) {
@@ -177,14 +307,6 @@ function sortForDate(dateItems) {
   return [...dateItems].sort((a, b) => rank(a) - rank(b) || (rank(a) === 0 ? a.start.localeCompare(b.start) : 0));
 }
 
-function sortTodayItems(dateItems) {
-  return [...dateItems].sort((a, b) => {
-    const aTimed = Boolean(a.start), bTimed = Boolean(b.start);
-    if (aTimed !== bTimed) return aTimed ? -1 : 1;
-    return aTimed ? a.start.localeCompare(b.start) : 0;
-  });
-}
-
 function renderCalendar(today) {
   const year = calendarCursor.getFullYear();
   const month = calendarCursor.getMonth();
@@ -192,7 +314,7 @@ function renderCalendar(today) {
 
   const itemsByDate = new Map();
   for (const item of items) {
-    if (!item.date) continue;
+    if (!item.date || item.schedulePending) continue;
     if (!itemsByDate.has(item.date)) itemsByDate.set(item.date, []);
     itemsByDate.get(item.date).push(item);
   }
@@ -214,7 +336,7 @@ function renderCalendar(today) {
 }
 
 function renderSelectedDate() {
-  const dateItems = items.filter(item => item.date === selectedDate);
+  const dateItems = items.filter(item => item.date === selectedDate && !item.schedulePending);
   els.selectedTitle.textContent = formatDateLabel(selectedDate);
   els.selectedCount.textContent = `${dateItems.length} item${dateItems.length === 1 ? "" : "s"}`;
   renderSchedule(sortForDate(dateItems), els.selectedSchedule, els.selectedConflict, "No items planned for this date.");
@@ -224,7 +346,10 @@ function render() {
   const today = localDateString(new Date());
   els.calendarDate.textContent = formatDateLabel(today);
 
-  const todayItems = items.filter(item => item.date === today);
+  const todayItems = items.filter(item => item.date === today && !item.schedulePending);
+  const heroItems = getAttentionItems(todayItems);
+  const todayState = resolveTodayState(todayItems, heroItems);
+  els.todayMain.dataset.todayState = todayState;
   const completed = todayItems.filter(item => item.status === "completed").length;
   const remaining = todayItems.filter(item => !["completed", "cancelled"].includes(item.status)).length;
   const hasTodayItems = todayItems.length > 0;
@@ -237,9 +362,13 @@ function render() {
   if (hasTodayItems) {
     els.count.textContent = `${todayItems.length} item${todayItems.length === 1 ? "" : "s"}`;
     els.dailyProgress.textContent = `${completed} completed · ${remaining} remaining`;
-    renderAttention(todayItems);
+    renderAttention(todayItems, heroItems);
     renderSchedule(sortTodayItems(todayItems), els.list, els.conflict, "No items planned for today.", true);
   } else {
+    attentionItems = [];
+    attentionCarouselIndex = 0;
+    attentionSelectedItemId = null;
+    attentionCarouselInitialized = false;
     els.list.replaceChildren();
     els.now.replaceChildren();
     els.conflict.replaceChildren();
@@ -255,11 +384,166 @@ async function completeItem(id) {
   }
 }
 
-async function postponeItem(id) {
-  const result = await saPostponeItem(id);
-  if (!result.success) {
-    alert(`Could not postpone item: ${result.error}`);
+function postponeItem(id, trigger = null) {
+  openPostponeDialog(id, trigger);
+}
+
+function formatCurrentItemDate(item) {
+  return item.schedulePending || !item.date ? "Date not set" : formatDateLabel(item.date);
+}
+
+function openPostponeDialog(id, trigger) {
+  const item = items.find(candidate => candidate.id === id);
+  if (!item || !["upcoming", "in-progress", "overdue", "awaiting-check-in", "postponed"].includes(item.status)) return;
+  postponeTargetId = id;
+  postponeTrigger = trigger;
+  postponeConflictConfirmed = "";
+  postponeWriteInProgress = false;
+  els.postponeForm.reset();
+  els.postponeItemTitle.textContent = item.title;
+  els.postponeCurrentDate.textContent = formatCurrentItemDate(item);
+  els.postponeCurrentTime.textContent = itemTime(item);
+  els.postponeNewDate.value = item.date || "";
+  els.postponeNewStart.value = item.start || "";
+  els.postponeNewEnd.value = item.end || "";
+  const hasDuration = Boolean(item.start && item.end);
+  const hasTimes = Boolean(item.start || item.type === "activity");
+  els.postponeNewStart.required = hasTimes;
+  els.postponeTimeFields.hidden = !hasTimes;
+  els.postponeKeepDuration.checked = hasDuration;
+  els.postponeDurationLabel.hidden = !hasDuration;
+  els.postponeNewEndLabel.hidden = !hasTimes || hasDuration;
+  els.postponeNewEnd.required = hasTimes && !hasDuration;
+  els.postponeUnknown.checked = false;
+  els.postponeConflict.hidden = true;
+  els.postponeConflict.textContent = "";
+  els.postponeError.hidden = true;
+  els.postponeError.textContent = "";
+  updatePostponeFormState();
+  els.postponeDialog.returnValue = "";
+  els.postponeDialog.showModal();
+  els.postponeNewDate.focus();
+}
+
+function updatePostponeFormState() {
+  const pending = els.postponeUnknown.checked;
+  els.postponeKnownFields.hidden = pending;
+  for (const input of [els.postponeNewDate, els.postponeNewStart, els.postponeNewEnd, els.postponeKeepDuration]) input.disabled = pending;
+  const item = items.find(candidate => candidate.id === postponeTargetId);
+  els.savePostpone.disabled = !item || Boolean(getPostponeSchedule(item).error);
+}
+
+function setPostponeError(message) {
+  els.postponeError.textContent = message;
+  els.postponeError.hidden = !message;
+}
+
+function getPostponeSchedule(item) {
+  if (els.postponeUnknown.checked) return { schedulePending: true };
+  const date = els.postponeNewDate.value;
+  const hasTimes = item.type === "activity" || Boolean(item.start);
+  if (!scheduleValidateDate(date)) return { error: "Choose a valid new date." };
+  if (!hasTimes) {
+    if (!item.schedulePending && date === item.date) return { error: "Choose a new date for this postponement." };
+    return { date, start: "", end: "", schedulePending: false };
   }
+  const start = els.postponeNewStart.value;
+  if (!scheduleValidateTime(start)) return { error: "Choose a valid new start time." };
+  let end = "";
+  if (els.postponeKeepDuration.checked) {
+    if (!item.start || !item.end || !scheduleValidateTime(item.start) || !scheduleValidateTime(item.end)) return { error: "This item has no valid duration to preserve." };
+    const [startHour, startMinute] = start.split(":").map(Number);
+    const [oldStartHour, oldStartMinute] = item.start.split(":").map(Number);
+    const [oldEndHour, oldEndMinute] = item.end.split(":").map(Number);
+    const duration = oldEndHour * 60 + oldEndMinute - (oldStartHour * 60 + oldStartMinute);
+    const endMinutes = startHour * 60 + startMinute + duration;
+    if (duration <= 0 || endMinutes >= 24 * 60) return { error: "The preserved duration would cross midnight. Turn off Keep current duration and choose an end time." };
+    end = `${String(Math.floor(endMinutes / 60)).padStart(2, "0")}:${String(endMinutes % 60).padStart(2, "0")}`;
+  } else {
+    end = els.postponeNewEnd.value;
+    if (!scheduleValidateTime(end) || start >= end) return { error: "Choose an end time later than the start time." };
+  }
+  if (!item.schedulePending && date === item.date && start === item.start && end === item.end) return { error: "Choose a new date or time for this postponement." };
+  return { date, start, end, schedulePending: false };
+}
+
+function postponeConflictFor(candidate, scheduleItems = items) {
+  if (candidate.schedulePending || candidate.type !== "activity" || !candidate.start || !candidate.end) return null;
+  const overlaps = scheduleItems.find(item => item.id !== candidate.id && item.date === candidate.date && item.type === "activity" && item.start && item.end && !["completed", "missed", "cancelled"].includes(item.status) && candidate.start < item.end && item.start < candidate.end);
+  if (!overlaps) return null;
+  const start = candidate.start > overlaps.start ? candidate.start : overlaps.start;
+  const end = candidate.end < overlaps.end ? candidate.end : overlaps.end;
+  return `Schedule conflict: ${candidate.title} overlaps with ${overlaps.title} from ${formatTime(start)} to ${formatTime(end)}.`;
+}
+
+async function savePostponement(event) {
+  event.preventDefault();
+  if (postponeWriteInProgress || !postponeTargetId) return;
+  const id = postponeTargetId;
+  const localItem = items.find(item => item.id === id);
+  if (!localItem) { setPostponeError("This item is no longer available."); return; }
+  const schedule = getPostponeSchedule(localItem);
+  if (schedule.error) { setPostponeError(schedule.error); return; }
+  const candidate = {
+    ...localItem,
+    date: schedule.schedulePending ? "" : schedule.date,
+    start: schedule.schedulePending ? "" : schedule.start,
+    end: schedule.schedulePending ? "" : schedule.end,
+    schedulePending: schedule.schedulePending,
+    status: "postponed"
+  };
+  postponeWriteInProgress = true;
+  els.savePostpone.disabled = true;
+  setPostponeError("");
+  try {
+    const persistedItems = await window.firebaseStore.loadScheduleItems();
+    const persisted = persistedItems.find(item => item.id === id);
+    if (!persisted || persisted.title !== localItem.title || persisted.status !== localItem.status || persisted.date !== localItem.date || persisted.start !== localItem.start || persisted.end !== localItem.end || persisted.schedulePending !== Boolean(localItem.schedulePending) || persisted.postponed !== (localItem.postponed || 0)) {
+      throw new Error("This item changed since it was opened. Close this dialog and try again.");
+    }
+    const conflict = postponeConflictFor(candidate, persistedItems);
+    if (conflict && conflict !== postponeConflictConfirmed) {
+      els.postponeConflict.textContent = conflict;
+      els.postponeConflict.hidden = false;
+      els.savePostpone.textContent = "Save anyway";
+      postponeConflictConfirmed = conflict;
+      postponeWriteInProgress = false;
+      updatePostponeFormState();
+      return;
+    }
+    const result = await saPostponeItem(id, schedule);
+    if (!result.success) throw new Error(result.error || "Could not save this postponement. Try again.");
+    els.postponeDialog.close("saved");
+  } catch (error) {
+    setPostponeError(error.message || "Could not save this postponement. Check your connection and retry.");
+    postponeWriteInProgress = false;
+    updatePostponeFormState();
+  }
+}
+
+function openEditItem(id) {
+  const item = items.find(candidate => candidate.id === id);
+  if (!item) return;
+  editingItemId = id;
+  const form = els.form;
+  form.elements.title.value = item.title;
+  form.elements.date.value = item.date || "";
+  form.elements.type.value = item.type;
+  form.elements.start.value = item.start || "";
+  form.elements.end.value = item.end || "";
+  form.elements.category.value = item.category || "Personal";
+  form.elements.notes.value = item.notes || "";
+  const recurrence = item.recurrence || null;
+  els.recurrenceFrequency.value = recurrence?.frequency || "";
+  form.elements.recurrenceInterval.value = String(recurrence?.interval || 1);
+  form.elements.recurrenceDays.value = Array.isArray(recurrence?.days) ? recurrence.days.join(", ") : "";
+  els.addDialogTitle.textContent = "Edit item";
+  els.addDialog.querySelector(".eyebrow").textContent = "Update";
+  els.addDialog.querySelector('[type="submit"]').textContent = "Save changes";
+  els.timeFields.hidden = item.type === "task";
+  els.postponeDialog.close("edit");
+  els.addDialog.showModal();
+  form.elements.title.focus();
 }
 
 // Primary navigation
@@ -300,23 +584,166 @@ els.calendarGrid.addEventListener("click", event => {
 });
 
 document.addEventListener("click", event => {
+  const attentionArrow = event.target.closest("[data-attention-direction]");
+  if (attentionArrow && attentionItems.length > 1) {
+    const step = attentionArrow.dataset.attentionDirection === "previous" ? -1 : 1;
+    attentionCarouselIndex = (attentionCarouselIndex + step + attentionItems.length) % attentionItems.length;
+    attentionSelectedItemId = attentionItems[attentionCarouselIndex].id;
+    render();
+    return;
+  }
+  const cancel = event.target.closest("[data-attention-cancel]");
+  if (cancel) {
+    openAttentionCancel(cancel);
+    return;
+  }
   const button = event.target.closest("[data-action]");
   if (!button) return;
   if (button.dataset.action === "complete") completeItem(button.dataset.id);
-  if (button.dataset.action === "postpone") postponeItem(button.dataset.id);
+  if (button.dataset.action === "postpone") postponeItem(button.dataset.id, button);
 });
 
+function selectTodayHeroItem(id) {
+  const index = attentionItems.findIndex(item => item.id === id);
+  if (index < 0) return;
+  attentionCarouselIndex = index;
+  attentionSelectedItemId = id;
+  setView("today");
+  render();
+  els.now.querySelector(".attention-item h3")?.focus({ preventScroll: true });
+  els.attentionSection.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+}
+
+els.list.addEventListener("click", event => {
+  const row = event.target.closest("[data-today-hero-item]");
+  if (row) selectTodayHeroItem(row.dataset.todayHeroItem);
+});
+els.list.addEventListener("keydown", event => {
+  const row = event.target.closest("[data-today-hero-item]");
+  if (!row || !["Enter", " "].includes(event.key)) return;
+  event.preventDefault();
+  selectTodayHeroItem(row.dataset.todayHeroItem);
+});
+
+function openAttentionCancel(trigger) {
+  const item = items.find(candidate => candidate.id === trigger.dataset.attentionCancel);
+  if (!item || ["cancelled", "completed"].includes(item.status)) return;
+  cancelTargetId = item.id;
+  cancelTrigger = trigger;
+  cancellationCommitted = false;
+  els.cancelItemTitle.textContent = item.title;
+  els.cancelItemDate.textContent = formatDateLabel(item.date);
+  els.cancelItemTime.textContent = itemTime(item);
+  els.cancelItemCategory.textContent = item.category || "Personal";
+  els.cancelError.hidden = true;
+  els.cancelError.textContent = "";
+  els.confirmCancel.disabled = false;
+  els.keepCancel.disabled = false;
+  els.cancelDialog.showModal();
+  els.keepCancel.focus();
+}
+
+async function confirmAttentionCancel() {
+  if (cancelWriteInProgress || !cancelTargetId) return;
+  const targetId = cancelTargetId;
+  cancelWriteInProgress = true;
+  els.confirmCancel.disabled = true;
+  els.keepCancel.disabled = true;
+  els.cancelError.hidden = true;
+  try {
+    const localItem = items.find(item => item.id === targetId);
+    if (!localItem || ["cancelled", "completed"].includes(localItem.status)) {
+      throw new Error("This item is no longer available to cancel.");
+    }
+    const persistedItems = await window.firebaseStore.loadScheduleItems();
+    const persistedItem = persistedItems.find(item => item.id === targetId);
+    if (!persistedItem || ["cancelled", "completed"].includes(persistedItem.status)) {
+      throw new Error("This item has changed or no longer exists. Your schedule was not changed.");
+    }
+    const result = await saCancelItem(targetId);
+    if (!result.success) throw new Error(result.error || "Could not cancel this item.");
+    cancellationCommitted = true;
+    els.cancelDialog.close();
+  } catch (error) {
+    els.cancelError.textContent = error.message || "Could not cancel this item. Your schedule was not changed.";
+    els.cancelError.hidden = false;
+    els.confirmCancel.disabled = false;
+    els.keepCancel.disabled = false;
+  } finally {
+    cancelWriteInProgress = false;
+  }
+}
+
+els.confirmCancel.addEventListener("click", confirmAttentionCancel);
+els.keepCancel.addEventListener("click", () => { if (!cancelWriteInProgress) els.cancelDialog.close(); });
+els.cancelDialog.addEventListener("click", event => { if (event.target === els.cancelDialog && !cancelWriteInProgress) els.cancelDialog.close(); });
+els.cancelDialog.addEventListener("cancel", event => { if (cancelWriteInProgress) event.preventDefault(); });
+els.cancelDialog.addEventListener("close", () => {
+  if (!cancellationCommitted && cancelTrigger?.isConnected) cancelTrigger.focus();
+  cancelTargetId = null;
+  cancelTrigger = null;
+  cancellationCommitted = false;
+});
+
+const guidanceDialog = document.querySelector("#guidanceDialog");
+const guidanceTitle = document.querySelector("#guidanceTitle");
+const guidanceList = document.querySelector("#guidanceList");
+let guidanceTrigger = null;
+const guidanceCopy = {
+  today: ["Today", ["See what needs attention now.", "Move through attention items using the arrows.", "Mark an item done, postpone it, or cancel it.", "Review the complete schedule below."]],
+  calendar: ["Calendar", ["Select a date to see its schedule.", "Use the month controls to move between months.", "Dates with scheduled items show the existing calendar indicators."]],
+  assistant: ["Assistant", ["Ask questions about the schedule.", "Give natural instructions to create or change items.", "Review and confirm proposed changes before they are saved."]],
+  progress: ["Progress", ["Review daily and weekly completion.", "See completed, missed, remaining, and unresolved items."]]
+};
+document.addEventListener("click", event => {
+  const trigger = event.target.closest("[data-guidance]");
+  if (!trigger) return;
+  const guidance = guidanceCopy[trigger.dataset.guidance];
+  if (!guidance) return;
+  guidanceTrigger = trigger;
+  guidanceTitle.textContent = guidance[0];
+  guidanceList.replaceChildren(...guidance[1].map(text => {
+    const item = document.createElement("li");
+    item.textContent = text;
+    return item;
+  }));
+  guidanceDialog.showModal();
+});
+document.querySelector("#closeGuidanceButton").addEventListener("click", () => guidanceDialog.close());
+guidanceDialog.addEventListener("click", event => { if (event.target === guidanceDialog) guidanceDialog.close(); });
+guidanceDialog.addEventListener("close", () => guidanceTrigger?.focus());
+
 function openAddDialog() {
+  editingItemId = null;
+  els.form.reset();
   els.form.date.value = localDateString(new Date());
+  els.addDialogTitle.textContent = "Add new item";
+  els.addDialog.querySelector(".eyebrow").textContent = "Create";
+  els.addDialog.querySelector('[type="submit"]').textContent = "Save item";
+  els.timeFields.hidden = false;
   els.dialog.showModal();
 }
 
 document.querySelector("#closeAddButton").addEventListener("click", () => els.dialog.close());
+els.dialog.addEventListener("close", () => { editingItemId = null; });
 els.type.addEventListener("change", () => { els.timeFields.hidden = els.type.value === "task"; });
 els.form.addEventListener("submit", async event => {
   event.preventDefault();
   const data = new FormData(els.form);
-  const newItem = {
+  const recurrenceFrequency = data.get("recurrenceFrequency");
+  let recurrence = null;
+  if (recurrenceFrequency) {
+    const rawDays = String(data.get("recurrenceDays") || "").trim();
+    const days = rawDays ? rawDays.split(",").map(value => Number(value.trim())) : [];
+    if (days.some(day => !Number.isInteger(day) || day < 0 || day > 6)) {
+      els.form.elements.recurrenceDays.setCustomValidity("Enter weekdays as numbers from 0 to 6, separated by commas.");
+      els.form.elements.recurrenceDays.reportValidity();
+      return;
+    }
+    els.form.elements.recurrenceDays.setCustomValidity("");
+    recurrence = { frequency: recurrenceFrequency, interval: Number(data.get("recurrenceInterval")) || 1, days };
+  }
+  const updates = {
     title: data.get("title").trim(),
     date: data.get("date"),
     type: data.get("type"),
@@ -324,12 +751,14 @@ els.form.addEventListener("submit", async event => {
     end: data.get("end"),
     category: data.get("category"),
     notes: data.get("notes").trim(),
-    status: "upcoming",
-    postponed: 0
+    recurrence,
+    schedulePending: false
   };
-  const result = await saCreateItem(newItem);
+  const result = editingItemId
+    ? await saUpdateItem(editingItemId, updates)
+    : await saCreateItem({ ...updates, status: "upcoming", postponed: 0 });
   if (!result.success) {
-    alert(`Could not save item: ${result.error}`);
+    if (els.form.reportValidity()) alert(`Could not save item: ${result.error}`);
     return;
   }
   els.form.reset();
@@ -337,6 +766,39 @@ els.form.addEventListener("submit", async event => {
   els.timeFields.hidden = false;
   els.dialog.close();
   render();
+});
+
+document.querySelector("#postponeForm").addEventListener("input", () => {
+  postponeConflictConfirmed = "";
+  els.savePostpone.textContent = "Save postponement";
+  els.postponeConflict.hidden = true;
+  setPostponeError("");
+  updatePostponeFormState();
+});
+els.postponeUnknown.addEventListener("change", () => {
+  postponeConflictConfirmed = "";
+  els.savePostpone.textContent = "Save postponement";
+  els.postponeConflict.hidden = true;
+  setPostponeError("");
+  updatePostponeFormState();
+});
+els.postponeKeepDuration.addEventListener("change", () => {
+  els.postponeNewEndLabel.hidden = els.postponeKeepDuration.checked;
+  els.postponeNewEnd.required = !els.postponeKeepDuration.checked;
+  updatePostponeFormState();
+});
+els.postponeForm.addEventListener("submit", savePostponement);
+document.querySelector("#cancelPostponeButton").addEventListener("click", () => { if (!postponeWriteInProgress) els.postponeDialog.close("cancel"); });
+document.querySelector("#closePostponeButton").addEventListener("click", () => { if (!postponeWriteInProgress) els.postponeDialog.close("cancel"); });
+document.querySelector("#editPostponedItem").addEventListener("click", () => { if (postponeTargetId && !postponeWriteInProgress) openEditItem(postponeTargetId); });
+els.postponeDialog.addEventListener("click", event => { if (event.target === els.postponeDialog && !postponeWriteInProgress) els.postponeDialog.close("cancel"); });
+els.postponeDialog.addEventListener("cancel", event => { if (postponeWriteInProgress) event.preventDefault(); });
+els.postponeDialog.addEventListener("close", () => {
+  if (els.postponeDialog.returnValue !== "edit" && els.postponeDialog.returnValue !== "saved" && postponeTrigger?.isConnected) postponeTrigger.focus();
+  postponeTargetId = null;
+  postponeTrigger = null;
+  postponeWriteInProgress = false;
+  postponeConflictConfirmed = "";
 });
 
 render();
