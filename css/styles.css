@@ -94,10 +94,11 @@ section { margin-top: 28px; }
 /* Today: understated attention, schedule, and progress hierarchy */
 .progress-summary { margin: 18px 0 0; color: var(--color-muted); font-size: .82rem; }
 .today-main .progress-summary[hidden] { display: none; }
-.empty-day { display: grid; justify-items: start; align-content: center; gap: 10px; min-height: min(56vh, 440px); margin: auto; padding-block: 30px; }
+.empty-day { display: grid; justify-items: center; align-content: center; gap: 10px; min-height: min(56vh, 440px); margin: auto; padding-block: 30px; }
 .today-main .empty-day[hidden] { display: none; }
 .empty-day h2 { font-size: 1.38rem; font-weight: 600; letter-spacing: -.025em; }
 .empty-day p { margin: 0; color: var(--color-text-secondary); font-size: .92rem; }
+.empty-state-cat { width: 170px; max-width: 44vw; height: auto; display: block; pointer-events: none; }
 .empty-add { display: inline-flex; align-items: center; gap: 8px; margin-top: 8px; padding: 0; border: 0; background: transparent; color: var(--color-primary-hover); font-size: .9rem; font-weight: 600; }
 .empty-add svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
 .empty-add:focus-visible { outline: 2px solid var(--color-primary-hover); outline-offset: 4px; border-radius: 3px; }
