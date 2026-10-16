@@ -529,11 +529,11 @@ function openEditItem(id, sourceDialog = els.postponeDialog) {
   form.elements.recurrenceInterval.value = String(recurrence?.interval || 1);
   form.elements.recurrenceDays.value = Array.isArray(recurrence?.days) ? recurrence.days.join(", ") : "";
   els.addDialogTitle.textContent = "Edit item";
-  els.addDialog.querySelector(".eyebrow").textContent = "Update";
-  els.addDialog.querySelector('[type="submit"]').textContent = "Save changes";
+  els.dialog.querySelector(".eyebrow").textContent = "Update";
+  els.dialog.querySelector('[type="submit"]').textContent = "Save changes";
   els.timeFields.hidden = item.type === "task";
   if (sourceDialog?.open) sourceDialog.close("edit");
-  els.addDialog.showModal();
+  els.dialog.showModal();
   form.elements.title.focus();
 }
 
@@ -590,6 +590,10 @@ function setView(nextView) {
 
 els.navToday.addEventListener("click", () => setView("today"));
 els.navCalendar.addEventListener("click", () => setView("calendar"));
+// Central Add action: bound once during initialization and enabled only after the
+// authenticated schedule state has loaded (app.js runs after the first cloud load)
+els.navAdd.disabled = false;
+els.navAdd.removeAttribute("aria-disabled");
 els.navAdd.addEventListener("click", openAddDialog);
 els.emptyAdd.addEventListener("click", openAddDialog);
 els.navProgress.addEventListener("click", () => setView("progress"));
@@ -900,10 +904,11 @@ function openAddDialog() {
   els.form.reset();
   els.form.date.value = localDateString(new Date());
   els.addDialogTitle.textContent = "Add new item";
-  els.addDialog.querySelector(".eyebrow").textContent = "Create";
-  els.addDialog.querySelector('[type="submit"]').textContent = "Save item";
+  els.dialog.querySelector(".eyebrow").textContent = "Create";
+  els.dialog.querySelector('[type="submit"]').textContent = "Save item";
   els.timeFields.hidden = false;
   els.dialog.showModal();
+  els.form.elements.title.focus();
 }
 
 document.querySelector("#closeAddButton").addEventListener("click", () => els.dialog.close());

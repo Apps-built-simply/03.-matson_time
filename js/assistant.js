@@ -2912,14 +2912,6 @@ updateComposerHeight();
 updateSendButtonState();
 if (pendingMessageWrites.length) showPersistenceFailure();
 
-function openAddDialog() {
-  document.querySelector("#addForm").reset();
-  document.querySelector("#itemType").value = "activity";
-  document.querySelector("#timeFields").hidden = false;
-  document.querySelector("#addForm").date.value = localDateString(new Date());
-  document.querySelector("#addDialog").showModal();
-}
-
 function classifyAndProcess(text) {
   const classification = classifyRequest(text);
   return classification;
