@@ -586,6 +586,10 @@ function closeCalendarEventDetails(result = "close") {
 
 // Primary navigation
 function setView(nextView) {
+  // Centralized access gate: Progress is disabled while the feature flag is
+  // false. Returning early keeps the current route, footer state, history and
+  // saved navigation state untouched, and throws nothing.
+  if (nextView === "progress" && !MATSON_FEATURES.progressAccess) return;
   els.todayView.hidden = nextView !== "today";
   els.calendarView.hidden = nextView !== "calendar";
   els.assistantView.hidden = nextView !== "assistant";
