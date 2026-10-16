@@ -275,59 +275,128 @@
 
     <!-- Progress view -->
     <div id="progressView" hidden>
-      <header class="app-header">
+      <header class="app-header progress-page-header">
         <div class="container">
-          <p class="eyebrow" id="progressDate"></p>
           <h1>Progress</h1>
           <button class="page-guidance-button" type="button" aria-label="Page guidance" data-guidance="progress"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></svg></button>
         </div>
       </header>
 
-      <main class="container">
-        <!-- Daily / Weekly switch -->
-        <div class="view-switch" role="group" aria-label="Progress period">
-          <button type="button" class="view-switch-button active" id="dailyButton" aria-pressed="true">Daily</button>
-          <button type="button" class="view-switch-button" id="weeklyButton" aria-pressed="false">Weekly</button>
+      <main class="progress-scroll" id="progressScroll">
+        <div class="container progress-content">
+          <!-- Route selector -->
+          <nav class="progress-view-switch" role="group" aria-label="Progress period">
+            <button type="button" class="view-switch-button active" id="progressTodayButton" aria-pressed="true">Today</button>
+            <button type="button" class="view-switch-button" id="progressWeekButton" aria-pressed="false">This week</button>
+          </nav>
+
+          <!-- Loading state -->
+          <div id="progressLoading" class="progress-loading-state" hidden>
+            <p>Loading progress…</p>
+          </div>
+
+          <!-- Error state -->
+          <div id="progressError" class="progress-error-state" hidden>
+            <p>Progress could not be loaded.</p>
+            <button id="progressRetryButton" type="button" class="secondary-button">Retry</button>
+          </div>
+
+          <!-- TODAY ROUTE -->
+          <div id="progressTodayRoute">
+            <!-- Today summary -->
+            <section id="progressTodaySummary" class="progress-section">
+              <p id="progressTodayHeadline" class="progress-headline">Nothing was planned for today.</p>
+              <p id="progressTodayPercent" class="progress-percent" hidden></p>
+              <div id="progressTodayLine" class="progress-line" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+                <span></span>
+              </div>
+            </section>
+
+            <!-- Status breakdown -->
+            <section id="progressTodayBreakdown" class="progress-section">
+              <div class="section-heading">
+                <h2>Status breakdown</h2>
+              </div>
+              <ul id="progressTodayStats" class="stat-list"></ul>
+            </section>
+
+            <!-- Today routine -->
+            <section id="progressTodayRoutine" class="progress-section" hidden>
+              <div class="section-heading">
+                <h2>Routine completion</h2>
+              </div>
+              <ul id="progressTodayRoutineList" class="routine-today-list"></ul>
+            </section>
+          </div>
+
+          <!-- THIS WEEK ROUTE -->
+          <div id="progressWeekRoute" hidden>
+            <!-- Week selector -->
+            <section class="progress-section week-selector-wrap">
+              <button type="button" id="weekSelectorButton" class="week-selector" aria-haspopup="listbox" aria-expanded="false" aria-label="Select a week">
+                <span id="weekSelectorLabel">This week</span>
+                <svg class="week-selector-chevron" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 9l6 6 6-6"/>
+                </svg>
+              </button>
+
+              <!-- Week selector popup (overlays) -->
+              <div id="weekSelectorPopup" class="week-selector-popup" hidden role="dialog" aria-label="Select a week">
+                <div class="week-selector-popup-header">
+                  <button type="button" id="weekPrevMonth" class="week-nav-button" aria-label="Previous month">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+                  </button>
+                  <span id="weekPopupMonth" class="week-popup-month"></span>
+                  <button type="button" id="weekNextMonth" class="week-nav-button" aria-label="Next month">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+                  </button>
+                </div>
+                <div id="weekOptionsList" class="week-options" role="listbox"></div>
+              </div>
+            </section>
+
+            <!-- Week range -->
+            <p id="weekRange" class="week-range"></p>
+
+            <!-- Weekly summary -->
+            <section id="progressWeekSummary" class="progress-section">
+              <p id="progressWeekHeadline" class="progress-headline">No items were planned for this week.</p>
+              <p id="progressWeekPercent" class="progress-percent" hidden></p>
+              <div id="progressWeekLine" class="progress-line" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+                <span></span>
+              </div>
+            </section>
+
+            <!-- Weekly status breakdown -->
+            <section id="progressWeekBreakdown" class="progress-section">
+              <div class="section-heading">
+                <h2>Status breakdown</h2>
+              </div>
+              <ul id="progressWeekStats" class="stat-list"></ul>
+            </section>
+
+            <!-- Routine grid -->
+            <section class="progress-section">
+              <div class="section-heading">
+                <h2>Routine completion</h2>
+              </div>
+              <div id="routineGrid" class="routine-grid" role="group" tabindex="0" aria-label="Routine completion for the selected week, Monday through Sunday; scroll horizontally">
+                <!-- 7 day blocks -->
+              </div>
+              <p id="routineGridEmpty" class="routine-grid-empty" hidden>No routines scheduled for this week.</p>
+            </section>
+
+            <!-- Day by day -->
+            <section class="progress-section">
+              <div class="section-heading">
+                <h2>Day by day</h2>
+              </div>
+              <ul id="progressDayList" class="day-list">
+                <!-- 7 day rows with accordion -->
+              </ul>
+            </section>
+          </div>
         </div>
-
-        <p class="period-label" id="periodLabel"></p>
-
-        <section class="progress-empty" id="progressEmpty" hidden>
-          <p id="progressEmptyText"></p>
-        </section>
-
-        <section class="progress-main" id="progressMain" hidden>
-          <p class="progress-headline" id="progressHeadline">0 of 0 completed</p>
-          <p class="progress-percent" id="progressPercent">0% complete</p>
-          <div class="progress-line" id="progressLine" role="progressbar" aria-labelledby="progressHeadline" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progressLineFill"></span></div>
-        </section>
-
-        <section id="progressBreakdown" hidden>
-          <div class="section-heading"><h2>Status breakdown</h2></div>
-          <ul class="stat-list">
-            <li><span class="stat-label">Completed</span><span class="stat-value completed" id="statCompleted">0</span></li>
-            <li><span class="stat-label">Missed</span><span class="stat-value missed" id="statMissed">0</span></li>
-            <li><span class="stat-label">Remaining</span><span class="stat-value" id="statRemaining">0</span></li>
-            <li><span class="stat-label">Awaiting check-in</span><span class="stat-value awaiting" id="statAwaiting">0</span></li>
-            <li><span class="stat-label">Postponed</span><span class="stat-value postponed" id="statPostponed">0</span></li>
-          </ul>
-        </section>
-
-        <section id="routineSection" hidden>
-          <div class="section-heading"><h2>Routine completion</h2></div>
-          <ul class="stat-list">
-            <li><span class="stat-label">Routine occurrences</span><span class="stat-value" id="routineTotal">0</span></li>
-            <li><span class="stat-label">Completed routines</span><span class="stat-value completed" id="routineCompleted">0</span></li>
-            <li><span class="stat-label">Missed routines</span><span class="stat-value missed" id="routineMissed">0</span></li>
-            <li><span class="stat-label">Remaining routines</span><span class="stat-value" id="routineRemaining">0</span></li>
-          </ul>
-          <p class="routine-percent" id="routinePercent">0% of routines completed</p>
-        </section>
-
-        <section id="weekBreakdown" hidden>
-          <div class="section-heading"><h2>Day by day</h2></div>
-          <ul class="day-list" id="dayList"></ul>
-        </section>
       </main>
     </div>
 

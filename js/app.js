@@ -875,7 +875,7 @@ const guidanceCopy = {
     "Start a new conversation for a separate topic.",
     "Voice input will be added later."
   ]],
-  progress: ["Progress", ["Review daily and weekly completion.", "See completed, missed, remaining, and unresolved items."]]
+  progress: ["Progress", ["View Today or This week.", "Review completion and unresolved items.", "Select a week within the current month.", "Review routine completion across Monday to Sunday.", "Expand a day to inspect its schedule."]]
 };
 document.addEventListener("click", event => {
   const trigger = event.target.closest("[data-guidance]");
