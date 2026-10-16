@@ -528,10 +528,18 @@ function openEditItem(id, sourceDialog = els.postponeDialog) {
   els.recurrenceFrequency.value = recurrence?.frequency || "";
   form.elements.recurrenceInterval.value = String(recurrence?.interval || 1);
   form.elements.recurrenceDays.value = Array.isArray(recurrence?.days) ? recurrence.days.join(", ") : "";
+  if (window.customSelectType) window.customSelectType.sync();
+  if (window.customSelectFrequency) window.customSelectFrequency.sync();
+  if (window.customSelectCategory) window.customSelectCategory.sync();
+  updateDateDisplay(form.elements.date.value);
+  updateTimeDisplay("start", form.elements.start.value);
+  updateTimeDisplay("end", form.elements.end.value);
+  updateCategorySwatch(form.elements.category.value);
+  updateWeekdayButtons(recurrence?.days || []);
+  updateFieldVisibility(item.type);
   els.addDialogTitle.textContent = "Edit item";
   els.dialog.querySelector(".eyebrow").textContent = "Update";
   els.dialog.querySelector('[type="submit"]').textContent = "Save changes";
-  els.timeFields.hidden = item.type === "task";
   if (sourceDialog?.open) sourceDialog.close("edit");
   els.dialog.showModal();
   form.elements.title.focus();
@@ -899,36 +907,407 @@ document.querySelector("#closeGuidanceButton").addEventListener("click", () => g
 guidanceDialog.addEventListener("click", event => { if (event.target === guidanceDialog) guidanceDialog.close(); });
 guidanceDialog.addEventListener("close", () => guidanceTrigger?.focus());
 
+// ===========================================================================
+// Shared popover manager — only one form popover open at a time (select, date,
+// start time, end time). Handles outside click, Escape, dialog close, reset.
+// ===========================================================================
+
+let openPopover = null;
+const popovers = new Set();
+
+function registerPopover(element) { popovers.add(element); }
+function unregisterPopover(element) { popovers.delete(element); }
+
+function closeAllPopovers(restoreFocusTo = null) {
+  if (openPopover) { openPopover.close(); openPopover = null; }
+  if (restoreFocusTo) restoreFocusTo.focus({ preventScroll: true });
+}
+
+function openPopoverAt(popover) {
+  if (openPopover && openPopover !== popover) openPopover.close();
+  openPopover = popover;
+}
+
+function bindPopoverDocumentHandlers() {
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && openPopover) { event.preventDefault(); openPopover.close(); openPopover = null; }
+  });
+  document.addEventListener("pointerdown", event => {
+    if (!openPopover) return;
+    const target = event.target;
+    if (target === openPopover.trigger || target === openPopover.panel) return;
+    if (target.closest && (target.closest(".popover") || target.closest(".option-panel"))) return;
+    openPopover.close(); openPopover = null;
+  });
+}
+
+bindPopoverDocumentHandlers();
+
+
+
+
+// Shared custom dropdown widget instance manager.
+class CustomSelect {
+  constructor(trigger, panel, nativeSelect, labelId) {
+    this.trigger = trigger;
+    this.panel = panel;
+    this.native = nativeSelect;
+    this.labelId = labelId;
+    this.isOpen = false;
+
+    const options = panel.querySelectorAll(".option-row");
+    options.forEach((option, index) => {
+      option.addEventListener("click", () => this.choose(index));
+    });
+
+    this.sync();
+    this.trigger.addEventListener("click", () => this.toggle());
+  }
+
+  // Refresh trigger text/swatch and selected-row state from the native <select>.
+  sync() {
+    const index = this.native.selectedIndex;
+    const option = this.native.options[index];
+    if (!option) return;
+    this.trigger.querySelector(".field-display").textContent = option.textContent.trim();
+    this.native.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  open() {
+    if (this.isOpen) return;
+    openPopoverAt(this);
+    this.isOpen = true;
+    this.panel.hidden = false;
+    this.trigger.setAttribute("aria-expanded", "true");
+    positionPanel(this.panel, this.trigger);
+  }
+
+  close() {
+    if (!this.isOpen) return;
+    this.isOpen = false;
+    this.panel.hidden = true;
+    this.trigger.setAttribute("aria-expanded", "false");
+    if (openPopover === this) openPopover = null;
+  }
+
+  toggle() {
+    if (this.isOpen) this.close(); else this.open();
+  }
+
+  choose(index) {
+    const options = this.panel.querySelectorAll(".option-row");
+    if (index < 0 || index >= options.length) return;
+    const option = options[index];
+    const value = option.dataset.value;
+    this.native.value = value;
+    this.native.selectedIndex = index;
+    this.sync();
+    this.close();
+  }
+}
+
+function initCustomSelects() {
+  const typeSelect = document.querySelector("#itemType");
+  const freqSelect = document.querySelector("#recurrenceFrequency");
+  const catSelect = document.querySelector("#itemCategory");
+
+  if (typeSelect && document.querySelector("#typePanel")) {
+    window.customSelectType = new CustomSelect(
+      document.querySelector("#typeTrigger"),
+      document.querySelector("#typePanel"),
+      typeSelect,
+      "itemTypeLabel"
+    );
+  }
+  if (freqSelect && document.querySelector("#frequencyPanel")) {
+    window.customSelectFrequency = new CustomSelect(
+      document.querySelector("#recurrenceFrequencyTrigger"),
+      document.querySelector("#frequencyPanel"),
+      freqSelect,
+      "recurrenceFrequencyLabel"
+    );
+  }
+  if (catSelect && document.querySelector("#categoryPanel")) {
+    window.customSelectCategory = new CustomSelect(
+      document.querySelector("#categoryTrigger"),
+      document.querySelector("#categoryPanel"),
+      catSelect,
+      "categoryLabel"
+    );
+    renderCategoryOptions();
+  }
+}
+
+function renderCategoryOptions() {
+  const panel = document.querySelector("#categoryPanel");
+  if (!panel) return;
+  const list = Array.isArray(window.cloudCategories) ? window.cloudCategories : [];
+  panel.replaceChildren();
+  list.forEach((cat, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "option-row";
+    button.setAttribute("role", "option");
+    button.dataset.value = cat.name;
+    button.dataset.index = String(index);
+    const swatch = document.createElement("span");
+    swatch.className = "category-swatch";
+    swatch.style.backgroundColor = /^#[0-9a-fA-F]{3,8}$/.test(String(cat.color || "")) ? cat.color : "";
+    swatch.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = cat.name;
+    button.appendChild(swatch);
+    button.appendChild(label);
+    panel.appendChild(button);
+  });
+  panel.querySelectorAll(".option-row").forEach((option, index) => {
+    option.addEventListener("click", () => {
+      window.customSelectCategory.choose(index);
+    });
+  });
+  if (window.customSelectCategory) window.customSelectCategory.sync();
+}
+
+function positionPanel(panel, trigger) {
+  // 1. Make panel measurable without visually flashing in the wrong position.
+  panel.classList.add("popover-measuring");
+  panel.hidden = false;
+
+  // 2. Read trigger bounding rectangle.
+  const triggerRect = trigger.getBoundingClientRect();
+
+  // 3. Read popover measured height/width while in measurement state.
+  const popoverRect = panel.getBoundingClientRect();
+
+  // 4. Read current visual viewport dimensions.
+  const vv = window.visualViewport;
+  const viewportWidth = vv ? vv.width : window.innerWidth;
+  const viewportHeight = vv ? vv.height : window.innerHeight;
+  const viewportTop = vv ? vv.offsetTop : 0;
+  const viewportBottom = viewportTop + viewportHeight;
+
+  const margin = 12; // safe viewport margin (~12px)
+  const triggerGap = 8; // gap between trigger and popover
+
+  const popoverHeight = popoverRect.height || 0;
+  const popoverWidth = popoverRect.width || 0;
+
+  // 5. Calculate available space below the trigger.
+  const spaceBelow = viewportBottom - margin - triggerRect.bottom;
+  // 6. Calculate available space above the trigger.
+  const spaceAbove = triggerRect.top - (viewportTop + margin);
+
+  // 7. Choose the better direction.
+  let openAbove = false;
+  let availableHeight = 0;
+
+  if (spaceBelow >= popoverHeight) {
+    openAbove = false;
+    availableHeight = spaceBelow;
+  } else if (spaceAbove >= popoverHeight) {
+    openAbove = true;
+    availableHeight = spaceAbove;
+  } else {
+    // Neither side fits completely — use the side with more space.
+    openAbove = spaceAbove >= spaceBelow;
+    availableHeight = Math.max(spaceAbove, spaceBelow);
+  }
+
+  // 8. Clamp horizontal position within visible viewport + safe margin.
+  let left = triggerRect.left;
+  if (left + popoverWidth > viewportTop + viewportWidth - margin) {
+    left = viewportTop + viewportWidth - margin - popoverWidth;
+  }
+  if (left < margin) {
+    left = margin;
+  }
+
+  // 9. Apply final top, left, and width.
+  let top;
+  if (openAbove) {
+    top = triggerRect.top - popoverHeight - triggerGap;
+    top = Math.max(top, viewportTop + margin);
+  } else {
+    top = triggerRect.bottom + triggerGap;
+    top = Math.min(top, viewportBottom - margin - popoverHeight);
+  }
+
+  panel.style.top = Math.round(top) + "px";
+  panel.style.left = Math.round(left) + "px";
+  panel.style.width = Math.round(popoverWidth) + "px";
+
+  // Constrain popover height when it cannot fit completely above or below.
+  if (availableHeight > 0 && availableHeight < popoverHeight) {
+    panel.style.maxHeight = Math.round(availableHeight) + "px";
+    panel.style.overflowY = "auto";
+  } else {
+    panel.style.maxHeight = "";
+    panel.style.overflowY = "";
+  }
+
+  // 10. Reveal the popover.
+  panel.classList.remove("popover-measuring");
+}
+
+let rafId = null;
+function repositionOpenPopover() {
+  if (!openPopover || !openPopover.panel) return;
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = requestAnimationFrame(() => {
+    positionPanel(openPopover.panel, openPopover.trigger);
+    rafId = null;
+  });
+}
+
+window.addEventListener("scroll", repositionOpenPopover, true);
+window.addEventListener("resize", repositionOpenPopover, true);
+window.addEventListener("orientationchange", repositionOpenPopover, true);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", repositionOpenPopover, true);
+}
+
+// Initialize custom selects after DOM is ready
+initCustomSelects();
+
 function openAddDialog() {
   editingItemId = null;
   els.form.reset();
   els.form.date.value = localDateString(new Date());
+  updateDateDisplay(els.form.date.value);
   els.addDialogTitle.textContent = "Add new item";
   els.dialog.querySelector(".eyebrow").textContent = "Create";
   els.dialog.querySelector('[type="submit"]').textContent = "Save item";
-  els.timeFields.hidden = false;
+  updateFieldVisibility("activity");
   els.dialog.showModal();
   els.form.elements.title.focus();
 }
 
 document.querySelector("#closeAddButton").addEventListener("click", () => els.dialog.close());
-els.dialog.addEventListener("close", () => { editingItemId = null; });
-els.type.addEventListener("change", () => { els.timeFields.hidden = els.type.value === "task"; });
+els.dialog.addEventListener("close", () => {
+  editingItemId = null;
+  closeAllPopovers();
+});
+els.type.addEventListener("change", () => {
+  updateFieldVisibility(els.type.value);
+});
+
+// ── Field visibility by item type ──────────────────────────────────────────
+
+function updateFieldVisibility(type) {
+  const isTask = type === "task";
+  const isActivity = type === "activity";
+
+  // Close time popovers when time fields become hidden.
+  if (isTask) {
+    closeTimePicker("start");
+    closeTimePicker("end");
+  }
+
+  els.timeFields.hidden = isTask;
+
+  // Recurrence: always show the fieldset header; details depend on frequency
+  const frequency = els.recurrenceFrequency.value;
+  updateFrequencyVisibility(frequency, isTask);
+}
+
+function updateFrequencyVisibility(frequency, isTask = false) {
+  const hasRepeat = Boolean(frequency);
+  const isWeekly = frequency === "weekly";
+  const isDailyOrWeeklyOrMonthly = frequency === "daily" || frequency === "weekly" || frequency === "monthly";
+
+  // Every control: only when repeating
+  document.querySelector("#everyControl").hidden = !hasRepeat;
+
+  // Unit label
+  const unitEl = document.querySelector("#everyUnit");
+  if (unitEl) {
+    if (frequency === "daily") unitEl.textContent = "day(s)";
+    else if (frequency === "weekly") unitEl.textContent = "week(s)";
+    else if (frequency === "monthly") unitEl.textContent = "month(s)";
+  }
+
+  // Weekday selector: only weekly
+  document.querySelector("#weekdaySelector").hidden = !(isWeekly && hasRepeat);
+
+  // Monthly control: only monthly
+  document.querySelector("#monthlyControl").hidden = !(frequency === "monthly" && hasRepeat);
+
+  // For tasks, hide recurrence details entirely (tasks don't repeat in this version)
+  if (isTask) {
+    document.querySelector("#everyControl").hidden = true;
+    document.querySelector("#weekdaySelector").hidden = true;
+    document.querySelector("#monthlyControl").hidden = true;
+  }
+}
+
+// ── Display updates ────────────────────────────────────────────────────────
+
+function updateDateDisplay(dateString) {
+  const display = document.querySelector("#dateDisplay");
+  const hidden = document.querySelector("#dateHidden");
+  if (!display || !hidden) return;
+  hidden.value = dateString;
+  if (!dateString) {
+    display.textContent = "Select date";
+    return;
+  }
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateString);
+  if (!m) { display.textContent = dateString; return; }
+  const date = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  display.textContent = new Intl.DateTimeFormat("en", { month: "long", day: "numeric", year: "numeric" }).format(date);
+}
+
+function updateTimeDisplay(field, timeString) {
+  const display = document.querySelector(`#${field}TimeDisplay`);
+  const hidden = document.querySelector(`#${field}Hidden`);
+  const clearBtn = document.querySelector(`#${field}TimeClear`);
+  if (!display || !hidden) return;
+  hidden.value = timeString || "";
+  if (!timeString) {
+    display.textContent = "Select time";
+    if (clearBtn) clearBtn.hidden = true;
+    return;
+  }
+  const m = /^(\d{2}):(\d{2})$/.exec(timeString);
+  if (!m) { display.textContent = timeString; return; }
+  let hour = Number(m[1]); const minute = Number(m[2]);
+  const ampm = hour >= 12 ? "PM" : "AM";
+  const displayHour = hour === 0 ? 12 : hour > 12 ? hour - 12 : hour;
+  display.textContent = `${displayHour}:${String(minute).padStart(2,"0")} ${ampm}`;
+  if (clearBtn) clearBtn.hidden = false;
+}
+
+function updateCategorySwatch(categoryName) {
+  const swatch = document.querySelector("#categorySwatch");
+  const list = Array.isArray(window.cloudCategories) ? window.cloudCategories : [];
+  const match = list.find(c => c && c.name === categoryName);
+  const color = match && /^#[0-9a-fA-F]{3,8}$/.test(String(match.color || "")) ? match.color : "#14B8A6";
+  if (swatch) swatch.style.backgroundColor = color;
+}
+
+function updateWeekdayButtons(days) {
+  const daySet = new Set(Array.isArray(days) ? days : []);
+  document.querySelectorAll(".weekday-button").forEach(btn => {
+    const d = Number(btn.dataset.day);
+    btn.setAttribute("aria-pressed", String(daySet.has(d)));
+  });
+}
+
+// ── Form submit ────────────────────────────────────────────────────────────
+
 els.form.addEventListener("submit", async event => {
   event.preventDefault();
   const data = new FormData(els.form);
   const recurrenceFrequency = data.get("recurrenceFrequency");
   let recurrence = null;
   if (recurrenceFrequency) {
-    const rawDays = String(data.get("recurrenceDays") || "").trim();
-    const days = rawDays ? rawDays.split(",").map(value => Number(value.trim())) : [];
-    if (days.some(day => !Number.isInteger(day) || day < 0 || day > 6)) {
-      els.form.elements.recurrenceDays.setCustomValidity("Enter weekdays as numbers from 0 to 6, separated by commas.");
-      els.form.elements.recurrenceDays.reportValidity();
-      return;
-    }
-    els.form.elements.recurrenceDays.setCustomValidity("");
-    recurrence = { frequency: recurrenceFrequency, interval: Number(data.get("recurrenceInterval")) || 1, days };
+    const selectedDays = Array.from(document.querySelectorAll(".weekday-button[aria-pressed='true']"))
+      .map(btn => Number(btn.dataset.day));
+    recurrence = {
+      frequency: recurrenceFrequency,
+      interval: Number(data.get("recurrenceInterval")) || 1,
+      days: selectedDays
+    };
   }
   const updates = {
     title: data.get("title").trim(),
@@ -950,10 +1329,243 @@ els.form.addEventListener("submit", async event => {
   }
   els.form.reset();
   els.form.date.value = localDateString(new Date());
-  els.timeFields.hidden = false;
+  updateDateDisplay(els.form.date.value);
+  updateTimeDisplay("start", "");
+  updateTimeDisplay("end", "");
+  updateWeekdayButtons([]);
+  updateFieldVisibility("activity");
   els.dialog.close();
   render();
 });
+
+// ── Date picker ────────────────────────────────────────────────────────────
+
+let datePickerState = { year: new Date().getFullYear(), month: new Date().getMonth(), selected: "" };
+
+function openDatePicker() {
+  const trigger = document.querySelector("#dateTrigger");
+  const panel = document.querySelector("#datePopover");
+  const hidden = document.querySelector("#dateHidden");
+  datePickerState.selected = hidden.value || "";
+  const now = new Date();
+  if (!datePickerState.selected) {
+    datePickerState.year = now.getFullYear();
+    datePickerState.month = now.getMonth();
+  } else {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(datePickerState.selected);
+    if (m) { datePickerState.year = Number(m[1]); datePickerState.month = Number(m[2]) - 1; }
+  }
+  renderDateGrid();
+  openPopoverAt({ trigger, panel, close: closeDatePicker });
+  positionPanel(panel, trigger);
+  panel.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+}
+
+function closeDatePicker() {
+  const panel = document.querySelector("#datePopover");
+  const trigger = document.querySelector("#dateTrigger");
+  panel.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+  if (openPopover && openPopover.panel === panel) openPopover = null;
+}
+
+function renderDateGrid() {
+  const year = datePickerState.year;
+  const month = datePickerState.month;
+  document.querySelector("#dateMonthYear").textContent = new Intl.DateTimeFormat("en", { month: "long", year: "numeric" }).format(new Date(year, month, 1));
+  const daysContainer = document.querySelector("#dateDays");
+  daysContainer.replaceChildren();
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const today = new Date();
+  const todayStr = today.getFullYear() + "-" + String(today.getMonth() + 1).padStart(2, "0") + "-" + String(today.getDate()).padStart(2, "0");
+  const prevDays = new Date(year, month, 0).getDate();
+  for (let i = firstDay - 1; i >= 0; i--) {
+    const d = prevDays - i;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "date-day other-month";
+    btn.textContent = d;
+    const pm = month === 0 ? 11 : month - 1;
+    const py = month === 0 ? year - 1 : year;
+    btn.dataset.date = `${py}-${String(pm + 1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    btn.addEventListener("click", () => { datePickerState.year = py; datePickerState.month = pm; renderDateGrid(); });
+    daysContainer.appendChild(btn);
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "date-day";
+    btn.textContent = d;
+    const dateStr = `${year}-${String(month + 1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    btn.dataset.date = dateStr;
+    if (dateStr === datePickerState.selected) btn.classList.add("is-selected");
+    if (dateStr === todayStr) btn.classList.add("is-today");
+    btn.addEventListener("click", () => selectDate(dateStr));
+    daysContainer.appendChild(btn);
+  }
+  const totalCells = 42;
+  const nextStart = daysInMonth + firstDay;
+  for (let d = 1; nextStart + d - 1 < totalCells; d++) {
+    const nm = month === 11 ? 0 : month + 1;
+    const ny = month === 11 ? year + 1 : year;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "date-day other-month";
+    btn.textContent = d;
+    btn.dataset.date = `${ny}-${String(nm + 1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+    btn.addEventListener("click", () => { datePickerState.year = ny; datePickerState.month = nm; renderDateGrid(); });
+    daysContainer.appendChild(btn);
+  }
+}
+
+function selectDate(dateStr) {
+  datePickerState.selected = dateStr;
+  const hidden = document.querySelector("#dateHidden");
+  hidden.value = dateStr;
+  updateDateDisplay(dateStr);
+  renderDateGrid();
+  closeDatePicker();
+}
+
+document.querySelector("#datePrevMonth").addEventListener("click", () => {
+  datePickerState.month--;
+  if (datePickerState.month < 0) { datePickerState.month = 11; datePickerState.year--; }
+  renderDateGrid();
+});
+document.querySelector("#dateNextMonth").addEventListener("click", () => {
+  datePickerState.month++;
+  if (datePickerState.month > 11) { datePickerState.month = 0; datePickerState.year++; }
+  renderDateGrid();
+});
+document.querySelector("#dateToday").addEventListener("click", () => {
+  const now = new Date();
+  const todayStr = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-" + String(now.getDate()).padStart(2, "0");
+  selectDate(todayStr);
+});
+document.querySelector("#dateClear").addEventListener("click", () => {
+  const hidden = document.querySelector("#dateHidden");
+  hidden.value = "";
+  updateDateDisplay("");
+  closeDatePicker();
+});
+document.querySelector("#closeDatePopover").addEventListener("click", closeDatePicker);
+document.querySelector("#dateTrigger").addEventListener("click", openDatePicker);
+
+// ── Time picker (shared) ───────────────────────────────────────────────────
+
+let timePickerState = { field: "", hour: 1, minute: 0, ampm: "AM" };
+
+function openTimePicker(field) {
+  const trigger = document.querySelector(`#${field}TimeTrigger`);
+  const panel = document.querySelector(`#${field}TimePopover`);
+  const hidden = document.querySelector(`#${field}Hidden`);
+  timePickerState.field = field;
+  const current = hidden.value || "";
+  if (current) {
+    const m = /^(\d{2}):(\d{2})/.exec(current);
+    if (m) {
+      let h = Number(m[1]); const min = Number(m[2]);
+      timePickerState.ampm = h >= 12 ? "PM" : "AM";
+      timePickerState.hour = h === 0 ? 12 : h > 12 ? h - 12 : h;
+      timePickerState.minute = min;
+    }
+  } else {
+    timePickerState.hour = 1; timePickerState.minute = 0; timePickerState.ampm = "AM";
+  }
+  renderTimePicker();
+  openPopoverAt({ trigger, panel, close: () => closeTimePicker(field) });
+  positionPanel(panel, trigger);
+  panel.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+}
+
+function closeTimePicker(field) {
+  const panel = document.querySelector(`#${field}TimePopover`);
+  const trigger = document.querySelector(`#${field}TimeTrigger`);
+  panel.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+  if (openPopover && openPopover.panel === panel) openPopover = null;
+}
+
+function renderTimePicker() {
+  const { hour, minute, ampm } = timePickerState;
+  document.querySelectorAll("#startHourScroll .time-hour, #endHourScroll .time-hour").forEach(btn => {
+    btn.classList.toggle("is-selected", Number(btn.dataset.value) === hour);
+  });
+  document.querySelectorAll("#startMinuteScroll .time-minute, #endMinuteScroll .time-minute").forEach(btn => {
+    btn.classList.toggle("is-selected", btn.dataset.value === String(minute).padStart(2, "0"));
+  });
+  document.querySelectorAll("#startAmPmScroll .time-ampm, #endAmPmScroll .time-ampm").forEach(btn => {
+    btn.classList.toggle("is-selected", btn.dataset.value === ampm);
+  });
+}
+
+function setTimeValue(type, value) {
+  if (type === "hour") timePickerState.hour = Number(value);
+  else if (type === "minute") timePickerState.minute = Number(value);
+  else if (type === "ampm") timePickerState.ampm = value;
+  renderTimePicker();
+}
+
+function confirmTimePicker() {
+  const { field, hour, minute, ampm } = timePickerState;
+  const h24 = ampm === "PM" ? (hour === 12 ? 12 : hour + 12) : (hour === 12 ? 0 : hour);
+  const timeStr = `${String(h24).padStart(2,"0")}:${String(minute).padStart(2,"0")}`;
+  const hidden = document.querySelector(`#${field}Hidden`);
+  hidden.value = timeStr;
+  updateTimeDisplay(field, timeStr);
+  closeTimePicker(field);
+}
+
+function clearTimePicker(field) {
+  const hidden = document.querySelector(`#${field}Hidden`);
+  hidden.value = "";
+  updateTimeDisplay(field, "");
+  const clearBtn = document.querySelector(`#${field}TimeClear`);
+  if (clearBtn) clearBtn.hidden = true;
+  closeTimePicker(field);
+}
+
+for (const field of ["start", "end"]) {
+  document.querySelectorAll(`#${field}HourScroll .time-hour`).forEach(btn => {
+    btn.addEventListener("click", () => setTimeValue("hour", btn.dataset.value));
+  });
+  document.querySelectorAll(`#${field}MinuteScroll .time-minute`).forEach(btn => {
+    btn.addEventListener("click", () => setTimeValue("minute", btn.dataset.value));
+  });
+  document.querySelectorAll(`#${field}AmPmScroll .time-ampm`).forEach(btn => {
+    btn.addEventListener("click", () => setTimeValue("ampm", btn.dataset.value));
+  });
+  document.querySelector(`#${field}TimeConfirm`).addEventListener("click", () => confirmTimePicker());
+  document.querySelector(`#${field}TimeClear`).addEventListener("click", () => clearTimePicker(field));
+  document.querySelector(`#${field}TimeTrigger`).addEventListener("click", () => openTimePicker(field));
+  document.querySelector(`#close${field.charAt(0).toUpperCase() + field.slice(1)}TimePopover`).addEventListener("click", () => closeTimePicker(field));
+}
+
+document.querySelector("#startTimeClear").hidden = true;
+document.querySelector("#endTimeClear").hidden = true;
+
+// ── Weekday selector ───────────────────────────────────────────────────────
+
+document.querySelectorAll(".weekday-button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const pressed = btn.getAttribute("aria-pressed") === "true";
+    btn.setAttribute("aria-pressed", String(!pressed));
+  });
+});
+
+// ── Frequency change ───────────────────────────────────────────────────────
+
+if (window.customSelectFrequency) {
+  const origChoose = window.customSelectFrequency.choose.bind(window.customSelectFrequency);
+  window.customSelectFrequency.choose = (index) => {
+    origChoose(index);
+    const freq = document.querySelector("#recurrenceFrequency").value;
+    updateFrequencyVisibility(freq, els.type.value === "task");
+  };
+}
 
 document.querySelector("#postponeForm").addEventListener("input", () => {
   postponeConflictConfirmed = "";
