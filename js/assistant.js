@@ -6,7 +6,8 @@ const MAX_CONVERSATION_ENTRIES = 30;
 const assistantEls = {
   conversation: document.querySelector("#conversation"),
   empty: document.querySelector("#assistantEmpty"),
-  starters: document.querySelector("#starterActions"),
+  quickQuestionsControl: document.querySelector("#quickQuestionsControl"),
+  quickQuestionsPanel: document.querySelector("#quickQuestionsPanel"),
   input: document.querySelector("#assistantInput"),
   send: document.querySelector("#sendButton"),
   voice: document.querySelector("#voiceButton"),
@@ -484,6 +485,7 @@ async function startNewConversation() {
   try {
     activeRevealController?.abort();
     removeWaitingState();
+    closeQuickQuestions();
 
     const isCurrentEmpty = conversation.length === 0;
     if (isCurrentEmpty && activeConversationId) {
@@ -548,6 +550,7 @@ async function openConversation(id) {
   if (!id) return;
   activeRevealController?.abort();
   removeWaitingState();
+  closeQuickQuestions();
 
   try {
     if (activeConversationId) {
@@ -1169,10 +1172,14 @@ function resolveRelativeDate(token) {
   return null;
 }
 
+function sortForDate(dateItems) {
+  return sortTodayItems(dateItems || []);
+}
+
 function answerHaveToday() {
   const todayItemsList = saGetTodayItems();
   const sorted = sortForDate(todayItemsList);
-  if (!sorted.length) return { text: "Nothing is planned for today." };
+  if (!sorted.length) return { text: "You have nothing planned for today." };
   const items = sorted.map(item => ({
     time: itemTime(item),
     title: item.title,
@@ -1182,47 +1189,57 @@ function answerHaveToday() {
 }
 
 function answerWhatNow() {
-  const attention = saGetCurrentOrNextItem();
-  if (!attention || attention.date !== localDateString(new Date())) {
-    const todayItemsList = saGetTodayItems();
-    const attentionToday = getAttentionItem(todayItemsList);
-    if (!attentionToday) return { text: "Nothing needs attention right now." };
-    const reason = attentionToday.status === "in-progress"
-      ? "It is currently scheduled."
-      : attentionToday.postponed
-        ? `It has been postponed ${attentionToday.postponed} time${attentionToday.postponed === 1 ? "" : "s"}.`
-        : "It is the next item needing attention.";
-    return {
-      text: `${attentionToday.title} — ${itemTime(attentionToday)}. ${reason}`,
-      items: [{ time: itemTime(attentionToday), title: attentionToday.title, status: attentionToday.status.replace("-", " ") }]
-    };
-  }
-  const reason = attention.status === "in-progress"
+  const attentionOrder = { "in-progress": 0, overdue: 1, "awaiting-check-in": 2, upcoming: 3, postponed: 4 };
+  const todayItemsList = saGetTodayItems().filter(item => !item.schedulePending);
+  const active = todayItemsList.filter(item => ![ "completed", "cancelled", "missed" ].includes(item.status));
+  active.sort((a, b) => attentionOrder[a.status] - attentionOrder[b.status] || (a.start || "").localeCompare(b.start || ""));
+  const item = active[0];
+  if (!item) return { text: "Nothing needs your attention right now." };
+  const reason = item.status === "in-progress"
     ? "It is currently scheduled."
-    : attention.postponed
-      ? `It has been postponed ${attention.postponed} time${attention.postponed === 1 ? "" : "s"}.`
-      : "It is the next item needing attention.";
+    : item.status === "overdue"
+      ? "It is overdue and needs attention."
+      : item.status === "awaiting-check-in"
+        ? "It is awaiting check-in."
+        : item.postponed
+          ? `It has been postponed ${item.postponed} time${item.postponed === 1 ? "" : "s"}.`
+          : "It is the next item needing attention.";
   return {
-    text: `${attention.title} — ${itemTime(attention)}. ${reason}`,
-    items: [{ time: itemTime(attention), title: attention.title, status: attention.status.replace("-", " ") }]
+    text: `${item.title} — ${itemTime(item)}. ${reason}`,
+    items: [{ time: itemTime(item), title: item.title, status: item.status.replace("-", " ") }]
   };
 }
 
 function answerComingNext() {
-  const next = saGetCurrentOrNextItem();
-  if (!next) return { text: "Nothing is currently upcoming." };
+  const now = new Date();
   const today = localDateString(new Date());
-  const when = next.date === today ? "today" : formatDateLabel(next.date);
-  return {
-    text: `Next up: ${next.title}, ${when} at ${formatTime(next.start || "00:00")}.`,
-    items: [{ time: `${when}${next.start ? " at " + formatTime(next.start) : ""}`, title: next.title, status: next.status.replace("-", " ") }]
-  };
+  const nowTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  const eligible = saGetTodayItems().filter(item => !item.schedulePending && ![ "completed", "cancelled", "missed" ].includes(item.status));
+  const timed = eligible.filter(item => Boolean(item.start) && item.start > nowTime).sort((a, b) => (a.start || "").localeCompare(b.start || ""));
+  const untimed = eligible.filter(item => !item.start);
+  const next = timed[0] || untimed[0];
+  if (next) {
+    const time = next.start ? formatTime(next.start) : "Anytime today";
+    return {
+      text: `Next up: ${next.title} today at ${time}.`,
+      items: [{ time: `Today at ${time}`, title: next.title, status: next.status.replace("-", " ") }]
+    };
+  }
+  const later = saGetUpcomingItems().filter(item => item.date > today).sort((a, b) => (a.date + "|" + (a.start || "")).localeCompare(b.date + "|" + (b.start || "")))[0];
+  if (later) {
+    const time = later.start ? formatTime(later.start) : "Anytime";
+    return {
+      text: `Next up: ${later.title} on ${formatDateLabel(later.date)}${later.start ? ` at ${time}` : ""}.`,
+      items: [{ time: `${formatDateLabel(later.date)}${later.start ? ` at ${time}` : ""}`, title: later.title, status: later.status.replace("-", " ") }]
+    };
+  }
+  return { text: "Nothing else is coming up." };
 }
 
 function answerRemaining() {
   const todayItemsList = saGetTodayItems();
-  const remaining = sortForDate(todayItemsList.filter(item => item.status !== "completed" && item.status !== "cancelled"));
-  if (!remaining.length) return { text: "Everything planned for today is complete." };
+  const remaining = sortForDate(todayItemsList.filter(item => ![ "completed", "cancelled", "missed" ].includes(item.status)));
+  if (!remaining.length) return { text: "You have nothing remaining today." };
   return {
     text: `${remaining.length} item${remaining.length === 1 ? "" : "s"} remaining today.`,
     items: remaining.map(item => ({ time: itemTime(item), title: item.title, status: item.status.replace("-", " ") }))
@@ -1249,7 +1266,7 @@ function answerMissedWeek() {
   const weekEnd = localDateString(sunday);
   const missed = items.filter(item => item.date && item.status === "missed" && item.date >= weekStart && item.date <= weekEnd)
     .sort((a, b) => a.date.localeCompare(b.date));
-  if (!missed.length) return { text: "No missed items are recorded this week." };
+  if (!missed.length) return { text: "You have not missed anything this week." };
   return {
     text: `You missed ${missed.length} item${missed.length === 1 ? "" : "s"} this week.`,
     items: missed.map(item => ({ time: formatDateLabel(item.date), title: item.title, status: "missed" }))
@@ -1368,7 +1385,8 @@ function answerAtTime(dateStr, timeStr) {
 function handleDeterministicQuery(message) {
   const text = message.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.?]+$/i, "");
 
-  if (/what.*have.*today|what.*doing.*today|what should i do now/i.test(text)) return answerHaveToday();
+  if (/what.*have.*today|what.*doing.*today/i.test(text)) return answerHaveToday();
+  if (/what should i do now/i.test(text)) return answerWhatNow();
   if (/what.*coming next|what.*next/i.test(text) && !/studio/i.test(text)) return answerComingNext();
   if (/what.*remaining today|what.*still.*today/i.test(text)) return answerRemaining();
   if (/what.*complete.*today/i.test(text)) return answerCompletedToday();
@@ -2654,6 +2672,112 @@ function updateSendButtonState() {
   assistantEls.send.disabled = !canSend;
 }
 
+// ── Quick questions accordion ───────────────────────────────────────────
+// Compact, logic-only suggested prompts beneath the composer. The visible
+// wording is trusted static text; the handler is resolved through the stable
+// data-quick-question identifier, never by parsing the button label.
+let quickQuestionsOpen = false;
+
+// Reserves conversation scroll space for the composer region (composer +
+// quick-questions control) so the last message never hides beneath it. The
+// quick-questions panel overlays the conversation temporarily and does not
+// add to this reserved space.
+function updateConversationPadding() {
+  if (!assistantEls.conversation) return;
+  const region = assistantEls.quickQuestionsControl?.closest(".assistant-composer-region");
+  if (!region) return;
+  assistantEls.conversation.style.paddingBottom = `${region.offsetHeight + 8}px`;
+}
+
+const quickQuestionSpecs = {
+  today_schedule: { label: "What do I have today?", run: answerHaveToday },
+  current_attention: { label: "What should I do now?", run: answerWhatNow },
+  next_item: { label: "What is coming next?", run: answerComingNext },
+  remaining_today: { label: "What is still remaining today?", run: answerRemaining },
+  missed_this_week: { label: "What did I miss this week?", run: answerMissedWeek },
+  open_add_item: { label: "Add something to my schedule", run: null }
+};
+
+function closeQuickQuestions() {
+  if (!quickQuestionsOpen) return;
+  quickQuestionsOpen = false;
+  const control = assistantEls.quickQuestionsControl;
+  const panel = assistantEls.quickQuestionsPanel;
+  if (control) {
+    control.setAttribute("aria-expanded", "false");
+    control.setAttribute("aria-label", "Open quick questions");
+  }
+  if (panel) {
+    panel.hidden = true;
+    panel.style.maxHeight = "";
+  }
+  updateConversationPadding();
+}
+
+function openQuickQuestions() {
+  if (quickQuestionsOpen) return;
+  const panel = assistantEls.quickQuestionsPanel;
+  if (!panel) return;
+  quickQuestionsOpen = true;
+  const control = assistantEls.quickQuestionsControl;
+  if (control) {
+    control.setAttribute("aria-expanded", "true");
+    control.setAttribute("aria-label", "Close quick questions");
+  }
+  panel.hidden = false;
+  refreshQuickQuestionsLayout();
+  updateConversationPadding();
+  const first = panel.querySelector("[data-quick-question]");
+  if (first) first.focus();
+}
+
+function toggleQuickQuestions() {
+  if (quickQuestionsOpen) closeQuickQuestions(); else openQuickQuestions();
+}
+
+function refreshQuickQuestionsLayout() {
+  if (!quickQuestionsOpen) return;
+  const panel = assistantEls.quickQuestionsPanel;
+  const control = assistantEls.quickQuestionsControl;
+  if (!panel || !control) return;
+  const controlRect = control.getBoundingClientRect();
+  const available = Math.floor(controlRect.top) - 8;
+  panel.style.maxHeight = `${Math.max(100, available)}px`;
+  scrollToBottom();
+}
+
+async function handleQuickQuestion(id) {
+  if (id === "open_add_item") { openAddDialog(); return; }
+  const spec = quickQuestionSpecs[id];
+  if (!spec) return;
+  let requestConvId;
+  try {
+    requestConvId = await ensureConversation();
+  } catch (err) {
+    console.error("Failed to ensure conversation", err);
+    showPersistenceFailure();
+    return;
+  }
+  appendEntry({ role: "user", text: spec.label });
+  const userMessages = conversation.filter(m => m.role === "user");
+  if (userMessages.length === 1 && requestConvId) {
+    const derivedTitle = deriveConversationTitle(spec.label);
+    firebaseStore.updateConversationSummary(requestConvId, { title: derivedTitle }).catch(() => {});
+  }
+  let result;
+  try {
+    result = spec.run();
+  } catch (err) {
+    console.error("Quick question failed", err);
+    result = { text: "I couldn't answer that right now." };
+  }
+  if (!result) return;
+  appendEntry({ role: "assistant", text: result.text, items: result.items || [] });
+  if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
+  scrollToBottom();
+  assistantEls.input?.focus();
+}
+
 function submitInput() {
   const value = assistantEls.input.value;
   if (!value.trim() || sendInProgress) return;
@@ -2709,6 +2833,8 @@ assistantEls.input?.addEventListener("input", () => {
   if (activeConversationId) {
     composerDrafts.set(activeConversationId, assistantEls.input.value);
   }
+  updateConversationPadding();
+  if (quickQuestionsOpen) refreshQuickQuestionsLayout();
 });
 
 assistantEls.input?.addEventListener("paste", () => {
@@ -2718,11 +2844,21 @@ assistantEls.input?.addEventListener("cut", () => {
   requestAnimationFrame(updateSendButtonState);
 });
 
-assistantEls.starters?.addEventListener("click", event => {
-  const starter = event.target.closest("[data-starter]");
-  if (!starter) return;
-  if (starter.dataset.starter === "add") { openAddDialog(); return; }
-  sendMessage(starter.dataset.starter);
+assistantEls.quickQuestionsControl?.addEventListener("click", () => {
+  toggleQuickQuestions();
+});
+
+assistantEls.quickQuestionsPanel?.addEventListener("click", event => {
+  const button = event.target.closest("[data-quick-question]");
+  if (!button) return;
+  closeQuickQuestions();
+  handleQuickQuestion(button.dataset.quickQuestion);
+});
+
+window.closeQuickQuestions = closeQuickQuestions;
+window.addEventListener("resize", () => {
+  updateConversationPadding();
+  if (quickQuestionsOpen) refreshQuickQuestionsLayout();
 });
 
 assistantEls.voice?.addEventListener("click", () => {
@@ -2864,6 +3000,10 @@ assistantEls.confirmDeleteButton?.addEventListener("click", async () => {
 
 document.addEventListener("keydown", event => {
   if (event.key === "Escape") {
+    if (quickQuestionsOpen) {
+      closeQuickQuestions();
+      return;
+    }
     if (assistantEls.contextMenu && !assistantEls.contextMenu.hidden) {
       closeContextMenu();
       return;
@@ -2872,6 +3012,15 @@ document.addEventListener("keydown", event => {
       closeDrawer();
     }
   }
+});
+
+document.addEventListener("click", event => {
+  if (!quickQuestionsOpen) return;
+  const control = assistantEls.quickQuestionsControl;
+  const panel = assistantEls.quickQuestionsPanel;
+  if (control && control.contains(event.target)) return;
+  if (panel && panel.contains(event.target)) return;
+  closeQuickQuestions();
 });
 
 assistantEls.conversation?.addEventListener("scroll", () => {
@@ -2910,6 +3059,7 @@ renderConversation();
 loadDrawerConversations().catch(showPersistenceFailure);
 updateComposerHeight();
 updateSendButtonState();
+updateConversationPadding();
 if (pendingMessageWrites.length) showPersistenceFailure();
 
 function classifyAndProcess(text) {

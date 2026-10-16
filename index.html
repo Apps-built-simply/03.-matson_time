@@ -153,14 +153,6 @@
 
           <div class="assistant-empty" id="assistantEmpty">
             <p class="assistant-empty-prompt">How can I assist you?</p>
-            <div class="starter-actions" id="starterActions">
-              <button class="starter" type="button" data-starter="What do I have today?">What do I have today?</button>
-              <button class="starter" type="button" data-starter="What should I do now?">What should I do now?</button>
-              <button class="starter" type="button" data-starter="What is coming next?">What is coming next?</button>
-              <button class="starter" type="button" data-starter="What is still remaining today?">What is still remaining today?</button>
-              <button class="starter" type="button" data-starter="What did I miss this week?">What did I miss this week?</button>
-              <button class="starter" type="button" data-starter="add">Add something to my schedule</button>
-            </div>
           </div>
 
           <div class="conversation" id="conversation" aria-live="polite"></div>
@@ -193,7 +185,21 @@
             </button>
           </div>
         </div>
+        <div class="quick-questions-dock">
+          <button type="button" class="quick-questions-control" id="quickQuestionsControl" aria-expanded="false" aria-controls="quickQuestionsPanel" aria-label="Open quick questions">
+            <span class="quick-questions-label">Quick questions</span>
+            <svg class="quick-questions-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 14 12 18 8 14"/></svg>
+          </button>
+          <div class="quick-questions-panel" id="quickQuestionsPanel" hidden>
+            <button type="button" class="quick-question" data-quick-question="today_schedule">What do I have today?</button>
+            <button type="button" class="quick-question" data-quick-question="current_attention">What should I do now?</button>
+            <button type="button" class="quick-question" data-quick-question="next_item">What is coming next?</button>
+            <button type="button" class="quick-question" data-quick-question="remaining_today">What is still remaining today?</button>
+            <button type="button" class="quick-question" data-quick-question="missed_this_week">What did I miss this week?</button>
+            <button type="button" class="quick-question" data-quick-question="open_add_item">Add something to my schedule</button>
+        </div>
       </div>
+    </div>
     </div>
 
     <!-- Conversation History Drawer Backdrop & Drawer -->

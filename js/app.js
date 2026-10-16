@@ -590,6 +590,9 @@ function setView(nextView) {
   // false. Returning early keeps the current route, footer state, history and
   // saved navigation state untouched, and throws nothing.
   if (nextView === "progress" && !MATSON_FEATURES.progressAccess) return;
+  if (nextView !== "assistant" && typeof window.closeQuickQuestions === "function") {
+    window.closeQuickQuestions();
+  }
   els.todayView.hidden = nextView !== "today";
   els.calendarView.hidden = nextView !== "calendar";
   els.assistantView.hidden = nextView !== "assistant";
