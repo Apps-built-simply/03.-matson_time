@@ -67,10 +67,12 @@ let contextMenuConv = null;
 let contextMenuTriggerEl = null;
 let deletingConversationId = null;
 let renamingConversationId = null;
-let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ role: message.role, text: message.text, kind: message.kind, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [], deletedItemIds: message.deletedItemIds || [] })) : [];
+let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ id: message.id, role: message.role, text: message.text, kind: message.kind, guidedFlowId: message.guidedFlowId, guidedStepId: message.guidedStepId, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [], deletedItemIds: message.deletedItemIds || [] })) : [];
 let activeConversationId = window.initialConversation?.id || window.initialAssistantState?.activeConversationId || null;
 let guidedFlowsByConversation = window.initialAssistantState?.guidedFlowsByConversation && typeof window.initialAssistantState.guidedFlowsByConversation === "object" ? { ...window.initialAssistantState.guidedFlowsByConversation } : {};
-let guidedFlow = activeConversationId ? (guidedFlowsByConversation[activeConversationId] || (window.initialAssistantState?.activeConversationId === activeConversationId ? window.initialAssistantState?.guidedFlow : null)) : null;
+const initialGuidedFlow = activeConversationId ? (guidedFlowsByConversation[activeConversationId] || (window.initialAssistantState?.activeConversationId === activeConversationId ? window.initialAssistantState?.guidedFlow : null)) : null;
+let guidedCompletedFlow = initialGuidedFlow?.status === "completed" ? initialGuidedFlow : null;
+let guidedFlow = guidedCompletedFlow ? null : initialGuidedFlow;
 let pendingClarification = window.initialAssistantState?.pendingClarification || null;
 let entityRegistry = Array.isArray(window.initialAssistantState?.entityRegistry) ? window.initialAssistantState.entityRegistry.slice(-10) : [];
 let pendingOperation = window.initialAssistantState?.pendingOperation || null;
@@ -95,8 +97,8 @@ function savePlanningContext() {
 }
 function saveGuidedFlow() {
   if (activeConversationId) {
-    if (guidedFlow) guidedFlowsByConversation[activeConversationId] = guidedFlow;
-    else delete guidedFlowsByConversation[activeConversationId];
+  if (guidedFlow) guidedFlowsByConversation[activeConversationId] = guidedFlow;
+  else if (guidedFlowsByConversation[activeConversationId]?.status !== "completed") delete guidedFlowsByConversation[activeConversationId];
   }
   return firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction, guidedFlow, guidedFlowsByConversation }).catch(() => { showPersistenceFailure(); return false; });
 }
@@ -215,7 +217,8 @@ function saveEntryForConversation(convId, entry) {
     referencedItemIds: entry.referencedItemIds || [],
     deletedItemIds: [],
     proposalSummary: entry.proposalSummary || null,
-    resolved: entry.resolved !== false
+    resolved: entry.resolved !== false,
+    ...(entry.guidedFlowId ? { guidedFlowId: entry.guidedFlowId, guidedStepId: entry.guidedStepId } : {})
   };
   pendingMessageWrites.push({ conversationId: convId, message });
   localStorage.setItem(PENDING_MESSAGE_WRITES_KEY, JSON.stringify(pendingMessageWrites));
@@ -585,9 +588,10 @@ async function openConversation(id) {
     await firebaseStore.updateConversationSummary(id, { status: "active" }).catch(() => {});
 
     conversation = loaded.messages.map(message => ({
-      role: message.role,
+      id: message.id, role: message.role,
       text: message.text,
       kind: message.kind,
+      guidedFlowId: message.guidedFlowId, guidedStepId: message.guidedStepId,
       resolved: message.resolved !== false,
       referencedItemIds: message.referencedItemIds || [],
       deletedItemIds: message.deletedItemIds || []
@@ -598,7 +602,9 @@ async function openConversation(id) {
     const state = await firebaseStore.loadAssistantState();
     const isActive = state.activeConversationId === id;
     guidedFlowsByConversation = state.guidedFlowsByConversation && typeof state.guidedFlowsByConversation === "object" ? { ...state.guidedFlowsByConversation } : guidedFlowsByConversation;
-    guidedFlow = guidedFlowsByConversation[id] || (isActive ? state.guidedFlow || null : null);
+    const savedGuidedFlow = guidedFlowsByConversation[id] || (isActive ? state.guidedFlow || null : null);
+    guidedCompletedFlow = savedGuidedFlow?.status === "completed" ? savedGuidedFlow : null;
+    guidedFlow = guidedCompletedFlow ? null : savedGuidedFlow;
     pendingQuickQuestionId = guidedFlow?.queuedQuickQuestion || null;
     if (guidedFlow) guidedFlowsByConversation[id] = guidedFlow;
     pendingClarification = isActive ? state.pendingClarification : null;
@@ -626,6 +632,8 @@ async function openConversation(id) {
 
     closeDrawer();
     renderConversation({ restoring: true });
+    if (guidedFlow) { if (!guidedFlow.id) guidedFlow.id = crypto.randomUUID(); renderGuidedHistoryControls(); renderGuidedControls(); }
+    else if (guidedCompletedFlow) renderGuidedHistoryControls(guidedCompletedFlow);
     scrollToBottom();
     updateDrawerActiveItem();
   } catch (error) {
@@ -766,18 +774,20 @@ function revealAssistantMessage(targetElement, fullText, { onUpdate, signal } = 
 }
 
 function appendEntry(entry, options = {}) {
+  if (!entry.id) entry.id = crypto.randomUUID();
   conversation.push(entry);
   if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
   if (!options.skipRender) {
     renderConversationEntry(entry, options);
   }
   const message = {
-    id: crypto.randomUUID(),
+    id: entry.id,
     role: entry.role, text: entry.text, kind: entry.kind || (entry.role === "user" ? "user_message" : "assistant_message"),
     referencedItemIds: entry.referencedItemIds || [],
     deletedItemIds: entityRegistry.filter(entity => entity.deleted && (entry.referencedItemIds || []).includes(entity.id)).map(entity => entity.id),
     proposalSummary: entry.proposalSummary || null,
-    resolved: entry.resolved !== false
+    resolved: entry.resolved !== false,
+    ...(entry.guidedFlowId ? { guidedFlowId: entry.guidedFlowId, guidedStepId: entry.guidedStepId } : {})
   };
   pendingMessageWrites.push({ conversationId: activeConversationId, message });
   localStorage.setItem(PENDING_MESSAGE_WRITES_KEY, JSON.stringify(pendingMessageWrites));
@@ -800,6 +810,7 @@ function renderConversationEntry(entry, options = {}) {
   const shouldKeepBottom = isNearBottom();
   const message = document.createElement("div");
   message.className = entry.role === "user" ? "message user-message" : "message assistant-message";
+  if (entry.guidedFlowId) { message.dataset.guidedFlowId = entry.guidedFlowId; message.dataset.guidedStep = entry.guidedStepId || ""; }
 
   if (entry.role === "user") {
     const bubble = document.createElement("div");
@@ -809,6 +820,7 @@ function renderConversationEntry(entry, options = {}) {
   } else {
     const bubble = document.createElement("div");
     bubble.className = "assistant-bubble";
+    if (entry.kind === "guided_completion") { message.tabIndex = -1; bubble.setAttribute("role", "status"); bubble.setAttribute("aria-live", "polite"); bubble.setAttribute("aria-atomic", "true"); }
     const text = document.createElement("p");
     text.className = "assistant-text";
     bubble.appendChild(text);
@@ -822,8 +834,9 @@ function renderConversationEntry(entry, options = {}) {
       if (details.length) {
         completionDetails = document.createElement("div");
         completionDetails.className = "guided-completed-summary";
-        for (const detail of details) {
+        for (const [index, detail] of details.entries()) {
           const line = document.createElement("p");
+          if (index === 0) line.className = "guided-completed-title";
           line.textContent = detail;
           completionDetails.appendChild(line);
         }
@@ -832,8 +845,17 @@ function renderConversationEntry(entry, options = {}) {
     if (entry.items && entry.items.length) {
       const list = document.createElement("ul");
       list.className = "response-list";
+      let lastDate = null;
       for (const item of entry.items) {
+        if (item.date && item.date !== lastDate) {
+          const heading = document.createElement("li");
+          heading.className = "response-date-heading";
+          heading.textContent = formatKampalaDate(item.date, { weekday: "long", month: "long", day: "numeric" });
+          list.appendChild(heading);
+          lastDate = item.date;
+        }
         const row = document.createElement("li");
+        row.className = "response-row";
         const time = document.createElement("span");
         time.className = "response-time";
         time.textContent = item.time;
@@ -2212,7 +2234,8 @@ async function sendMessage(rawText) {
       firebaseStore.updateConversationSummary(requestConvId, { title: derivedTitle }).catch(() => {});
     }
 
-    appendEntry({ role: "user", text });
+    const structuredGuidedStep = guidedFlow && ["type", "date", "time_range", "category"].includes(guidedFlow.step);
+    if (!structuredGuidedStep) appendEntry({ role: "user", text, ...(guidedFlow?.id ? { guidedFlowId: guidedFlow.id, guidedStepId: guidedFlow.step } : {}) });
 
     if (guidedFlow) {
       await handleGuidedAnswer(text);
@@ -2873,21 +2896,13 @@ function compareScheduleOccurrences(a, b) {
     || (a.end || "").localeCompare(b.end || "")
     || String(a.id).localeCompare(String(b.id));
 }
-function quickQuestionRows(occurrences, includeDate = false) {
-  return [...occurrences].sort((a, b) => includeDate ? a.effectiveDate.localeCompare(b.effectiveDate) || compareScheduleOccurrences(a, b) : compareScheduleOccurrences(a, b)).map(item => ({
-    time: `${includeDate ? `${formatKampalaDate(item.effectiveDate, { weekday: "short", day: "numeric", month: "short" })} · ` : ""}${item.start ? `${formatKampalaTime(item.start)}${item.end ? ` – ${formatKampalaTime(item.end)}` : ""}` : "Untimed"}`,
+function quickQuestionRows(occurrences, grouped = false) {
+  return [...occurrences].sort((a, b) => grouped ? a.effectiveDate.localeCompare(b.effectiveDate) || compareScheduleOccurrences(a, b) : compareScheduleOccurrences(a, b)).map(item => ({
+    ...(grouped ? { date: item.effectiveDate } : {}),
+    time: item.start ? `${formatKampalaTime(item.start)}${item.end ? ` – ${formatKampalaTime(item.end)}` : ""}` : "Anytime",
     title: item.title,
     status: formatScheduleStatus(item.status)
   }));
-}
-function quickQuestionGroupedText(occurrences) {
-  const byDate = new Map();
-  for (const item of [...occurrences].sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate) || compareScheduleOccurrences(a, b))) {
-    if (!byDate.has(item.effectiveDate)) byDate.set(item.effectiveDate, []);
-    const time = item.start ? `${formatKampalaTime(item.start)}${item.end ? `–${formatKampalaTime(item.end)}` : ""}` : "Untimed";
-    byDate.get(item.effectiveDate).push(`• ${time} · ${item.title} (${formatScheduleStatus(item.status)})`);
-  }
-  return [...byDate.entries()].map(([date, rows]) => `${formatKampalaDate(date)}\n${rows.join("\n")}`).join("\n\n");
 }
 function currentKampalaTimeMinutes() {
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone: KAMPALA_TIME_ZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date());
@@ -2905,7 +2920,7 @@ function answerScheduleWeek() {
   const sunday = addCalendarDays(monday, 6);
   const range = scheduleOccurrencesBetween(monday, sunday);
   if (!range.length) return { text: "You have nothing planned for this week." };
-  return { text: `This week:\n\n${quickQuestionGroupedText(range)}` };
+  return { text: "Here is your schedule for this week.", items: quickQuestionRows(range, true) };
 }
 function answerScheduleMonth() {
   const today = kampalaDate();
@@ -2916,7 +2931,7 @@ function answerScheduleMonth() {
   const range = scheduleOccurrencesBetween(monthStart, monthEnd);
   if (!range.length) return { text: "You have nothing planned for this month." };
   const visible = [...range].sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate) || compareScheduleOccurrences(a, b)).slice(0, 12);
-  return { text: `You have ${range.length} scheduled occurrence${range.length === 1 ? "" : "s"} this month${range.length > visible.length ? `; showing the first ${visible.length}` : ""}.\n\n${quickQuestionGroupedText(visible)}` };
+  return { text: `You have ${range.length} scheduled occurrence${range.length === 1 ? "" : "s"} this month${range.length > visible.length ? `; showing the first ${visible.length}` : ""}.`, items: quickQuestionRows(visible, true) };
 }
 function answerAttentionNow() {
   const today = kampalaDate();
@@ -2934,7 +2949,7 @@ function answerAttentionNow() {
   const reason = inProgress ? (item.end ? `is in progress until ${formatKampalaTime(item.end)}` : "is in progress")
     : overdue ? "is overdue" : checkIn ? "is awaiting check-in" : next ? "is your next scheduled item today"
       : postponed ? "is postponed and still scheduled today" : "is an untimed task for today";
-  const time = item.start ? `${formatKampalaTime(item.start)}${item.end ? ` – ${formatKampalaTime(item.end)}` : ""}` : "Untimed";
+  const time = item.start ? `${formatKampalaTime(item.start)}${item.end ? ` – ${formatKampalaTime(item.end)}` : ""}` : "Anytime";
   return { text: `${item.title} ${reason}.`, items: [{ time, title: item.title, status: formatScheduleStatus(item.status) }] };
 }
 function answerFreeTimeWeek() {
@@ -2968,14 +2983,17 @@ function answerFreeTimeWeek() {
   return { text: `Your clearest open period${phrases.length === 1 ? " is " : "s this week are "}${phrases.join(" and ")}.` };
 }
 
-const GUIDED_ADD_INITIAL_VALUES = Object.freeze({ itemType: null, title: null, date: null, start: null, end: null, category: null, notes: "", recurrence: null, weekdays: [] });
+const GUIDED_ADD_INITIAL_VALUES = Object.freeze({ itemType: null, title: null, date: null, dateDraft: null, timeDraft: null, start: null, end: null, category: null, notes: "", recurrence: null, weekdays: [] });
 let guidedSaveInProgress = false;
 let pendingQuickQuestionId = null;
+let guidedEditFormOpen = false;
+let guidedDraftSaveTimer = null;
+function queueGuidedDraftSave() { clearTimeout(guidedDraftSaveTimer); guidedDraftSaveTimer = setTimeout(() => saveGuidedFlow(), 250); }
 
 function guidedSteps(flow = guidedFlow) {
   const type = flow?.values?.itemType;
   const steps = ["type", "title", "date"];
-  if (type === "activity" || type === "routine") steps.push("start", "end");
+  if (type === "activity" || type === "routine") steps.push("time_range");
   if (type === "routine") {
     steps.push("frequency", "interval");
     if (flow.values.recurrence?.frequency === "weekly") steps.push("weekdays");
@@ -2983,13 +3001,26 @@ function guidedSteps(flow = guidedFlow) {
   steps.push("category", "notes", "summary");
   return steps;
 }
+function pruneGuidedValues(values, step) {
+  const clean = { ...values, recurrence: values.recurrence ? { ...values.recurrence, days: [...(values.recurrence.days || [])] } : null, weekdays: [...(values.weekdays || [])] };
+  const rank = { type: 0, title: 1, date: 2, time_range: 3, frequency: 4, interval: 5, weekdays: 6, category: 7, notes: 8, summary: 9 };
+  const keep = rank[step] ?? 0;
+  if (keep < rank.title) clean.title = null;
+  if (keep < rank.date) clean.date = null;
+  if (keep < rank.date || step === "date") clean.dateDraft = null;
+  if (keep < rank.time_range) { clean.start = null; clean.end = null; }
+  if (keep < rank.time_range || step === "time_range") clean.timeDraft = null;
+  if (keep < rank.frequency) { clean.recurrence = null; clean.weekdays = []; }
+  if (keep < rank.category) clean.category = null;
+  if (keep < rank.notes) clean.notes = "";
+  return clean;
+}
 function guidedPrompt(step, flow = guidedFlow) {
   const type = flow?.values?.itemType;
   if (step === "type") return "What would you like to add?";
   if (step === "title") return type === "activity" ? "What is the activity called?" : type === "routine" ? "What is the routine called?" : "What is the task called?";
-  if (step === "date") return type === "routine" ? "What date should this routine start? Enter YYYY-MM-DD, today, or tomorrow." : "What date should it be scheduled for? Enter YYYY-MM-DD, today, or tomorrow.";
-  if (step === "start") return type === "routine" ? "What time should it start? You can also skip the time." : "What time should the activity start? Enter 2:00 PM or 14:00.";
-  if (step === "end") return type === "routine" ? "What time should it end? You can also skip the time." : "What time should the activity end? Enter 3:00 PM or 15:00.";
+  if (step === "date") return type === "routine" ? "What date should this routine start?" : "What date should it be scheduled for?";
+  if (step === "time_range") return type === "routine" ? "What time should the routine start and end?" : "What time should the activity start and end?";
   if (step === "frequency") return "How often should this routine repeat?";
   if (step === "interval") return `How often should it repeat? Enter a positive number of ${flow.values.recurrence.frequency === "daily" ? "days" : flow.values.recurrence.frequency === "weekly" ? "weeks" : "months"}.`;
   if (step === "weekdays") return "Which days should this routine repeat? Select one or more days, then continue.";
@@ -2999,7 +3030,6 @@ function guidedPrompt(step, flow = guidedFlow) {
 }
 async function guidedAppendAssistant(text, { wait = false, showControls = true, kind } = {}) {
   const conversationId = activeConversationId;
-  assistantEls.conversation.querySelector("#guidedControls")?.remove();
   const startedAt = performance.now();
   if (wait && activeConversationId === conversationId) {
     showWaitingState();
@@ -3007,12 +3037,14 @@ async function guidedAppendAssistant(text, { wait = false, showControls = true, 
     await waitForPresentation(startedAt, 350);
   }
   if (activeConversationId === conversationId) removeWaitingState();
-  await appendAssistantWithReveal({ role: "assistant", text, ...(kind ? { kind } : {}) }, conversationId);
+  await appendAssistantWithReveal({ role: "assistant", text, ...(kind ? { kind } : {}), ...(guidedFlow?.id ? { guidedFlowId: guidedFlow.id, guidedStepId: guidedFlow.step } : {}) }, conversationId);
+  if (kind === "guided_completion" && activeConversationId === conversationId) assistantEls.conversation?.lastElementChild?.focus({ preventScroll: true });
   if (showControls && activeConversationId === conversationId && guidedFlow) renderGuidedControls();
 }
 async function beginGuidedAdd({ logUser = false } = {}) {
   if (logUser) appendEntry({ role: "user", text: "Add something to my schedule." });
-  guidedFlow = { type: "create_schedule_item", step: "type", values: { ...GUIDED_ADD_INITIAL_VALUES, recurrence: null, weekdays: [] } };
+  guidedCompletedFlow = null;
+  guidedFlow = { id: crypto.randomUUID(), type: "create_schedule_item", step: "type", values: { ...GUIDED_ADD_INITIAL_VALUES, recurrence: null, weekdays: [] } };
   await saveGuidedFlow();
   await guidedAppendAssistant(guidedPrompt("type"));
 }
@@ -3022,6 +3054,36 @@ function guidedSummaryText(values) {
   if (values.recurrence) lines.push(`${values.recurrence.frequency[0].toUpperCase()}${values.recurrence.frequency.slice(1)} · every ${values.recurrence.interval}${values.recurrence.frequency === "daily" ? " day(s)" : values.recurrence.frequency === "weekly" ? " week(s)" : " month(s)"}${values.recurrence.frequency === "weekly" ? ` · ${values.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ")}` : ""}`);
   return lines.join("\n");
 }
+async function removeGuidedReviewInstruction(flowId) {
+  if (!flowId) return;
+  const removed = conversation.filter(entry => entry.role === "assistant" && entry.guidedFlowId === flowId && entry.guidedStepId === "summary" && entry.text === "Review the schedule details below.");
+  if (!removed.length) return;
+  conversation = conversation.filter(entry => !removed.includes(entry));
+  assistantEls.conversation?.querySelectorAll("[data-guided-flow-id][data-guided-step='summary']").forEach(message => {
+    if (message.dataset.guidedFlowId === flowId && message.querySelector(".assistant-text")?.textContent === "Review the schedule details below.") message.remove();
+  });
+  const ids = removed.map(entry => entry.id).filter(Boolean);
+  if (ids.length && activeConversationId) {
+    await persistenceQueue.catch(() => {});
+    await firebaseStore.deleteConversationMessages(activeConversationId, ids).catch(showPersistenceFailure);
+  }
+}
+window.completeGuidedAddFromForm = async item => {
+  if (!guidedEditFormOpen || !guidedFlow) return;
+  guidedEditFormOpen = false;
+  const flowId = guidedFlow.id;
+  if (item) guidedFlow.values = { ...guidedFlow.values, itemType: item.type, title: item.title, date: item.date, start: item.start || null, end: item.end || null, category: item.category, notes: item.notes || "", recurrence: item.recurrence || null, weekdays: item.recurrence?.days || [] };
+  const summary = guidedSummaryText(guidedFlow.values);
+  await removeGuidedReviewInstruction(flowId);
+  guidedFlow.status = "completed"; guidedFlow.step = "summary";
+  guidedFlowsByConversation[activeConversationId] = guidedFlow; guidedCompletedFlow = guidedFlow;
+  guidedFlow = null;
+  pendingQuickQuestionId = null;
+  await saveGuidedFlow();
+  assistantEls.conversation.querySelector("#guidedControls-summary")?.remove();
+  await guidedAppendAssistant(`Added to your schedule.\n${summary}`, { showControls: false, kind: "guided_completion" });
+};
+window.guidedAddDialogClosed = () => { guidedEditFormOpen = false; };
 function guidedCategoryNames() {
   const names = typeof saGetAvailableCategories === "function" ? saGetAvailableCategories() : [];
   return names.length ? names : [];
@@ -3035,27 +3097,212 @@ function guidedControlButton(label, action, value = null, className = "secondary
   button.textContent = label;
   return button;
 }
+function guidedNavButton(label, action, path, tone) {
+  const button = guidedControlButton("", action, null, `guided-nav-action guided-nav-${tone}`);
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  icon.setAttribute("d", path);
+  svg.appendChild(icon);
+  const text = document.createElement("span");
+  text.textContent = label === "Back to previous step" ? "Back" : "Cancel";
+  button.append(svg, text);
+  return button;
+}
+function guidedCategoryColor(name) {
+  const keys = { Music: "music", Health: "health", Personal: "personal", Meetings: "meetings", Travel: "travel" };
+  const key = Object.hasOwn(keys, name) ? keys[name] : keys.Personal;
+  return getComputedStyle(document.documentElement).getPropertyValue(`--category-${key}`).trim() || "#14B8A6";
+}
+function renderGuidedDateControl(parent, value) {
+  const form = document.createElement("form");
+  form.className = "guided-date-form";
+  form.noValidate = true;
+  form.dataset.guidedDate = "true";
+  const control = document.createElement("div");
+  control.className = "date-entry-control";
+  const raw = value && /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const date = raw ? new Date(Number(raw[1]), Number(raw[2]) - 1, Number(raw[3])) : null;
+  const draft = guidedFlow.values.dateDraft || {};
+  const names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const day = document.createElement("input");
+  day.className = "date-entry-day"; day.placeholder = "Day"; day.maxLength = 2; day.inputMode = "numeric"; day.setAttribute("aria-label", "Day");
+  day.value = draft.day ?? (date ? String(date.getDate()).padStart(2, "0") : "");
+  const wrap = document.createElement("div"); wrap.className = "month-entry-wrap";
+  const month = document.createElement("input");
+  month.className = "date-entry-month"; month.placeholder = "Month"; month.setAttribute("aria-label", "Month"); month.setAttribute("role", "combobox"); month.setAttribute("aria-autocomplete", "list"); month.setAttribute("aria-expanded", "false"); month.autocomplete = "off";
+  month.value = draft.month ?? (date ? date.toLocaleString("en", { month: "long" }) : "");
+  const list = document.createElement("ul");
+  list.id = `guided-month-suggestions-${guidedFlow.id}`; list.className = "month-suggestions"; list.setAttribute("role", "listbox"); list.setAttribute("aria-label", "Month suggestions");
+  month.setAttribute("aria-controls", list.id); list.hidden = true; wrap.append(month, list);
+  const year = document.createElement("input");
+  year.className = "date-entry-year"; year.placeholder = "Year"; year.maxLength = 4; year.inputMode = "numeric"; year.setAttribute("aria-label", "Year");
+  year.value = draft.year ?? (date ? String(date.getFullYear()) : "");
+  const submit = document.createElement("button");
+  submit.type = "submit"; submit.className = "date-entry-go"; submit.setAttribute("aria-label", "Enter date");
+  const submitIcon = document.createElementNS("http://www.w3.org/2000/svg", "svg"); submitIcon.setAttribute("viewBox", "0 0 24 24"); submitIcon.setAttribute("aria-hidden", "true");
+  const submitPath = document.createElementNS("http://www.w3.org/2000/svg", "path"); submitPath.setAttribute("d", "M20 5v4a5 5 0 0 1-5 5H5m0 0 5-5m-5 5 5 5"); submitIcon.appendChild(submitPath); submit.appendChild(submitIcon);
+  const error = document.createElement("p"); error.className = "date-entry-error"; error.setAttribute("role", "alert"); error.hidden = true;
+  control.append(wrap, day, year, submit); form.append(control, error); parent.appendChild(form);
+
+  const clearError = () => { error.hidden = true; error.textContent = ""; };
+  const saveDraft = () => { guidedFlow.values.dateDraft = { day: day.value, month: month.value, year: year.value }; queueGuidedDraftSave(); };
+  const monthIndex = input => names.findIndex(name => name.toLowerCase() === input.trim().toLowerCase() || name.slice(0, 3).toLowerCase() === input.trim().toLowerCase());
+  const selectMonth = index => {
+    if (index < 0 || index > 11) return false;
+    month.value = names[index];
+    month.dataset.monthNumber = String(index + 1);
+    list.hidden = true; month.setAttribute("aria-expanded", "false");
+    saveDraft(); clearError(); day.focus();
+    return true;
+  };
+  const validateDay = () => /^\d{1,2}$/.test(day.value.trim()) && Number(day.value) >= 1 && Number(day.value) <= 31;
+  const goToYear = () => { if (!validateDay()) { error.textContent = "Enter a valid day."; error.hidden = false; return false; } clearError(); year.focus(); return true; };
+  const updateSuggestions = () => {
+    const query = month.value.trim().toLowerCase();
+    const matches = query ? names.map((name, index) => ({ name, index })).filter(item => item.name.toLowerCase().startsWith(query) || item.name.slice(0, 3).toLowerCase().startsWith(query)) : [];
+    list.replaceChildren(...matches.map(item => { const option = document.createElement("li"); option.setAttribute("role", "option"); option.setAttribute("aria-selected", "false"); option.dataset.month = String(item.index); option.textContent = item.name; return option; }));
+    list.hidden = !list.childElementCount; month.setAttribute("aria-expanded", String(!list.hidden));
+    activeMonth = list.hidden ? -1 : 0;
+    if (activeMonth >= 0) list.children[activeMonth].setAttribute("aria-selected", "true");
+    const exact = monthIndex(month.value);
+    if (exact >= 0 && month.value.trim().length >= 3) selectMonth(exact);
+  };
+  let activeMonth = -1;
+  day.addEventListener("input", () => { day.value = day.value.replace(/\D/g, "").slice(0, 2); saveDraft(); clearError(); if (day.value.length === 2 && validateDay()) year.focus(); });
+  year.addEventListener("input", () => { year.value = year.value.replace(/\D/g, "").slice(0, 4); saveDraft(); clearError(); });
+  month.addEventListener("input", () => { saveDraft(); clearError(); updateSuggestions(); });
+  month.addEventListener("keydown", event => {
+    event.stopPropagation();
+    const options = [...list.children];
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      if (list.hidden || !options.length) return;
+      event.preventDefault(); options[activeMonth]?.setAttribute("aria-selected", "false");
+      activeMonth = (activeMonth + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+      options[activeMonth].setAttribute("aria-selected", "true");
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const exact = monthIndex(month.value);
+      if (exact >= 0) selectMonth(exact);
+      else if (activeMonth >= 0) selectMonth(Number(options[activeMonth].dataset.month));
+      else { error.textContent = "Enter a valid month."; error.hidden = false; }
+    } else if (event.key === "Tab") { list.hidden = true; month.setAttribute("aria-expanded", "false"); }
+  });
+  day.addEventListener("keydown", event => {
+    event.stopPropagation();
+    if (event.key === "Enter" || event.key === "ArrowRight") { event.preventDefault(); goToYear(); }
+  });
+  year.addEventListener("keydown", event => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); form.requestSubmit(submit); } });
+  list.addEventListener("pointerdown", event => event.preventDefault());
+  list.addEventListener("click", event => { const option = event.target.closest('[role="option"]'); if (option) selectMonth(Number(option.dataset.month)); });
+  form.addEventListener("submit", async event => {
+    event.preventDefault(); event.stopPropagation();
+    const monthNumber = monthIndex(month.value) + 1;
+    const dayNumber = Number(day.value.trim());
+    const yearNumber = Number(year.value.trim());
+    if (!monthNumber) { error.textContent = "Enter a valid month."; error.hidden = false; month.focus(); return; }
+    if (!validateDay()) { error.textContent = "Enter a valid day."; error.hidden = false; day.focus(); return; }
+    if (!/^\d{4}$/.test(year.value.trim()) || yearNumber < 1900 || yearNumber > 2100) { error.textContent = "Enter a four-digit year."; error.hidden = false; year.focus(); return; }
+    const candidate = new Date(yearNumber, monthNumber - 1, dayNumber);
+    if (candidate.getFullYear() !== yearNumber || candidate.getMonth() !== monthNumber - 1 || candidate.getDate() !== dayNumber) { error.textContent = "Enter a valid date."; error.hidden = false; day.focus(); return; }
+    clearError();
+    guidedFlow.values.date = `${yearNumber}-${String(monthNumber).padStart(2, "0")}-${String(dayNumber).padStart(2, "0")}`;
+    guidedFlow.values.dateDraft = null;
+    control.querySelectorAll("input, button").forEach(field => { field.disabled = true; });
+    guidedAdvance(); await guidedAskCurrentStep();
+  });
+}
+function renderGuidedTimeControl(parent, start, end) {
+  const control = document.createElement("div");
+  control.className = "guided-time-control";
+  const card = document.createElement("div");
+  card.className = "guided-time-range";
+  const line = document.createElement("div");
+  line.className = "guided-time-line";
+  function group(name, value) {
+    const [hour24 = "", minute = ""] = (value || "").split(":");
+    let hour = Number(hour24);
+    const meridiem = hour >= 12 ? "PM" : "AM";
+    hour = hour % 12 || 12;
+    const draft = guidedFlow.values.timeDraft?.[name.toLowerCase()] || {};
+    const groupElement = document.createElement("div");
+    groupElement.className = `guided-time-group guided-time-${name.toLowerCase()}`;
+    groupElement.setAttribute("role", "group");
+    groupElement.setAttribute("aria-label", `${name} time`);
+    const hourInput = document.createElement("input");
+    hourInput.inputMode = "numeric"; hourInput.maxLength = 2; hourInput.placeholder = "HH"; hourInput.setAttribute("aria-label", `${name} hour`);
+    hourInput.value = draft.hour ?? (value ? String(hour) : "");
+    const minuteInput = document.createElement("input");
+    minuteInput.inputMode = "numeric"; minuteInput.maxLength = 2; minuteInput.placeholder = "MM"; minuteInput.setAttribute("aria-label", `${name} minute`);
+    minuteInput.value = draft.minute ?? (value ? minute : "");
+    const selector = document.createElement("select");
+    selector.setAttribute("aria-label", `${name} AM or PM`);
+    ["AM", "PM"].forEach(valueName => { const option = document.createElement("option"); option.value = valueName; option.textContent = valueName; selector.appendChild(option); });
+    selector.value = draft.meridiem || meridiem;
+    groupElement.append(hourInput, minuteInput, selector);
+    const save = () => {
+      guidedFlow.values.timeDraft ||= {};
+      guidedFlow.values.timeDraft[name.toLowerCase()] = { hour: hourInput.value, minute: minuteInput.value, meridiem: selector.value };
+      queueGuidedDraftSave();
+    };
+    [hourInput, minuteInput, selector].forEach(field => { field.addEventListener("input", save); field.addEventListener("change", save); });
+    return { element: groupElement, hourInput, minuteInput, selector };
+  }
+  const startGroup = group("Start", start);
+  const separator = document.createElement("span");
+  separator.className = "guided-time-separator"; separator.textContent = "to";
+  const endGroup = group("End", end);
+  const submit = document.createElement("button");
+  submit.type = "button"; submit.className = "date-entry-go"; submit.setAttribute("aria-label", "Use entered time range");
+  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg"); icon.setAttribute("viewBox", "0 0 24 24"); icon.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", "M20 5v4a5 5 0 0 1-5 5H5m0 0 5-5m-5 5 5 5"); icon.appendChild(path); submit.appendChild(icon);
+  const error = document.createElement("p"); error.className = "guided-inline-error"; error.setAttribute("role", "alert"); error.hidden = true;
+  line.append(startGroup.element, separator, endGroup.element, submit);
+  card.appendChild(line); control.append(card, error); parent.appendChild(control);
+  const parse = groupValue => {
+    let hour = Number(groupValue.hourInput.value);
+    const minute = Number(groupValue.minuteInput.value);
+    if (!/^\d{1,2}$/.test(groupValue.hourInput.value) || hour < 1 || hour > 12 || !/^\d{1,2}$/.test(groupValue.minuteInput.value) || minute > 59) return null;
+    hour = hour % 12 + (groupValue.selector.value === "PM" ? 12 : 0);
+    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  };
+  submit.addEventListener("click", async () => {
+    const startTime = parse(startGroup);
+    const endTime = parse(endGroup);
+    if (!startTime || !endTime || endTime <= startTime) { error.textContent = "End time must be later than start time."; error.hidden = false; return; }
+    guidedFlow.values.start = startTime; guidedFlow.values.end = endTime; guidedFlow.values.timeDraft = null;
+    card.querySelectorAll("input, select, button").forEach(field => { field.disabled = true; field.tabIndex = -1; });
+    guidedAdvance(); await guidedAskCurrentStep();
+  });
+}
 function renderGuidedControls() {
   if (!assistantEls.conversation) return;
-  assistantEls.conversation.querySelector("#guidedControls")?.remove();
   if (!guidedFlow) return;
   const shell = document.createElement("div");
-  shell.id = "guidedControls";
+  shell.id = `guidedControls-${guidedFlow.step}`;
+  assistantEls.conversation.querySelector(`#${shell.id}`)?.remove();
   shell.className = "message assistant-message guided-controls-message";
   const controls = document.createElement("div");
   controls.className = guidedFlow.step === "summary" ? "guided-summary-card" : "guided-controls";
+  controls.dataset.guidedStep = guidedFlow.step;
   const values = guidedFlow.values;
 
   if (guidedFlow.step === "summary") {
     const title = document.createElement("h3");
     title.textContent = values.title || "Schedule item";
+    const itemType = document.createElement("p");
+    itemType.className = "guided-summary-type";
+    itemType.textContent = values.itemType ? values.itemType[0].toUpperCase() + values.itemType.slice(1) : "";
     const date = document.createElement("p");
     date.textContent = formatKampalaDate(values.date);
     const time = document.createElement("p");
     time.textContent = values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed";
     const category = document.createElement("p");
     category.textContent = values.category || "Personal";
-    controls.append(title, date, time, category);
+    controls.append(title, itemType, date, time, category);
     if (values.recurrence) {
       const repeat = document.createElement("p");
       repeat.textContent = `${values.recurrence.frequency[0].toUpperCase()}${values.recurrence.frequency.slice(1)} · every ${values.recurrence.interval}${values.recurrence.frequency === "weekly" ? ` · ${values.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ")}` : ""}`;
@@ -3072,37 +3319,76 @@ function renderGuidedControls() {
     const actions = document.createElement("div");
     actions.className = "guided-control-actions";
     actions.append(guidedControlButton("Cancel creation and ask", "cancel_and_ask", null, "primary-button"), guidedControlButton("Keep creating", "keep_guided"));
+    const prior=guidedSteps().indexOf(guidedFlow.returnStep);
+    if(prior>0) actions.appendChild(guidedNavButton("Back to previous step","back","M15 18l-6-6 6-6","back"));
+    actions.appendChild(guidedNavButton("Cancel schedule creation","cancel","M6 6l12 12M18 6 6 18","cancel"));
     controls.appendChild(actions);
   } else {
     const step = guidedFlow.step;
     if (step === "type") {
-      controls.append(guidedControlButton("Activity", "type", "activity", "primary-button"), guidedControlButton("Task", "type", "task"), guidedControlButton("Routine", "type", "routine"));
+      const card = document.createElement("div"); card.className = "guided-choice-card"; card.setAttribute("role", "group"); card.setAttribute("aria-label", "Choose item type");
+      [["activity","Activity"],["task","Task"],["routine","Routine"]].forEach(([value,label]) => { const button=guidedControlButton(label,"type",value); button.className="guided-choice-row"; button.setAttribute("aria-pressed",String(values.itemType===value)); button.tabIndex=0; const square=document.createElement("span"); square.className="guided-choice-square"; square.setAttribute("aria-hidden","true"); const text=document.createElement("span"); text.className="guided-choice-label"; text.textContent=label; button.replaceChildren(square,text); card.appendChild(button); }); controls.appendChild(card);
     } else if (step === "frequency") {
       for (const [value, label] of [["daily", "Daily"], ["weekly", "Weekly"], ["monthly", "Monthly"]]) controls.appendChild(guidedControlButton(label, "frequency", value));
     } else if (step === "category") {
-      for (const name of guidedCategoryNames()) controls.appendChild(guidedControlButton(name, "category", name));
-      if (values.itemType === "task") controls.appendChild(guidedControlButton("Skip category", "skip"));
+      const card=document.createElement("div"); card.className="guided-choice-card"; card.setAttribute("role","group"); card.setAttribute("aria-label","Choose category");
+      for (const name of guidedCategoryNames()) { const button=guidedControlButton(name,"category",name); button.className="guided-choice-row"; button.setAttribute("aria-pressed",String(values.category===name)); button.tabIndex=0; const square=document.createElement("span"); square.className="guided-choice-square"; square.setAttribute("aria-hidden","true"); if(values.category===name) square.style.setProperty("--guided-choice-accent", guidedCategoryColor(name)); const text=document.createElement("span"); text.className="guided-choice-label"; text.textContent=name; button.replaceChildren(square,text); card.appendChild(button); }
+      controls.appendChild(card);
+    } else if (step === "date") {
+      renderGuidedDateControl(controls, values.date);
+    } else if (step === "time_range") {
+      renderGuidedTimeControl(controls, values.start, values.end);
     } else if (step === "weekdays") {
       GUIDED_WEEKDAYS.forEach((name, day) => {
         const button = guidedControlButton(name, "weekday", day);
         button.setAttribute("aria-pressed", String(values.weekdays.includes(day)));
         controls.appendChild(button);
       });
-      controls.appendChild(guidedControlButton("Continue", "continue_weekdays", null, "primary-button"));
-    } else if ((step === "start" || step === "end") && values.itemType === "routine") {
-      controls.appendChild(guidedControlButton("Skip time", "skip"));
-    } else if (step === "notes") {
-      controls.appendChild(guidedControlButton("Skip note", "skip"));
     }
     const actions = document.createElement("div");
     actions.className = "guided-control-actions";
-    if (guidedSteps().indexOf(step) > 0) actions.appendChild(guidedControlButton("Back", "back"));
-    actions.appendChild(guidedControlButton("Cancel", "cancel"));
+    if (step === "notes") actions.appendChild(guidedControlButton("Skip note", "skip", null, "guided-skip-note"));
+    if (step === "time_range" && values.itemType === "routine") actions.appendChild(guidedControlButton("Skip time", "skip", null, "guided-quiet-action"));
+    if (step === "category" && values.itemType === "task") actions.appendChild(guidedControlButton("Skip category", "skip", null, "guided-quiet-action"));
+    if (step === "weekdays") actions.appendChild(guidedControlButton("Continue", "continue_weekdays", null, "primary-button"));
+    if (guidedSteps().indexOf(step) > 0) actions.appendChild(guidedNavButton("Back to previous step", "back", "M15 18l-6-6 6-6", "back"));
+    actions.appendChild(guidedNavButton("Cancel schedule creation", "cancel", "M6 6l12 12M18 6 6 18", "cancel"));
     controls.appendChild(actions);
   }
   shell.appendChild(controls);
   assistantEls.conversation.appendChild(shell);
+  if (guidedFlow.step === "notes" && values.notes && assistantEls.input && !assistantEls.input.value) {
+    assistantEls.input.value = values.notes;
+    updateComposerHeight();
+    updateSendButtonState();
+  }
   scrollToBottom();
+  controls.querySelector("button:not(:disabled), input:not(:disabled)")?.focus({ preventScroll: true });
+}
+function renderGuidedHistoryControls(flow = guidedFlow) {
+  if (!flow?.id || !assistantEls.conversation) return;
+  const activeFlow = guidedFlow;
+  guidedFlow = flow;
+  const originalStep = guidedFlow.step;
+  const activeStep = guidedFlow.step === "switch_question" ? guidedFlow.returnStep : guidedFlow.step;
+  const steps = guidedSteps();
+  const activeIndex = steps.indexOf(activeStep);
+  for (const step of steps.slice(0, Math.max(0, activeIndex))) {
+    if (!["type", "date", "time_range", "category"].includes(step)) continue;
+    const questions = [...assistantEls.conversation.querySelectorAll(`[data-guided-flow-id="${guidedFlow.id}"][data-guided-step="${step}"]`)];
+    const question = questions.at(-1);
+    if (!question || assistantEls.conversation.querySelector(`#guidedControls-${step}`)) continue;
+    guidedFlow.step = step;
+    renderGuidedControls();
+    const shell = assistantEls.conversation.querySelector(`#guidedControls-${step}`);
+    if (!shell) continue;
+    shell.querySelector(".guided-control-actions")?.remove();
+    shell.querySelectorAll("button, input, select").forEach(control => { control.disabled = true; control.tabIndex = -1; });
+    shell.querySelector(".guided-choice-card")?.setAttribute("aria-disabled", "true");
+    question.after(shell);
+  }
+  guidedFlow.step = originalStep;
+  guidedFlow = activeFlow;
 }
 function guidedAdvance() {
   const steps = guidedSteps();
@@ -3112,8 +3398,12 @@ function guidedAdvance() {
 async function guidedAskCurrentStep({ wait = false } = {}) {
   const conversationId = activeConversationId;
   const prompt = guidedPrompt(guidedFlow.step);
-  const shouldWait = wait && guidedFlow.step !== "category";
-  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  const shouldWait = wait;
+  assistantEls.conversation.querySelectorAll(".guided-controls-message").forEach(shell => {
+    shell.querySelectorAll("button, input, select").forEach(control => { control.disabled = true; control.tabIndex = -1; });
+    shell.querySelector(".guided-choice-card")?.setAttribute("aria-disabled", "true");
+    shell.querySelector(".guided-control-actions")?.remove();
+  });
   const startedAt = performance.now();
   if (shouldWait && activeConversationId === conversationId) {
     showWaitingState();
@@ -3123,30 +3413,8 @@ async function guidedAskCurrentStep({ wait = false } = {}) {
   if (shouldWait) await waitForPresentation(startedAt, 350);
   await saved;
   if (activeConversationId === conversationId) removeWaitingState();
-  await appendAssistantWithReveal({ role: "assistant", text: prompt }, conversationId);
+  await appendAssistantWithReveal({ role: "assistant", text: prompt, guidedFlowId: guidedFlow.id, guidedStepId: guidedFlow.step }, conversationId);
   if (activeConversationId === conversationId && guidedFlow) renderGuidedControls();
-}
-function parseGuidedDate(text) {
-  const value = text.trim().toLowerCase();
-  const today = kampalaDate();
-  if (value === "today") return today;
-  if (value === "tomorrow") return addCalendarDays(today, 1);
-  const date = value;
-  return scheduleValidateDate(date) ? date : null;
-}
-function parseGuidedTime(text) {
-  const value = text.trim();
-  let match = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(value);
-  if (match) {
-    let hour = Number(match[1]);
-    const minute = Number(match[2]);
-    if (hour < 1 || hour > 12 || minute > 59) return null;
-    hour = (hour % 12) + (match[3].toUpperCase() === "PM" ? 12 : 0);
-    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  }
-  match = /^(\d{2}):(\d{2})$/.exec(value);
-  if (!match || !scheduleValidateTime(value)) return null;
-  return value;
 }
 function validateGuidedValues() {
   const values = guidedFlow.values;
@@ -3175,6 +3443,7 @@ async function handleGuidedAnswer(text) {
   if (step === "switch_question" && ["no", "keep", "keep creating"].includes(answer.toLowerCase())) { await handleGuidedControl("keep_guided"); return; }
   if (["cancel", "cancel schedule creation", "cancel creation"].includes(answer.toLowerCase())) { await cancelGuidedAdd(); return; }
   if (step === "switch_question") { await guidedAppendAssistant("Choose whether to cancel schedule creation or keep going with it."); return; }
+  if (["type", "date", "time_range", "category"].includes(step)) { await guidedAppendAssistant("Use the controls beneath the question to choose this value."); return; }
   if (step === "summary") {
     const normalized = answer.toLowerCase();
     if (["cancel", "cancel creation"].includes(normalized)) { await cancelGuidedAdd(); return; }
@@ -3182,25 +3451,9 @@ async function handleGuidedAnswer(text) {
     await guidedAppendAssistant("Use Add to schedule, Edit, or Cancel on the summary card.");
     return;
   }
-  if (step === "type") {
-    const type = answer.toLowerCase();
-    if (!["activity", "task", "routine"].includes(type)) { await guidedAppendAssistant("Choose Activity, Task, or Routine."); return; }
-    values.itemType = type;
-  } else if (step === "title") {
+  if (step === "title") {
     if (!answer || answer.length > 200) { await guidedAppendAssistant("Enter a title of 1 to 200 characters."); return; }
     values.title = answer;
-  } else if (step === "date") {
-    const date = parseGuidedDate(answer);
-    if (!date) { await guidedAppendAssistant("Enter a valid date as YYYY-MM-DD, today, or tomorrow."); return; }
-    values.date = date;
-  } else if (step === "start" || step === "end") {
-    if (!answer && values.itemType === "routine") values[step] = null;
-    else {
-      const time = parseGuidedTime(answer);
-      if (!time) { await guidedAppendAssistant(`Enter a valid ${step} time, such as 2:00 PM or 14:00.`); return; }
-      values[step] = time;
-      if (step === "end" && values.start && time <= values.start) { await guidedAppendAssistant("End time must be later than start time."); return; }
-    }
   } else if (step === "interval") {
     const interval = Number(answer);
     if (!Number.isInteger(interval) || interval < 1 || interval > 365) { await guidedAppendAssistant("Enter a positive whole number from 1 to 365."); return; }
@@ -3216,29 +3469,27 @@ async function handleGuidedAnswer(text) {
     if (!days.length || days.length !== parts.length) { await guidedAppendAssistant("Enter weekday names such as Monday, Wednesday, or Friday."); return; }
     values.weekdays = [...new Set(days)];
     values.recurrence.days = values.weekdays;
-  } else if (step === "category") {
-    const category = guidedCategoryNames().find(name => name.toLowerCase() === answer.toLowerCase());
-    if (!category && !(values.itemType === "task" && !answer)) { await guidedAppendAssistant("Choose one of the available categories, or skip this optional step."); return; }
-    if (category) values.category = category;
   } else if (step === "notes") {
     if (answer.length > 2000) { await guidedAppendAssistant("Keep the note to 2,000 characters or fewer."); return; }
     values.notes = answer;
   }
-  if (step === "category" && values.itemType === "task" && !answer) values.category = null;
   guidedAdvance();
   await guidedAskCurrentStep({ wait: true });
 }
 async function cancelGuidedAdd() {
+  await removeGuidedReviewInstruction(guidedFlow?.id);
+  if (activeConversationId) delete guidedFlowsByConversation[activeConversationId];
+  guidedCompletedFlow = null;
   guidedFlow = null;
   pendingQuickQuestionId = null;
   await saveGuidedFlow();
-  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  assistantEls.conversation.querySelectorAll(".guided-controls-message").forEach(node => node.remove());
   await guidedAppendAssistant("Schedule creation cancelled.", { showControls: false });
 }
 async function confirmGuidedAdd() {
   if (!guidedFlow || guidedSaveInProgress) return;
   const validationError = validateGuidedValues();
-  if (validationError) { guidedFlow.step = validationError.startsWith("Select a start") ? "start" : validationError.startsWith("Select an end") ? "end" : validationError.startsWith("Choose a category") ? "category" : validationError.startsWith("Choose a routine") || validationError.startsWith("Enter a positive recurrence") ? "frequency" : validationError.startsWith("Select at least one weekday") ? "weekdays" : validationError.startsWith("Enter a valid date") ? "date" : "title"; await guidedAskCurrentStep(); return; }
+  if (validationError) { guidedFlow.step = validationError.startsWith("Select a start") || validationError.startsWith("Select an end") || validationError.startsWith("End time") ? "time_range" : validationError.startsWith("Choose a category") ? "category" : validationError.startsWith("Choose a routine") || validationError.startsWith("Enter a positive recurrence") ? "frequency" : validationError.startsWith("Select at least one weekday") ? "weekdays" : validationError.startsWith("Enter a valid date") ? "date" : "title"; await guidedAskCurrentStep(); return; }
   const values = guidedFlow.values;
   const updates = {
     title: values.title.trim(), date: values.date, type: values.itemType, start: values.start || "", end: values.end || "",
@@ -3254,7 +3505,7 @@ async function confirmGuidedAdd() {
     guidedFlow.conflictKey = conflictKey;
     guidedFlow.conflictMessage = `Schedule conflict: ${candidate.title} overlaps with ${otherTitle} from ${formatTime(conflict.overlapStart)} to ${formatTime(conflict.overlapEnd)}.`;
     await saveGuidedFlow();
-    await guidedAppendAssistant(`${guidedFlow.conflictMessage} You can edit the details or add it anyway.`);
+    await guidedAppendAssistant("Review the schedule details below.");
     return;
   }
   guidedSaveInProgress = true;
@@ -3265,11 +3516,15 @@ async function confirmGuidedAdd() {
   finally { guidedSaveInProgress = false; }
   if (!result?.success) { await guidedAppendAssistant("The item could not be saved. Try again."); return; }
   if (result.item && typeof window.refreshAssistantScheduleItem === "function") window.refreshAssistantScheduleItem(result.item, "created");
+  const flowId = guidedFlow.id;
   const summary = guidedSummaryText(values);
+  await removeGuidedReviewInstruction(flowId);
+  guidedFlow.status = "completed"; guidedFlow.step = "summary";
+  guidedFlowsByConversation[activeConversationId] = guidedFlow; guidedCompletedFlow = guidedFlow;
   guidedFlow = null;
   pendingQuickQuestionId = null;
   await saveGuidedFlow();
-  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  assistantEls.conversation.querySelector("#guidedControls-summary")?.remove();
   await guidedAppendAssistant(`Added to your schedule.\n${summary}`, { showControls: false, kind: "guided_completion" });
 }
 async function handleGuidedControl(action, value) {
@@ -3291,18 +3546,33 @@ async function handleGuidedControl(action, value) {
   }
   if (action === "back") {
     const steps = guidedSteps();
-    const index = steps.indexOf(guidedFlow.step);
-    if (index > 0) guidedFlow.step = steps[index - 1];
+    const currentStep = guidedFlow.step === "switch_question" ? guidedFlow.returnStep : guidedFlow.step;
+    const index = steps.indexOf(currentStep);
+    if (index > 0) {
+      const returnedStep = steps[index - 1];
+      const rank = new Map(steps.map((step, i) => [step, i]));
+      const removed = conversation.filter(entry => entry.guidedFlowId === guidedFlow.id && (entry.guidedStepId === "switch_question" || (rank.has(entry.guidedStepId) && rank.get(entry.guidedStepId) >= rank.get(returnedStep))));
+      conversation = conversation.filter(entry => !removed.includes(entry));
+      for (const entry of removed) assistantEls.conversation.querySelector(`[data-guided-flow-id="${guidedFlow.id}"][data-guided-step="${entry.guidedStepId}"]`)?.remove();
+      const ids = removed.map(entry => entry.id).filter(Boolean);
+      if (ids.length && activeConversationId) { await persistenceQueue.catch(() => {}); await firebaseStore.deleteConversationMessages(activeConversationId, ids); await firebaseStore.updateConversationSummary(activeConversationId, { summary: conversationSummary("active"), keywords: conversation.map(entry => entry.text || "").join(" ").split(/\s+/).filter(Boolean).slice(-40) }).catch(() => {}); }
+      assistantEls.conversation.querySelectorAll(".guided-controls-message").forEach(node => {
+        const nodeStep = node.querySelector("[data-guided-step]")?.dataset.guidedStep;
+        if (node.id === "guidedControls-switch_question" || (rank.get(nodeStep) ?? -1) >= rank.get(returnedStep)) node.remove();
+      });
+      guidedFlow.step = returnedStep;
+      guidedFlow.returnStep = null;
+      delete guidedFlow.queuedQuickQuestion;
+      guidedFlow.values = pruneGuidedValues(guidedFlow.values, returnedStep);
+    }
     guidedFlow.conflictKey = null;
     guidedFlow.conflictMessage = null;
     await guidedAskCurrentStep();
     return;
   }
   if (action === "edit") {
-    guidedFlow.step = "title";
-    guidedFlow.conflictKey = null;
-    guidedFlow.conflictMessage = null;
-    await guidedAskCurrentStep();
+    guidedEditFormOpen = true;
+    window.openGuidedAddDialog?.(guidedFlow.values);
     return;
   }
   if (action === "confirm") { await confirmGuidedAdd(); return; }
@@ -3318,14 +3588,14 @@ async function handleGuidedControl(action, value) {
   }
   if (action === "continue_weekdays") {
     if (!guidedFlow.values.weekdays.length) { await guidedAppendAssistant("Select at least one weekday."); return; }
-    appendEntry({ role: "user", text: guidedFlow.values.weekdays.map(day => GUIDED_WEEKDAYS[day]).join(", ") });
     guidedAdvance();
     await guidedAskCurrentStep({ wait: true });
     return;
   }
   if (action === "type") {
     guidedFlow.values.itemType = value;
-    appendEntry({ role: "user", text: value[0].toUpperCase() + value.slice(1) });
+      const card=assistantEls.conversation.querySelector("#guidedControls-type .guided-choice-card"); if(card) card.setAttribute("aria-disabled","true");
+      card?.querySelectorAll("[data-guided-action='type']").forEach(button=>{button.tabIndex=-1;button.disabled=true;button.setAttribute("aria-pressed",String(button.dataset.guidedValue===value));});
     guidedAdvance();
     await guidedAskCurrentStep({ wait: true });
     return;
@@ -3333,26 +3603,30 @@ async function handleGuidedControl(action, value) {
   if (action === "frequency") {
     guidedFlow.values.recurrence = { frequency: value, interval: 1, days: [] };
     guidedFlow.values.weekdays = [];
-    appendEntry({ role: "user", text: value[0].toUpperCase() + value.slice(1) });
     guidedAdvance();
     await guidedAskCurrentStep({ wait: true });
     return;
   }
   if (action === "category") {
     guidedFlow.values.category = value;
-    appendEntry({ role: "user", text: value });
+    const card=assistantEls.conversation.querySelector("#guidedControls-category .guided-choice-card"); if(card) card.setAttribute("aria-disabled","true");
+    card?.querySelectorAll("[data-guided-action='category']").forEach(button=>{button.tabIndex=-1;button.disabled=true;button.setAttribute("aria-pressed",String(button.dataset.guidedValue===value));});
     guidedAdvance();
     await guidedAskCurrentStep({ wait: true });
     return;
   }
   if (action === "skip") {
     if (guidedFlow.step === "category") guidedFlow.values.category = null;
-    else if (guidedFlow.step === "notes") guidedFlow.values.notes = "";
-    else if (guidedFlow.step === "start" || guidedFlow.step === "end") guidedFlow.values[guidedFlow.step] = null;
+    else if (guidedFlow.step === "notes") {
+      guidedFlow.values.notes = "";
+      if (assistantEls.input) assistantEls.input.value = "";
+      updateComposerHeight();
+      updateSendButtonState();
+    }
+    else if (guidedFlow.step === "time_range") { guidedFlow.values.start = null; guidedFlow.values.end = null; guidedFlow.values.timeDraft = null; }
     const skipped = guidedFlow.step;
-    appendEntry({ role: "user", text: skipped === "notes" ? "Skip note" : skipped === "category" ? "Skip category" : "Skip time" });
     guidedAdvance();
-    await guidedAskCurrentStep({ wait: true });
+    await guidedAskCurrentStep({ wait: skipped !== "notes" });
   }
 }
 
@@ -3766,6 +4040,8 @@ assistantEls.conversation?.addEventListener("click", event => {
 });
 
 renderConversation();
+if (guidedFlow) { if (!guidedFlow.id) guidedFlow.id = crypto.randomUUID(); renderGuidedHistoryControls(); renderGuidedControls(); }
+else if (guidedCompletedFlow) renderGuidedHistoryControls(guidedCompletedFlow);
 loadDrawerConversations().catch(showPersistenceFailure);
 updateComposerHeight();
 updateSendButtonState();

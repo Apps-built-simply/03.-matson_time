@@ -1211,12 +1211,37 @@ function openAddDialog() {
   els.form.elements.title.focus();
 }
 
+window.openGuidedAddDialog = values => {
+  openAddDialog();
+  const form = els.form.elements;
+  form.type.value = values.itemType || "activity";
+  form.title.value = values.title || "";
+  form.date.value = values.date || localDateString(new Date());
+  form.start.value = values.start || "";
+  form.end.value = values.end || "";
+  form.category.value = values.category || "Personal";
+  form.notes.value = values.notes || "";
+  form.recurrenceFrequency.value = values.recurrence?.frequency || "";
+  form.recurrenceInterval.value = String(values.recurrence?.interval || 1);
+  updateFieldVisibility(form.type.value);
+  updateDateDisplay(form.date.value);
+  updateTimeDisplay("start", form.start.value);
+  updateTimeDisplay("end", form.end.value);
+  updateWeekdayButtons(values.recurrence?.days || []);
+  updateCategorySwatch(form.category.value);
+  window.customSelectType?.sync(false);
+  window.customSelectFrequency?.sync(false);
+  window.customSelectCategory?.sync(false);
+  form.title.focus();
+};
+
 document.querySelector("#closeAddButton").addEventListener("click", () => { if (!addWriteInProgress) els.dialog.close(); });
 els.dialog.addEventListener("cancel", event => { if (addWriteInProgress) event.preventDefault(); });
 els.dialog.addEventListener("close", () => {
   editingItemId = null;
   addConflictConfirmed = "";
   closeAllPopovers();
+  window.guidedAddDialogClosed?.();
 });
 els.type.addEventListener("change", () => {
   updateFieldVisibility(els.type.value);
@@ -1458,6 +1483,7 @@ els.form.addEventListener("submit", async event => {
   if (result.item && typeof window.refreshAssistantScheduleItem === "function") {
     window.refreshAssistantScheduleItem(result.item, editingItemId ? "updated" : "created");
   }
+  if (!editingItemId && result.item) await window.completeGuidedAddFromForm?.(result.item);
   els.form.reset();
   editingItemId = null;
   addConflictConfirmed = "";

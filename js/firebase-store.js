@@ -74,6 +74,7 @@ function itemPayload(item, creating = false) {
 }
 function cleanMessage(message) {
   return {
+    ...(typeof message.id === "string" ? { id: message.id } : {}),
     role: message.role,
     text: String(message.text || ""),
     kind: message.kind || (message.role === "user" ? "user_message" : "assistant_message"),
@@ -81,6 +82,7 @@ function cleanMessage(message) {
     deletedItemIds: Array.isArray(message.deletedItemIds) ? [...new Set(message.deletedItemIds.filter(id => typeof id === "string"))] : [],
     proposalSummary: message.proposalSummary || null,
     resolved: message.resolved !== false,
+    ...(typeof message.guidedFlowId === "string" ? { guidedFlowId: message.guidedFlowId.slice(0, 80), guidedStepId: String(message.guidedStepId || "").slice(0, 40) } : {}),
     createdAt: message.createdAt || serverTimestamp()
   };
 }
@@ -182,11 +184,21 @@ export async function loadConversation(id, max = 50) {
       referencedItemIds: Array.isArray(value.referencedItemIds) ? value.referencedItemIds.filter(id => typeof id === "string").slice(0, 20) : [],
       deletedItemIds: Array.isArray(value.deletedItemIds) ? value.deletedItemIds.filter(id => typeof id === "string").slice(0, 20) : [],
       proposalSummary: typeof value.proposalSummary === "string" ? value.proposalSummary.slice(0, 300) : null,
-      resolved: value.resolved !== false, createdAt: value.createdAt || null
+      resolved: value.resolved !== false, guidedFlowId: typeof value.guidedFlowId === "string" ? value.guidedFlowId : null, guidedStepId: typeof value.guidedStepId === "string" ? value.guidedStepId : null, createdAt: value.createdAt || null
     };
   }).reverse();
   conversationMessageCache.set(id, messages);
   return { ...normalizeConversation({ id, data: () => metadata.data() }), messages };
+}
+export async function deleteConversationMessages(conversationId, ids) {
+  const safeIds = [...new Set((ids || []).filter(id => typeof id === "string" && id))];
+  if (!conversationId || !safeIds.length) return;
+  for (let offset = 0; offset < safeIds.length; offset += 450) {
+    const batch = writeBatch(db);
+    safeIds.slice(offset, offset + 450).forEach(id => batch.delete(doc(userDoc("conversations", conversationId, "messages"), id)));
+    await batch.commit();
+  }
+  conversationMessageCache.set(conversationId, (conversationMessageCache.get(conversationId) || []).filter(message => !safeIds.includes(message.id)));
 }
 export async function addConversationMessage(conversationId, message) {
   const safeMessage = cleanMessage(message);
@@ -268,7 +280,7 @@ export async function loadAssistantState() {
 }
 function cleanGuidedFlow(flow) {
   if (!flow || typeof flow !== "object" || flow.type !== "create_schedule_item") return null;
-  const allowedSteps = new Set(["type", "title", "date", "start", "end", "frequency", "interval", "weekdays", "category", "notes", "summary", "switch_question"]);
+  const allowedSteps = new Set(["type", "title", "date", "time_range", "frequency", "interval", "weekdays", "category", "notes", "summary", "switch_question"]);
   const values = flow.values && typeof flow.values === "object" ? flow.values : {};
   const recurrence = values.recurrence && typeof values.recurrence === "object" ? {
     frequency: ["daily", "weekly", "monthly"].includes(values.recurrence.frequency) ? values.recurrence.frequency : null,
@@ -277,13 +289,17 @@ function cleanGuidedFlow(flow) {
   } : null;
   return {
     type: "create_schedule_item",
-    step: allowedSteps.has(flow.step) ? flow.step : "type",
+    ...(typeof flow.id === "string" ? { id: flow.id.slice(0, 80) } : {}),
+    ...(flow.status === "completed" ? { status: "completed" } : {}),
+    step: allowedSteps.has(flow.step) ? flow.step : (["start", "end"].includes(flow.step) ? "time_range" : "type"),
     ...(allowedSteps.has(flow.returnStep) ? { returnStep: flow.returnStep } : {}),
     ...(["schedule_today", "schedule_week", "schedule_month", "attention_now", "free_time_week"].includes(flow.queuedQuickQuestion) ? { queuedQuickQuestion: flow.queuedQuickQuestion } : {}),
     values: {
       itemType: ["activity", "task", "routine"].includes(values.itemType) ? values.itemType : null,
       title: typeof values.title === "string" ? values.title.slice(0, 200) : null,
       date: typeof values.date === "string" ? values.date.slice(0, 10) : null,
+      dateDraft: values.dateDraft && typeof values.dateDraft === "object" ? { day: String(values.dateDraft.day || "").replace(/\D/g, "").slice(0, 2), month: String(values.dateDraft.month || "").slice(0, 20), year: String(values.dateDraft.year || "").replace(/\D/g, "").slice(0, 4) } : null,
+      timeDraft: values.timeDraft && typeof values.timeDraft === "object" ? Object.fromEntries(["start", "end"].map(key => [key, { hour: String(values.timeDraft[key]?.hour || "").replace(/\D/g, "").slice(0, 2), minute: String(values.timeDraft[key]?.minute || "").replace(/\D/g, "").slice(0, 2), meridiem: values.timeDraft[key]?.meridiem === "PM" ? "PM" : "AM" }])) : null,
       start: typeof values.start === "string" ? values.start.slice(0, 5) : null,
       end: typeof values.end === "string" ? values.end.slice(0, 5) : null,
       category: typeof values.category === "string" ? values.category.slice(0, 60) : null,
