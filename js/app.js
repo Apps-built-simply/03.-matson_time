@@ -16,6 +16,8 @@ let postponeTrigger = null;
 let postponeWriteInProgress = false;
 let postponeConflictConfirmed = "";
 let editingItemId = null;
+let addWriteInProgress = false;
+let addConflictConfirmed = "";
 
 const scheduleStatusPresentation = {
   upcoming: { label: "Upcoming", className: "upcoming" },
@@ -527,10 +529,13 @@ function openEditItem(id, sourceDialog = els.postponeDialog) {
   const recurrence = item.recurrence || null;
   els.recurrenceFrequency.value = recurrence?.frequency || "";
   form.elements.recurrenceInterval.value = String(recurrence?.interval || 1);
-  form.elements.recurrenceDays.value = Array.isArray(recurrence?.days) ? recurrence.days.join(", ") : "";
-  if (window.customSelectType) window.customSelectType.sync();
-  if (window.customSelectFrequency) window.customSelectFrequency.sync();
-  if (window.customSelectCategory) window.customSelectCategory.sync();
+  addConflictConfirmed = "";
+  clearAddFormError();
+  document.querySelector("#saveItemButton").disabled = false;
+  document.querySelector("#saveItemButton").textContent = "Save changes";
+  if (window.customSelectType) window.customSelectType.sync(false);
+  if (window.customSelectFrequency) window.customSelectFrequency.sync(false);
+  if (window.customSelectCategory) window.customSelectCategory.sync(false);
   updateDateDisplay(form.elements.date.value);
   updateTimeDisplay("start", form.elements.start.value);
   updateTimeDisplay("end", form.elements.end.value);
@@ -972,19 +977,18 @@ class CustomSelect {
   }
 
   // Refresh trigger text/swatch and selected-row state from the native <select>.
-  sync() {
+  sync(emitChange = true) {
     const index = this.native.selectedIndex;
     const option = this.native.options[index];
     if (!option) return;
     this.trigger.querySelector(".field-display").textContent = option.textContent.trim();
-    this.native.dispatchEvent(new Event("change", { bubbles: true }));
+    if (emitChange) this.native.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   open() {
     if (this.isOpen) return;
     openPopoverAt(this);
     this.isOpen = true;
-    this.panel.hidden = false;
     this.trigger.setAttribute("aria-expanded", "true");
     positionPanel(this.panel, this.trigger);
   }
@@ -1179,30 +1183,50 @@ initCustomSelects();
 function openAddDialog() {
   editingItemId = null;
   els.form.reset();
+  addConflictConfirmed = "";
+  clearAddFormError();
+  const category = els.form.elements.category;
+  if (Array.from(category.options).some(option => option.value === "Personal")) category.value = "Personal";
+  else if (category.options.length) category.selectedIndex = 0;
+  els.form.elements.type.value = "activity";
+  els.recurrenceFrequency.value = "";
+  els.form.elements.recurrenceInterval.value = "1";
+  els.form.elements.start.value = "";
+  els.form.elements.end.value = "";
+  window.customSelectType?.sync(false);
+  window.customSelectFrequency?.sync(false);
+  window.customSelectCategory?.sync(false);
   els.form.date.value = localDateString(new Date());
   updateDateDisplay(els.form.date.value);
+  updateTimeDisplay("start", "");
+  updateTimeDisplay("end", "");
+  updateWeekdayButtons([]);
+  updateCategorySwatch(category.value);
   els.addDialogTitle.textContent = "Add new item";
   els.dialog.querySelector(".eyebrow").textContent = "Create";
-  els.dialog.querySelector('[type="submit"]').textContent = "Save item";
+  document.querySelector("#saveItemButton").textContent = "Save item";
+  document.querySelector("#saveItemButton").disabled = false;
   updateFieldVisibility("activity");
   els.dialog.showModal();
   els.form.elements.title.focus();
 }
 
-document.querySelector("#closeAddButton").addEventListener("click", () => els.dialog.close());
+document.querySelector("#closeAddButton").addEventListener("click", () => { if (!addWriteInProgress) els.dialog.close(); });
+els.dialog.addEventListener("cancel", event => { if (addWriteInProgress) event.preventDefault(); });
 els.dialog.addEventListener("close", () => {
   editingItemId = null;
+  addConflictConfirmed = "";
   closeAllPopovers();
 });
 els.type.addEventListener("change", () => {
   updateFieldVisibility(els.type.value);
 });
+document.querySelector("#itemCategory").addEventListener("change", event => updateCategorySwatch(event.currentTarget.value));
 
 // ── Field visibility by item type ──────────────────────────────────────────
 
 function updateFieldVisibility(type) {
   const isTask = type === "task";
-  const isActivity = type === "activity";
 
   // Close time popovers when time fields become hidden.
   if (isTask) {
@@ -1211,6 +1235,16 @@ function updateFieldVisibility(type) {
   }
 
   els.timeFields.hidden = isTask;
+  if (isTask) {
+    els.form.elements.start.value = "";
+    els.form.elements.end.value = "";
+    els.recurrenceFrequency.value = "";
+    els.form.elements.recurrenceInterval.value = "1";
+    updateWeekdayButtons([]);
+    window.customSelectFrequency?.sync(false);
+    updateTimeDisplay("start", "");
+    updateTimeDisplay("end", "");
+  }
 
   // Recurrence: always show the fieldset header; details depend on frequency
   const frequency = els.recurrenceFrequency.value;
@@ -1221,6 +1255,7 @@ function updateFrequencyVisibility(frequency, isTask = false) {
   const hasRepeat = Boolean(frequency);
   const isWeekly = frequency === "weekly";
   const isDailyOrWeeklyOrMonthly = frequency === "daily" || frequency === "weekly" || frequency === "monthly";
+  if (!isWeekly) updateWeekdayButtons([]);
 
   // Every control: only when repeating
   document.querySelector("#everyControl").hidden = !hasRepeat;
@@ -1302,47 +1337,167 @@ function updateWeekdayButtons(days) {
 
 // ── Form submit ────────────────────────────────────────────────────────────
 
+function clearAddFormError() {
+  const error = document.querySelector("#addFormError");
+  if (error) { error.textContent = ""; error.hidden = true; }
+  els.form.querySelectorAll("[aria-invalid='true']").forEach(control => control.removeAttribute("aria-invalid"));
+}
+
+function showAddFormError(message, control = null) {
+  const error = document.querySelector("#addFormError");
+  if (error) { error.textContent = message; error.hidden = false; }
+  if (control) {
+    control.setAttribute("aria-invalid", "true");
+    control.focus();
+  }
+}
+
+function validateAddForm(values) {
+  const title = els.form.elements.title;
+  const dateTrigger = document.querySelector("#dateTrigger");
+  const startTrigger = document.querySelector("#startTimeTrigger");
+  const endTrigger = document.querySelector("#endTimeTrigger");
+  const categoryTrigger = document.querySelector("#categoryTrigger");
+  const frequencyTrigger = document.querySelector("#recurrenceFrequencyTrigger");
+  const type = values.type;
+  if (!values.title.trim()) return { message: "Enter a title.", control: title };
+  if (!values.date || !scheduleValidateDate(values.date)) return { message: "Select a date.", control: dateTrigger };
+  if (!values.category || !saGetAvailableCategories().includes(values.category)) return { message: "Select a category.", control: categoryTrigger };
+  if (!(["activity", "task", "routine"].includes(type))) return { message: "Select an item type.", control: document.querySelector("#typeTrigger") };
+  if (type === "activity") {
+    if (!values.start || !scheduleValidateTime(values.start)) return { message: "Select a start time.", control: startTrigger };
+    if (!values.end || !scheduleValidateTime(values.end)) return { message: "Select an end time.", control: endTrigger };
+    if (values.end <= values.start) return { message: "End time must be later than start time.", control: endTrigger };
+  }
+  if (type === "routine" && !values.recurrenceFrequency) return { message: "Select a frequency.", control: frequencyTrigger };
+  if (type !== "task" && values.recurrenceFrequency) {
+    if (!["daily", "weekly", "monthly"].includes(values.recurrenceFrequency)) return { message: "Select a valid frequency.", control: frequencyTrigger };
+    const interval = Number(values.recurrenceInterval);
+    if (!Number.isInteger(interval) || interval < 1 || interval > 365) return { message: "Enter a valid recurrence interval.", control: els.form.elements.recurrenceInterval };
+    if (values.recurrenceFrequency === "weekly" && !values.days.length) return { message: "Select at least one weekday.", control: document.querySelector(".weekday-button") };
+  }
+  return null;
+}
+
 els.form.addEventListener("submit", async event => {
   event.preventDefault();
+  if (addWriteInProgress) return;
+  try {
+  closeAllPopovers();
+  clearAddFormError();
+  // Custom controls use native fields as their source of truth. Synchronize
+  // displays and weekday buttons before constructing the one submit payload.
+  window.customSelectType?.sync(false);
+  window.customSelectFrequency?.sync(false);
+  window.customSelectCategory?.sync(false);
+  const selectedDays = Array.from(document.querySelectorAll(".weekday-button[aria-pressed='true']"))
+    .map(button => Number(button.dataset.day));
   const data = new FormData(els.form);
-  const recurrenceFrequency = data.get("recurrenceFrequency");
+  const recurrenceFrequency = String(data.get("recurrenceFrequency") || "");
   let recurrence = null;
-  if (recurrenceFrequency) {
-    const selectedDays = Array.from(document.querySelectorAll(".weekday-button[aria-pressed='true']"))
-      .map(btn => Number(btn.dataset.day));
+  if (recurrenceFrequency && data.get("type") !== "task") {
     recurrence = {
       frequency: recurrenceFrequency,
       interval: Number(data.get("recurrenceInterval")) || 1,
       days: selectedDays
     };
   }
+  const values = {
+    title: String(data.get("title") || ""), date: String(data.get("date") || ""), type: String(data.get("type") || ""),
+    start: data.get("type") === "task" ? "" : String(data.get("start") || ""),
+    end: data.get("type") === "task" ? "" : String(data.get("end") || ""),
+    category: String(data.get("category") || ""), notes: String(data.get("notes") || ""),
+    recurrenceFrequency, recurrenceInterval: String(data.get("recurrenceInterval") || "1"), days: selectedDays
+  };
+  const invalid = validateAddForm(values);
+  if (invalid) { showAddFormError(invalid.message, invalid.control); return; }
   const updates = {
-    title: data.get("title").trim(),
-    date: data.get("date"),
-    type: data.get("type"),
-    start: data.get("start"),
-    end: data.get("end"),
-    category: data.get("category"),
-    notes: data.get("notes").trim(),
+    title: values.title.trim(), date: values.date, type: values.type,
+    start: values.start, end: values.end, category: values.category,
+    notes: values.notes.trim(),
     recurrence,
     schedulePending: false
   };
-  const result = editingItemId
-    ? await saUpdateItem(editingItemId, updates)
-    : await saCreateItem({ ...updates, status: "upcoming", postponed: 0 });
-  if (!result.success) {
-    if (els.form.reportValidity()) alert(`Could not save item: ${result.error}`);
+  const candidate = { ...(editingItemId ? items.find(item => item.id === editingItemId) : {}), ...updates, id: editingItemId || "__new_add_item__", status: editingItemId ? (items.find(item => item.id === editingItemId)?.status || "upcoming") : "upcoming" };
+  const conflict = candidate.date && candidate.start && candidate.end
+    ? saDetectConflictsForDate(candidate.date, [...items.filter(item => item.id !== editingItemId), candidate]).find(item => item.firstItemId === candidate.id || item.secondItemId === candidate.id)
+    : null;
+  const conflictKey = conflict ? `${candidate.date}|${candidate.start}|${candidate.end}|${conflict.pairKey}` : "";
+  if (conflict && conflictKey !== addConflictConfirmed) {
+    addConflictConfirmed = conflictKey;
+    const otherTitle = conflict.firstItemId === candidate.id ? conflict.secondTitle : conflict.firstTitle;
+    showAddFormError(`Schedule conflict: ${candidate.title} overlaps with ${otherTitle} from ${formatTime(conflict.overlapStart)} to ${formatTime(conflict.overlapEnd)}. Revise the time or select Save anyway.`);
+    document.querySelector("#saveItemButton").textContent = "Save anyway";
     return;
   }
+  const saveButton = document.querySelector("#saveItemButton");
+  addWriteInProgress = true;
+  saveButton.disabled = true;
+  saveButton.setAttribute("aria-busy", "true");
+  saveButton.textContent = "Saving…";
+  document.querySelector("#closeAddButton").disabled = true;
+  let result;
+  try {
+    result = editingItemId
+      ? await saUpdateItem(editingItemId, updates)
+      : await saCreateItem({ ...updates, status: "upcoming", postponed: 0 });
+  } catch {
+    console.error(editingItemId ? "schedule_update_failed" : "schedule_create_failed");
+    result = { success: false };
+  } finally {
+    addWriteInProgress = false;
+    saveButton.removeAttribute("aria-busy");
+    document.querySelector("#closeAddButton").disabled = false;
+  }
+  if (!result?.success) {
+    saveButton.disabled = false;
+    saveButton.textContent = addConflictConfirmed ? "Save anyway" : (editingItemId ? "Save changes" : "Save item");
+    showAddFormError("The item could not be saved. Try again.");
+    return;
+  }
+  if (result.item && typeof window.refreshAssistantScheduleItem === "function") {
+    window.refreshAssistantScheduleItem(result.item, editingItemId ? "updated" : "created");
+  }
   els.form.reset();
+  editingItemId = null;
+  addConflictConfirmed = "";
   els.form.date.value = localDateString(new Date());
   updateDateDisplay(els.form.date.value);
+  els.form.elements.type.value = "activity";
+  els.recurrenceFrequency.value = "";
+  els.form.elements.recurrenceInterval.value = "1";
+  window.customSelectType?.sync(false);
+  window.customSelectFrequency?.sync(false);
+  window.customSelectCategory?.sync(false);
   updateTimeDisplay("start", "");
   updateTimeDisplay("end", "");
   updateWeekdayButtons([]);
+  clearAddFormError();
   updateFieldVisibility("activity");
   els.dialog.close();
-  render();
+  } catch {
+    console.error("[schedule-save] add_validation_exception");
+    addWriteInProgress = false;
+    const saveButton = document.querySelector("#saveItemButton");
+    saveButton.disabled = false;
+    saveButton.removeAttribute("aria-busy");
+    saveButton.textContent = editingItemId ? "Save changes" : "Save item";
+    document.querySelector("#closeAddButton").disabled = false;
+    showAddFormError("The item could not be saved. Try again.");
+  }
+});
+
+els.form.addEventListener("input", () => {
+  clearAddFormError();
+  addConflictConfirmed = "";
+  const button = document.querySelector("#saveItemButton");
+  if (button && !addWriteInProgress) button.textContent = editingItemId ? "Save changes" : "Save item";
+});
+els.form.addEventListener("change", () => {
+  clearAddFormError();
+  addConflictConfirmed = "";
+  const button = document.querySelector("#saveItemButton");
+  if (button && !addWriteInProgress) button.textContent = editingItemId ? "Save changes" : "Save item";
 });
 
 // ── Date picker ────────────────────────────────────────────────────────────
@@ -1365,7 +1520,6 @@ function openDatePicker() {
   renderDateGrid();
   openPopoverAt({ trigger, panel, close: closeDatePicker });
   positionPanel(panel, trigger);
-  panel.hidden = false;
   trigger.setAttribute("aria-expanded", "true");
 }
 
@@ -1431,6 +1585,7 @@ function selectDate(dateStr) {
   datePickerState.selected = dateStr;
   const hidden = document.querySelector("#dateHidden");
   hidden.value = dateStr;
+  hidden.dispatchEvent(new Event("change", { bubbles: true }));
   updateDateDisplay(dateStr);
   renderDateGrid();
   closeDatePicker();
@@ -1484,7 +1639,6 @@ function openTimePicker(field) {
   renderTimePicker();
   openPopoverAt({ trigger, panel, close: () => closeTimePicker(field) });
   positionPanel(panel, trigger);
-  panel.hidden = false;
   trigger.setAttribute("aria-expanded", "true");
 }
 
@@ -1522,6 +1676,7 @@ function confirmTimePicker() {
   const timeStr = `${String(h24).padStart(2,"0")}:${String(minute).padStart(2,"0")}`;
   const hidden = document.querySelector(`#${field}Hidden`);
   hidden.value = timeStr;
+  hidden.dispatchEvent(new Event("change", { bubbles: true }));
   updateTimeDisplay(field, timeStr);
   closeTimePicker(field);
 }
@@ -1529,6 +1684,7 @@ function confirmTimePicker() {
 function clearTimePicker(field) {
   const hidden = document.querySelector(`#${field}Hidden`);
   hidden.value = "";
+  hidden.dispatchEvent(new Event("change", { bubbles: true }));
   updateTimeDisplay(field, "");
   const clearBtn = document.querySelector(`#${field}TimeClear`);
   if (clearBtn) clearBtn.hidden = true;
@@ -1560,6 +1716,9 @@ document.querySelectorAll(".weekday-button").forEach(btn => {
   btn.addEventListener("click", () => {
     const pressed = btn.getAttribute("aria-pressed") === "true";
     btn.setAttribute("aria-pressed", String(!pressed));
+    clearAddFormError();
+    addConflictConfirmed = "";
+    document.querySelector("#saveItemButton").textContent = editingItemId ? "Save changes" : "Save item";
   });
 });
 

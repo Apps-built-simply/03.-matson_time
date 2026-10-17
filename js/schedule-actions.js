@@ -58,7 +58,10 @@ async function saCreateItem(item) {
   };
   if (item.recurrence) newItem.recurrence = item.recurrence;
   try { await firebaseStore.createScheduleItem(newItem); }
-  catch { return { success: false, error: "Could not save this item. Check your connection and retry." }; }
+  catch {
+    console.error("schedule_create_failed");
+    return { success: false, error: "Could not save this item. Check your connection and retry." };
+  }
   items.push(newItem);
   triggerScheduleRender();
   return { success: true, item: newItem };
@@ -86,7 +89,10 @@ async function saUpdateItem(id, updates) {
   const error = scheduleValidateItem(updated);
   if (error) return { success: false, error };
   try { await firebaseStore.updateScheduleItem(id, normalizedUpdates); }
-  catch { return { success: false, error: "Could not save this change. Check your connection and retry." }; }
+  catch {
+    console.error("schedule_update_failed");
+    return { success: false, error: "Could not save this change. Check your connection and retry." };
+  }
   items[index] = updated;
   triggerScheduleRender();
   return { success: true, item: updated };
@@ -333,7 +339,25 @@ function saCalculateWeeklyProgress(startDate = null) {
 }
 
 function saGetAvailableCategories() {
-  return Object.keys(categoryColors);
+  const normalizeNames = categories => {
+    if (!Array.isArray(categories)) return [];
+    const names = [];
+    const seen = new Set();
+    for (const category of categories) {
+      const rawName = typeof category === "string" ? category : category?.name;
+      if (typeof rawName !== "string") continue;
+      const name = rawName.trim();
+      const key = name.toLocaleLowerCase();
+      if (!name || seen.has(key)) continue;
+      seen.add(key);
+      names.push(name);
+    }
+    return names;
+  };
+
+  const loadedCategories = normalizeNames(window.cloudCategories);
+  if (loadedCategories.length) return loadedCategories;
+  return normalizeNames(window.defaultCategories);
 }
 
 function saGetAvailableItemTypes() {

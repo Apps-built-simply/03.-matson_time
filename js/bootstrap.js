@@ -16,6 +16,7 @@ const defaultCategories = [
   { id: "meetings", name: "Meetings", color: "#F97316" },
   { id: "travel", name: "Travel", color: "#6366F1" }
 ];
+window.defaultCategories = defaultCategories;
 
 function showLoading() {
   loading.hidden = false;

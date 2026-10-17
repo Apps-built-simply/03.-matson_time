@@ -101,6 +101,10 @@ function rememberScheduleEntity(item, lastAction = "updated", mentions = []) {
     lastMentionedOrder: conversation.length
   }].slice(-10);
 }
+window.refreshAssistantScheduleItem = (item, lastAction = "updated") => {
+  rememberScheduleEntity(item, lastAction, ["that", "it", item?.title]);
+  savePlanningContext();
+};
 function saveConversation() { /* Conversation writes are queued by appendEntry. */ }
 
 function deriveConversationTitle(rawText) {
@@ -2614,6 +2618,7 @@ function updateComposerHeight() {
   assistantEls.input.style.height = "auto";
   const newHeight = Math.min(assistantEls.input.scrollHeight, 130);
   assistantEls.input.style.height = newHeight + "px";
+  updateConversationPadding();
 }
 
 // ── Context menu ──────────────────────────────────────────────────────────────
@@ -2673,20 +2678,32 @@ function updateSendButtonState() {
 }
 
 // ── Quick questions accordion ───────────────────────────────────────────
-// Compact, logic-only suggested prompts beneath the composer. The visible
+// Compact, logic-only suggested prompts inside the composer. The visible
 // wording is trusted static text; the handler is resolved through the stable
 // data-quick-question identifier, never by parsing the button label.
 let quickQuestionsOpen = false;
 
-// Reserves conversation scroll space for the composer region (composer +
-// quick-questions control) so the last message never hides beneath it. The
+// Reserves conversation scroll space for the composer region so the last
+// message never hides beneath it. The
 // quick-questions panel overlays the conversation temporarily and does not
 // add to this reserved space.
 function updateConversationPadding() {
   if (!assistantEls.conversation) return;
   const region = assistantEls.quickQuestionsControl?.closest(".assistant-composer-region");
   if (!region) return;
-  assistantEls.conversation.style.paddingBottom = `${region.offsetHeight + 8}px`;
+  const composer = region.querySelector(".assistant-composer");
+  if (!composer) return;
+  const regionStyle = getComputedStyle(region);
+  const notice = region.querySelector(".voice-notice");
+  const noticeClearance = notice && !notice.hidden
+    ? notice.offsetHeight + (parseFloat(getComputedStyle(notice).marginBottom) || 0)
+    : 0;
+  const rootStyle = getComputedStyle(document.documentElement);
+  const footerGap = parseFloat(rootStyle.getPropertyValue("--assistant-footer-gap")) || 12;
+  const internalSpacing = parseFloat(regionStyle.paddingTop) || 0;
+  // The fixed footer clearance stays below this flex item and is deliberately
+  // excluded; reserving the whole region would count the footer twice.
+  assistantEls.conversation.style.paddingBottom = `${Math.ceil(composer.offsetHeight + internalSpacing + noticeClearance + footerGap + 8)}px`;
 }
 
 const quickQuestionSpecs = {
@@ -2740,9 +2757,13 @@ function refreshQuickQuestionsLayout() {
   const panel = assistantEls.quickQuestionsPanel;
   const control = assistantEls.quickQuestionsControl;
   if (!panel || !control) return;
-  const controlRect = control.getBoundingClientRect();
-  const available = Math.floor(controlRect.top) - 8;
-  panel.style.maxHeight = `${Math.max(100, available)}px`;
+  const composerRect = control.closest(".assistant-composer")?.getBoundingClientRect();
+  if (!composerRect) return;
+  const vv = window.visualViewport;
+  const viewportTop = vv ? vv.offsetTop : 0;
+  const available = Math.floor(composerRect.top - viewportTop - 12);
+  panel.style.maxHeight = `${Math.max(72, available)}px`;
+  panel.style.maxWidth = `${Math.max(180, Math.min(320, window.innerWidth - composerRect.left - 24))}px`;
   scrollToBottom();
 }
 
@@ -2781,11 +2802,9 @@ async function handleQuickQuestion(id) {
 function submitInput() {
   const value = assistantEls.input.value;
   if (!value.trim() || sendInProgress) return;
+  // sendMessage clears only after the conversation has been accepted, so a
+  // conversation-creation failure leaves the draft available for retry.
   sendMessage(value);
-  assistantEls.input.value = "";
-  updateComposerHeight();
-  updateSendButtonState();
-  assistantEls.input.focus();
 }
 
 function renderProposalButton(button, action) {
@@ -2833,7 +2852,6 @@ assistantEls.input?.addEventListener("input", () => {
   if (activeConversationId) {
     composerDrafts.set(activeConversationId, assistantEls.input.value);
   }
-  updateConversationPadding();
   if (quickQuestionsOpen) refreshQuickQuestionsLayout();
 });
 
@@ -2860,12 +2878,23 @@ window.addEventListener("resize", () => {
   updateConversationPadding();
   if (quickQuestionsOpen) refreshQuickQuestionsLayout();
 });
+window.visualViewport?.addEventListener("resize", () => {
+  updateConversationPadding();
+  if (quickQuestionsOpen) refreshQuickQuestionsLayout();
+});
+window.visualViewport?.addEventListener("scroll", () => {
+  if (quickQuestionsOpen) refreshQuickQuestionsLayout();
+});
 
 assistantEls.voice?.addEventListener("click", () => {
   if (!assistantEls.voiceNotice) return;
   assistantEls.voiceNotice.hidden = false;
+  updateConversationPadding();
   clearTimeout(voiceNoticeTimer);
-  voiceNoticeTimer = setTimeout(() => { assistantEls.voiceNotice.hidden = true; }, 3000);
+  voiceNoticeTimer = setTimeout(() => {
+    assistantEls.voiceNotice.hidden = true;
+    updateConversationPadding();
+  }, 3000);
 });
 
 assistantEls.historyButton?.addEventListener("click", openDrawer);
