@@ -7,6 +7,7 @@ let attentionCarouselIndex = 0;
 let attentionCarouselInitialized = false;
 let attentionSelectedItemId = null;
 let attentionItems = [];
+let attentionUnderlineAnimatedItemId = null;
 let cancelTargetId = null;
 let cancelTrigger = null;
 let cancellationCommitted = false;
@@ -40,7 +41,7 @@ const attentionVisuals = {
 
 const els = {
   todayView: document.querySelector("#todayView"), calendarView: document.querySelector("#calendarView"), assistantView: document.querySelector("#assistantView"), progressView: document.querySelector("#progressView"),
-  todayMain: document.querySelector("#todayMain"), emptyDay: document.querySelector("#emptyDayState"), emptyAdd: document.querySelector("#emptyAddButton"), attentionSection: document.querySelector("#attentionSection"), todayScheduleSection: document.querySelector("#todayScheduleSection"), dailyProgress: document.querySelector("#dailyProgress"),
+  todayMain: document.querySelector("#todayMain"), emptyDay: document.querySelector("#emptyDayState"), emptyAdd: document.querySelector("#emptyAddButton"), attentionSection: document.querySelector("#attentionSection"), todayScheduleSection: document.querySelector("#todayScheduleSection"),
   list: document.querySelector("#scheduleList"), count: document.querySelector("#scheduleCount"),
   now: document.querySelector("#nowCard"), conflict: document.querySelector("#conflictNotice"),
   monthYear: document.querySelector("#monthYear"), calendarGrid: document.querySelector("#calendarGrid"), calendarCard: document.querySelector("#calendarCard"),
@@ -164,11 +165,21 @@ function scheduleItemNode(item, todayStyle = false, calendarDate = null) {
   const isTodayCalendarDate = calendarListing && calendarDate === localDateString(new Date());
   const routesToTodayHero = (todayStyle || isTodayCalendarDate) && activeStatuses.includes(item.status) && !item.schedulePending;
   const selectable = (todayStyle && routesToTodayHero) || calendarListing;
-  article.className = `schedule-item${selectable ? " is-selectable" : ""}${attentionSelectedItemId === item.id ? " is-hero-selected" : ""}`;
+  const isSelectedTodayHero = todayStyle && routesToTodayHero && attentionSelectedItemId === item.id;
+  article.className = `schedule-item${selectable ? " is-selectable" : ""}${isSelectedTodayHero ? " is-hero-selected" : ""}`;
+  if (isSelectedTodayHero) {
+    const visual = attentionVisuals[item.category] || attentionVisuals.Personal;
+    article.style.setProperty("--selected-category-accent", `var(--category-${visual.className})`);
+    if (attentionUnderlineAnimatedItemId !== item.id) {
+      article.classList.add("is-category-separator-entering");
+      attentionUnderlineAnimatedItemId = item.id;
+    }
+  }
   if (selectable) {
     article.tabIndex = 0;
     article.setAttribute("role", "button");
-    article.setAttribute("aria-label", routesToTodayHero ? `Show ${item.title} in Today focus` : `View ${item.title} details`);
+    article.setAttribute("aria-label", isSelectedTodayHero ? `Current focus item: ${item.title}` : routesToTodayHero ? `Show ${item.title} in Today focus` : `View ${item.title} details`);
+    if (isSelectedTodayHero) article.setAttribute("aria-current", "true");
     if (routesToTodayHero) article.dataset.todayHeroItem = item.id;
     else if (calendarListing) article.dataset.calendarItem = item.id;
   }
@@ -201,6 +212,7 @@ function renderAttention(dateItems, heroItems = getAttentionItems(dateItems)) {
   if (!attentionItems.length) {
     attentionCarouselIndex = 0;
     attentionSelectedItemId = null;
+    attentionUnderlineAnimatedItemId = null;
     attentionCarouselInitialized = false;
     const empty = document.createElement("div");
     empty.className = "attention-empty";
@@ -343,24 +355,21 @@ function render() {
   const heroItems = getAttentionItems(todayItems);
   const todayState = resolveTodayState(todayItems, heroItems);
   els.todayMain.dataset.todayState = todayState;
-  const completed = todayItems.filter(item => item.status === "completed").length;
-  const remaining = todayItems.filter(item => !["completed", "cancelled"].includes(item.status)).length;
   const hasTodayItems = todayItems.length > 0;
   els.emptyDay.hidden = hasTodayItems;
   els.todayMain.classList.toggle("is-empty", !hasTodayItems);
   els.attentionSection.hidden = !hasTodayItems;
   els.todayScheduleSection.hidden = !hasTodayItems;
-  els.dailyProgress.hidden = !hasTodayItems;
 
   if (hasTodayItems) {
     els.count.textContent = `${todayItems.length} item${todayItems.length === 1 ? "" : "s"}`;
-    els.dailyProgress.textContent = `${completed} completed · ${remaining} remaining`;
     renderAttention(todayItems, heroItems);
     renderSchedule(sortTodayItems(todayItems), els.list, els.conflict, "No items planned for today.", true);
   } else {
     attentionItems = [];
     attentionCarouselIndex = 0;
     attentionSelectedItemId = null;
+    attentionUnderlineAnimatedItemId = null;
     attentionCarouselInitialized = false;
     els.list.replaceChildren();
     els.now.replaceChildren();

@@ -117,9 +117,7 @@ main { flex: 1; padding-bottom: 96px; }
 section { margin-top: 28px; }
 .section-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin-bottom: 12px; }
 
-/* Today: understated attention, schedule, and progress hierarchy */
-.progress-summary { margin: 18px 0 0; color: var(--color-muted); font-size: .82rem; }
-.today-main .progress-summary[hidden] { display: none; }
+/* Today: understated attention and schedule hierarchy */
 .empty-day { display: grid; justify-items: center; align-content: center; gap: 10px; min-height: min(56vh, 440px); margin: auto; padding-block: 30px; }
 .today-main .empty-day[hidden] { display: none; }
 .empty-day h2 { font-size: 1.38rem; font-weight: 600; }
@@ -213,17 +211,25 @@ section { margin-top: 28px; }
 #todayView .schedule-item .schedule-meta { color: var(--color-text-secondary); }
 #todayView .schedule-item .schedule-time { color: #AAB2BF; font-weight: 400; }
 #todayView .schedule-item.is-selectable { cursor: pointer; }
-#todayView .schedule-item.is-selectable:hover { background: rgba(255, 255, 255, .025); }
+#todayView .schedule-item.is-selectable:hover,
+#todayView .schedule-item.is-selectable:active { background: transparent; }
 #todayView .schedule-item.is-selectable:hover h3, #todayView .schedule-item.is-hero-selected h3 { color: #F4F7FC; }
 #todayView .schedule-item.is-selectable:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--color-primary-hover); outline-offset: -2px; }
-#todayView .schedule-item.is-hero-selected { background: rgba(255, 255, 255, .018); }
+#todayView .schedule-item.is-hero-selected,
+#todayView .schedule-item.is-hero-selected.is-selectable:hover { background: transparent; }
+#todayView .schedule-item.is-hero-selected { position: relative; border-bottom-color: transparent; }
+#todayView .schedule-item.is-hero-selected::after { content: ""; position: absolute; z-index: 1; right: 0; bottom: -1px; left: 0; height: 2px; border-radius: 999px; background: var(--selected-category-accent, var(--category-personal)); transform: scaleX(1); transform-origin: left center; pointer-events: none; }
+#todayView .schedule-item.is-category-separator-entering::after { animation: today-category-separator-in 360ms cubic-bezier(.2, .7, .3, 1) both; }
+@keyframes today-category-separator-in { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@media (prefers-reduced-motion: reduce) {
+  #todayView .schedule-item.is-category-separator-entering::after { animation: none; transform: scaleX(1); }
+}
 #todayView .empty-state { padding: 8px 0; border: 0; border-radius: 0; background: transparent; text-align: left; color: var(--color-muted); }
 
 #todayView .conflict, #calendarView .conflict { margin-bottom: 12px; padding: 10px 12px; border: 0; border-radius: 6px; background: rgba(184, 112, 48, .12); color: #C99568; font-size: .85rem; font-weight: 400; box-shadow: none; }
 #todayView .conflict strong, .conflict-line { font-weight: 400; }
 .conflict-line { margin: 0; }
 .conflict-line + .conflict-line { margin-top: 5px; }
-#todayView .progress-summary { color: #929EAE; font-weight: 400; }
 .conflict strong { font-weight: 400; }
 .empty-state { padding: 26px 18px; text-align: center; color: var(--color-muted); border: 1px dashed var(--color-border); border-radius: var(--radius); }
 
@@ -270,7 +276,9 @@ section { margin-top: 28px; }
 .date-entry-error[hidden] { display: none; }
 #calendarView .schedule-item.is-selectable { cursor: pointer; }
 #calendarView .schedule-item { grid-template-columns: minmax(0, 1fr) auto; gap: 12px; }
-#calendarView .schedule-item.is-selectable:hover { background: rgba(255, 255, 255, .025); }
+#calendarView .schedule-item.is-selectable:hover,
+#calendarView .schedule-item.is-selectable:active { background: transparent; }
+#calendarView .schedule-item.is-selectable:hover h3 { color: #F4F7FC; }
 #calendarView .schedule-item.is-selectable:focus-visible { position: relative; z-index: 1; outline: 2px solid var(--color-primary-hover); outline-offset: -2px; }
 #calendarView .item-status.status-upcoming { color: var(--status-upcoming); }
 #calendarView .item-status.status-in-progress { color: var(--status-in-progress); }
