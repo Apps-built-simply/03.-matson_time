@@ -922,6 +922,17 @@ section { margin-top: 28px; }
 .proposal-changes li { color: var(--color-text-secondary); font-size: .82rem; }
 .proposal-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .proposal-actions button { min-height: 40px; flex: 1; }
+.guided-controls-message { width: fit-content; max-width: min(92%, 440px); }
+.guided-controls,
+.guided-summary-card { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
+.guided-controls > button,
+.guided-control-actions > button { width: fit-content; min-height: 40px; padding-inline: 12px; }
+.guided-control-actions { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; margin-top: 4px; }
+.guided-controls [aria-pressed="true"] { border-color: var(--color-primary); background: var(--color-surface); }
+.guided-summary-card { display: grid; justify-items: start; gap: 5px; min-width: min(280px, 80vw); padding: 14px; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-surface); }
+.guided-summary-card h3 { margin: 0 0 3px; color: var(--color-text); font-size: 1rem; font-weight: 600; }
+.guided-summary-card p { margin: 0; color: var(--color-text-secondary); font-size: .88rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.guided-summary-card .guided-conflict { color: #fca5a5; }
 
 /* Progress — factual schedule summary, no scoring */
 .progress-page-header {

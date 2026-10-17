@@ -67,6 +67,8 @@ let deletingConversationId = null;
 let renamingConversationId = null;
 let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ role: message.role, text: message.text, kind: message.kind, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [], deletedItemIds: message.deletedItemIds || [] })) : [];
 let activeConversationId = window.initialConversation?.id || window.initialAssistantState?.activeConversationId || null;
+let guidedFlowsByConversation = window.initialAssistantState?.guidedFlowsByConversation && typeof window.initialAssistantState.guidedFlowsByConversation === "object" ? { ...window.initialAssistantState.guidedFlowsByConversation } : {};
+let guidedFlow = activeConversationId ? (guidedFlowsByConversation[activeConversationId] || (window.initialAssistantState?.activeConversationId === activeConversationId ? window.initialAssistantState?.guidedFlow : null)) : null;
 let pendingClarification = window.initialAssistantState?.pendingClarification || null;
 let entityRegistry = Array.isArray(window.initialAssistantState?.entityRegistry) ? window.initialAssistantState.entityRegistry.slice(-10) : [];
 let pendingOperation = window.initialAssistantState?.pendingOperation || null;
@@ -87,7 +89,14 @@ function loadPendingMessageWrites() {
   catch { return []; }
 }
 function savePlanningContext() {
-  firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction, currentTopic: activePlanningContext?.topic || pendingOperation?.intent || null }).catch(showPersistenceFailure);
+  firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction, guidedFlow, guidedFlowsByConversation, currentTopic: activePlanningContext?.topic || pendingOperation?.intent || null }).catch(showPersistenceFailure);
+}
+function saveGuidedFlow() {
+  if (activeConversationId) {
+    if (guidedFlow) guidedFlowsByConversation[activeConversationId] = guidedFlow;
+    else delete guidedFlowsByConversation[activeConversationId];
+  }
+  return firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction, guidedFlow, guidedFlowsByConversation }).catch(() => { showPersistenceFailure(); return false; });
 }
 function rememberScheduleEntity(item, lastAction = "updated", mentions = []) {
   if (!item?.id) return;
@@ -156,7 +165,7 @@ function conversationSummary(status = "active") {
 async function ensureConversation() {
   if (activeConversationId) return activeConversationId;
   activeConversationId = await firebaseStore.createConversation({ title: "New conversation", status: "active" });
-  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction, guidedFlow, guidedFlowsByConversation });
   loadDrawerConversations().catch(() => {});
   return activeConversationId;
 }
@@ -503,6 +512,7 @@ async function startNewConversation() {
     }
 
     if (activeConversationId) {
+      await saveGuidedFlow();
       composerDrafts.set(activeConversationId, assistantEls.input.value);
       await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
       await firebaseStore.updateConversationSummary(activeConversationId, { status: "archived" }).catch(() => {});
@@ -511,6 +521,7 @@ async function startNewConversation() {
     const newId = await firebaseStore.createConversation({ title: "New conversation", status: "active" });
     activeConversationId = newId;
     conversation = [];
+    guidedFlow = null;
     currentProposal = null;
     pendingClarification = null;
     activePlanningContext = null;
@@ -525,7 +536,9 @@ async function startNewConversation() {
       entityRegistry: [],
       pendingOperation: null,
       referencedSets: [],
-      lastConfirmedAction: null
+      lastConfirmedAction: null,
+      guidedFlow: null,
+      guidedFlowsByConversation
     }).catch(showPersistenceFailure);
 
     renderConversation();
@@ -558,6 +571,7 @@ async function openConversation(id) {
 
   try {
     if (activeConversationId) {
+      await saveGuidedFlow();
       composerDrafts.set(activeConversationId, assistantEls.input.value);
       if (activeConversationId !== id) {
         await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("archived")).catch(() => {});
@@ -581,6 +595,10 @@ async function openConversation(id) {
 
     const state = await firebaseStore.loadAssistantState();
     const isActive = state.activeConversationId === id;
+    guidedFlowsByConversation = state.guidedFlowsByConversation && typeof state.guidedFlowsByConversation === "object" ? { ...state.guidedFlowsByConversation } : guidedFlowsByConversation;
+    guidedFlow = guidedFlowsByConversation[id] || (isActive ? state.guidedFlow || null : null);
+    pendingQuickQuestionId = guidedFlow?.queuedQuickQuestion || null;
+    if (guidedFlow) guidedFlowsByConversation[id] = guidedFlow;
     pendingClarification = isActive ? state.pendingClarification : null;
     activePlanningContext = isActive ? state.planningContext : null;
     entityRegistry = isActive && Array.isArray(state.entityRegistry) ? state.entityRegistry.slice(-10) : [];
@@ -595,7 +613,9 @@ async function openConversation(id) {
       entityRegistry,
       pendingOperation,
       referencedSets,
-      lastConfirmedAction
+      lastConfirmedAction,
+      guidedFlow,
+      guidedFlowsByConversation
     }).catch(showPersistenceFailure);
 
     assistantEls.input.value = composerDrafts.get(id) || "";
@@ -834,6 +854,7 @@ function renderConversation(options = {}) {
   if (conversation.length > 0) {
     scrollToBottom();
   }
+  renderGuidedControls();
 }
 
 function renderProposal(proposal) {
@@ -2140,6 +2161,11 @@ async function sendMessage(rawText) {
 
     appendEntry({ role: "user", text });
 
+    if (guidedFlow) {
+      await handleGuidedAnswer(text);
+      return;
+    }
+
     if (/^(?:never mind|forget (?:it|that|the plan)|drop the plan|cancel (?:this|the) plan|abandon (?:this|the) plan)$/i.test(text.trim())) {
       activePlanningContext = null;
       pendingClarification = null;
@@ -2707,13 +2733,573 @@ function updateConversationPadding() {
 }
 
 const quickQuestionSpecs = {
-  today_schedule: { label: "What do I have today?", run: answerHaveToday },
-  current_attention: { label: "What should I do now?", run: answerWhatNow },
-  next_item: { label: "What is coming next?", run: answerComingNext },
-  remaining_today: { label: "What is still remaining today?", run: answerRemaining },
-  missed_this_week: { label: "What did I miss this week?", run: answerMissedWeek },
-  open_add_item: { label: "Add something to my schedule", run: null }
+  schedule_today: { label: "What do I have today?", run: answerScheduleToday },
+  schedule_week: { label: "What do I have this week?", run: answerScheduleWeek },
+  schedule_month: { label: "What do I have this month?", run: answerScheduleMonth },
+  attention_now: { label: "What needs my attention?", run: answerAttentionNow },
+  free_time_week: { label: "When am I free this week?", run: answerFreeTimeWeek },
+  guided_add: { label: "Add something to my schedule", run: null }
 };
+
+const KAMPALA_TIME_ZONE = "Africa/Kampala";
+const DAILY_AVAILABILITY_WINDOW = Object.freeze({ start: 8 * 60, end: 22 * 60 });
+const GUIDED_WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function kampalaDate(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: KAMPALA_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+  const value = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
+}
+function dateAsUtcParts(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || "");
+  if (!match) return null;
+  const [year, month, day] = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? date : null;
+}
+function dateFromUtc(date) { return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`; }
+function addCalendarDays(value, count) { const date = dateAsUtcParts(value); if (!date) return ""; date.setUTCDate(date.getUTCDate() + count); return dateFromUtc(date); }
+function weekdayForDate(value) { return dateAsUtcParts(value)?.getUTCDay() ?? -1; }
+function formatKampalaDate(value, options = { weekday: "long", day: "numeric", month: "long" }) {
+  const date = dateAsUtcParts(value);
+  return date ? new Intl.DateTimeFormat("en", { ...options, timeZone: KAMPALA_TIME_ZONE }).format(date) : "Date not set";
+}
+function formatScheduleStatus(status) {
+  const readable = ({ "in-progress": "in progress", "awaiting-check-in": "awaiting check-in" })[status] || String(status || "upcoming").replaceAll("-", " ");
+  return readable.charAt(0).toUpperCase() + readable.slice(1);
+}
+function formatKampalaTime(value) {
+  const match = /^(\d{2}):(\d{2})$/.exec(value || "");
+  if (!match) return "Anytime";
+  const hour = Number(match[1]);
+  return `${hour % 12 || 12}:${match[2]} ${hour >= 12 ? "PM" : "AM"}`;
+}
+function recurrenceOccursOn(item, date) {
+  if (item.schedulePending || !item.date || date < item.date) return false;
+  if (item.status === "postponed") return item.date === date;
+  const recurrence = item.recurrence;
+  if (!recurrence) return item.date === date;
+  const start = dateAsUtcParts(item.date);
+  const target = dateAsUtcParts(date);
+  if (!start || !target) return false;
+  const interval = Math.max(1, Number(recurrence.interval) || 1);
+  const dayDiff = Math.round((target.getTime() - start.getTime()) / 86400000);
+  if (recurrence.frequency === "daily") return dayDiff % interval === 0;
+  if (recurrence.frequency === "weekly") {
+    const startMonday = new Date(start);
+    startMonday.setUTCDate(startMonday.getUTCDate() - ((startMonday.getUTCDay() + 6) % 7));
+    const targetMonday = new Date(target);
+    targetMonday.setUTCDate(targetMonday.getUTCDate() - ((targetMonday.getUTCDay() + 6) % 7));
+    const weekDiff = Math.round((targetMonday.getTime() - startMonday.getTime()) / (7 * 86400000));
+    const days = Array.isArray(recurrence.days) ? recurrence.days : [];
+    return weekDiff >= 0 && weekDiff % interval === 0 && (days.length ? days.includes(target.getUTCDay()) : target.getUTCDay() === start.getUTCDay());
+  }
+  if (recurrence.frequency === "monthly") {
+    const monthDiff = (target.getUTCFullYear() - start.getUTCFullYear()) * 12 + target.getUTCMonth() - start.getUTCMonth();
+    return monthDiff >= 0 && monthDiff % interval === 0 && target.getUTCDate() === start.getUTCDate();
+  }
+  return item.date === date;
+}
+function scheduleOccurrencesBetween(start, end) {
+  const occurrences = [];
+  for (let date = start; date <= end; date = addCalendarDays(date, 1)) {
+    for (const item of items) {
+      if (item.status === "postponed" && !item.date) continue;
+      if (recurrenceOccursOn(item, date)) occurrences.push({ ...item, effectiveDate: date });
+      else if (item.status === "postponed" && !item.recurrence && item.date === date && !item.schedulePending) occurrences.push({ ...item, effectiveDate: date });
+    }
+  }
+  return occurrences;
+}
+function compareScheduleOccurrences(a, b) {
+  const aTimed = Boolean(a.start);
+  const bTimed = Boolean(b.start);
+  if (!aTimed && !bTimed) return String(a.id).localeCompare(String(b.id));
+  return (aTimed === bTimed ? 0 : aTimed ? -1 : 1)
+    || (a.start || "").localeCompare(b.start || "")
+    || (a.end || "").localeCompare(b.end || "")
+    || String(a.id).localeCompare(String(b.id));
+}
+function quickQuestionRows(occurrences, includeDate = false) {
+  return [...occurrences].sort((a, b) => includeDate ? a.effectiveDate.localeCompare(b.effectiveDate) || compareScheduleOccurrences(a, b) : compareScheduleOccurrences(a, b)).map(item => ({
+    time: `${includeDate ? `${formatKampalaDate(item.effectiveDate, { weekday: "short", day: "numeric", month: "short" })} · ` : ""}${item.start ? `${formatKampalaTime(item.start)}${item.end ? ` – ${formatKampalaTime(item.end)}` : ""}` : "Untimed"}`,
+    title: item.title,
+    status: formatScheduleStatus(item.status)
+  }));
+}
+function quickQuestionGroupedText(occurrences) {
+  const byDate = new Map();
+  for (const item of [...occurrences].sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate) || compareScheduleOccurrences(a, b))) {
+    if (!byDate.has(item.effectiveDate)) byDate.set(item.effectiveDate, []);
+    const time = item.start ? `${formatKampalaTime(item.start)}${item.end ? `–${formatKampalaTime(item.end)}` : ""}` : "Untimed";
+    byDate.get(item.effectiveDate).push(`• ${time} · ${item.title} (${formatScheduleStatus(item.status)})`);
+  }
+  return [...byDate.entries()].map(([date, rows]) => `${formatKampalaDate(date)}\n${rows.join("\n")}`).join("\n\n");
+}
+function currentKampalaTimeMinutes() {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone: KAMPALA_TIME_ZONE, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return Number(values.hour) * 60 + Number(values.minute);
+}
+function answerScheduleToday() {
+  const today = kampalaDate();
+  const todayItems = scheduleOccurrencesBetween(today, today);
+  return todayItems.length ? { text: `You have ${todayItems.length} item${todayItems.length === 1 ? "" : "s"} planned for today.`, items: quickQuestionRows(todayItems) } : { text: "You have nothing planned for today." };
+}
+function answerScheduleWeek() {
+  const today = kampalaDate();
+  const monday = addCalendarDays(today, -((weekdayForDate(today) + 6) % 7));
+  const sunday = addCalendarDays(monday, 6);
+  const range = scheduleOccurrencesBetween(monday, sunday);
+  if (!range.length) return { text: "You have nothing planned for this week." };
+  return { text: `This week:\n\n${quickQuestionGroupedText(range)}` };
+}
+function answerScheduleMonth() {
+  const today = kampalaDate();
+  const monthStart = `${today.slice(0, 7)}-01`;
+  const monthEndDate = dateAsUtcParts(monthStart);
+  monthEndDate.setUTCMonth(monthEndDate.getUTCMonth() + 1, 0);
+  const monthEnd = dateFromUtc(monthEndDate);
+  const range = scheduleOccurrencesBetween(monthStart, monthEnd);
+  if (!range.length) return { text: "You have nothing planned for this month." };
+  const visible = [...range].sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate) || compareScheduleOccurrences(a, b)).slice(0, 12);
+  return { text: `You have ${range.length} scheduled occurrence${range.length === 1 ? "" : "s"} this month${range.length > visible.length ? `; showing the first ${visible.length}` : ""}.\n\n${quickQuestionGroupedText(visible)}` };
+}
+function answerAttentionNow() {
+  const today = kampalaDate();
+  const now = currentKampalaTimeMinutes();
+  const todayItems = scheduleOccurrencesBetween(today, today).filter(item => !["completed", "cancelled", "missed"].includes(item.status));
+  const byPriority = status => todayItems.filter(item => item.status === status).sort(compareScheduleOccurrences)[0] || null;
+  const inProgress = byPriority("in-progress");
+  const overdue = byPriority("overdue");
+  const checkIn = byPriority("awaiting-check-in");
+  const next = todayItems.filter(item => item.status === "upcoming" && item.start && Number(item.start.slice(0, 2)) * 60 + Number(item.start.slice(3, 5)) >= now).sort(compareScheduleOccurrences)[0] || null;
+  const postponed = todayItems.filter(item => item.status === "postponed" && item.start).sort(compareScheduleOccurrences)[0] || null;
+  const task = todayItems.filter(item => item.type === "task" && !item.start).sort(compareScheduleOccurrences)[0] || null;
+  const item = inProgress || overdue || checkIn || next || postponed || task;
+  if (!item) return { text: "Nothing needs your attention right now." };
+  const reason = inProgress ? (item.end ? `is in progress until ${formatKampalaTime(item.end)}` : "is in progress")
+    : overdue ? "is overdue" : checkIn ? "is awaiting check-in" : next ? "is your next scheduled item today"
+      : postponed ? "is postponed and still scheduled today" : "is an untimed task for today";
+  const time = item.start ? `${formatKampalaTime(item.start)}${item.end ? ` – ${formatKampalaTime(item.end)}` : ""}` : "Untimed";
+  return { text: `${item.title} ${reason}.`, items: [{ time, title: item.title, status: formatScheduleStatus(item.status) }] };
+}
+function answerFreeTimeWeek() {
+  const today = kampalaDate();
+  const monday = addCalendarDays(today, -((weekdayForDate(today) + 6) % 7));
+  const sunday = addCalendarDays(monday, 6);
+  const activeStatuses = new Set(["upcoming", "in-progress", "overdue", "awaiting-check-in", "postponed"]);
+  const occurrences = scheduleOccurrencesBetween(monday, sunday).filter(item => item.start && item.end && activeStatuses.has(item.status));
+  const free = [];
+  for (let date = monday; date <= sunday; date = addCalendarDays(date, 1)) {
+    let cursor = date === today ? Math.max(DAILY_AVAILABILITY_WINDOW.start, currentKampalaTimeMinutes()) : DAILY_AVAILABILITY_WINDOW.start;
+    const intervals = occurrences.filter(item => item.effectiveDate === date).map(item => ({
+      start: Math.max(DAILY_AVAILABILITY_WINDOW.start, Number(item.start.slice(0, 2)) * 60 + Number(item.start.slice(3, 5))),
+      end: Math.min(DAILY_AVAILABILITY_WINDOW.end, Number(item.end.slice(0, 2)) * 60 + Number(item.end.slice(3, 5)))
+    })).filter(interval => interval.end > interval.start).sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged = [];
+    for (const interval of intervals) {
+      const last = merged[merged.length - 1];
+      if (last && interval.start <= last.end) last.end = Math.max(last.end, interval.end);
+      else merged.push({ ...interval });
+    }
+    for (const interval of merged) {
+      if (interval.start - cursor >= 30) free.push({ date, start: cursor, end: interval.start });
+      cursor = Math.max(cursor, interval.end);
+    }
+    if (DAILY_AVAILABILITY_WINDOW.end - cursor >= 30) free.push({ date, start: cursor, end: DAILY_AVAILABILITY_WINDOW.end });
+  }
+  if (!free.length) return { text: "You do not have an open period of at least 30 minutes this week." };
+  const clearest = free.sort((a, b) => (b.end - b.start) - (a.end - a.start) || a.date.localeCompare(b.date) || a.start - b.start).slice(0, 3);
+  const phrases = clearest.map(slot => `${formatKampalaDate(slot.date, { weekday: "long" })} from ${formatKampalaTime(`${String(Math.floor(slot.start / 60)).padStart(2, "0")}:${String(slot.start % 60).padStart(2, "0")}`)} to ${formatKampalaTime(`${String(Math.floor(slot.end / 60)).padStart(2, "0")}:${String(slot.end % 60).padStart(2, "0")}`)}`);
+  return { text: `Your clearest open period${phrases.length === 1 ? " is " : "s this week are "}${phrases.join(" and ")}.` };
+}
+
+const GUIDED_ADD_INITIAL_VALUES = Object.freeze({ itemType: null, title: null, date: null, start: null, end: null, category: null, notes: "", recurrence: null, weekdays: [] });
+let guidedSaveInProgress = false;
+let pendingQuickQuestionId = null;
+
+function guidedSteps(flow = guidedFlow) {
+  const type = flow?.values?.itemType;
+  const steps = ["type", "title", "date"];
+  if (type === "activity" || type === "routine") steps.push("start", "end");
+  if (type === "routine") {
+    steps.push("frequency", "interval");
+    if (flow.values.recurrence?.frequency === "weekly") steps.push("weekdays");
+  }
+  steps.push("category", "notes", "summary");
+  return steps;
+}
+function guidedPrompt(step, flow = guidedFlow) {
+  const type = flow?.values?.itemType;
+  if (step === "type") return "What would you like to add?";
+  if (step === "title") return type === "activity" ? "What is the activity called?" : type === "routine" ? "What is the routine called?" : "What is the task called?";
+  if (step === "date") return type === "routine" ? "What date should this routine start? Enter YYYY-MM-DD, today, or tomorrow." : "What date should it be scheduled for? Enter YYYY-MM-DD, today, or tomorrow.";
+  if (step === "start") return type === "routine" ? "What time should it start? You can also skip the time." : "What time should the activity start? Enter 2:00 PM or 14:00.";
+  if (step === "end") return type === "routine" ? "What time should it end? You can also skip the time." : "What time should the activity end? Enter 3:00 PM or 15:00.";
+  if (step === "frequency") return "How often should this routine repeat?";
+  if (step === "interval") return `How often should it repeat? Enter a positive number of ${flow.values.recurrence.frequency === "daily" ? "days" : flow.values.recurrence.frequency === "weekly" ? "weeks" : "months"}.`;
+  if (step === "weekdays") return "Which days should this routine repeat? Select one or more days, then continue.";
+  if (step === "category") return type === "task" ? "Choose a category, or skip this optional step." : "Choose a category.";
+  if (step === "notes") return "Would you like to add a note? Type it here or skip this step.";
+  return "Review the schedule details below.";
+}
+function guidedAppendAssistant(text) {
+  appendEntry({ role: "assistant", text });
+  renderGuidedControls();
+}
+async function beginGuidedAdd({ logUser = false } = {}) {
+  if (logUser) appendEntry({ role: "user", text: "Add something to my schedule." });
+  guidedFlow = { type: "create_schedule_item", step: "type", values: { ...GUIDED_ADD_INITIAL_VALUES, recurrence: null, weekdays: [] } };
+  await saveGuidedFlow();
+  guidedAppendAssistant(guidedPrompt("type"));
+}
+function guidedSummaryText(values) {
+  const lines = [values.title, formatKampalaDate(values.date), values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed", values.category || "Personal"];
+  if (values.notes) lines.push(values.notes);
+  if (values.recurrence) lines.push(`${values.recurrence.frequency[0].toUpperCase()}${values.recurrence.frequency.slice(1)} · every ${values.recurrence.interval}${values.recurrence.frequency === "daily" ? " day(s)" : values.recurrence.frequency === "weekly" ? " week(s)" : " month(s)"}${values.recurrence.frequency === "weekly" ? ` · ${values.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ")}` : ""}`);
+  return lines.join("\n");
+}
+function guidedCategoryNames() {
+  const names = typeof saGetAvailableCategories === "function" ? saGetAvailableCategories() : [];
+  return names.length ? names : [];
+}
+function guidedControlButton(label, action, value = null, className = "secondary-button") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.dataset.guidedAction = action;
+  if (value !== null) button.dataset.guidedValue = String(value);
+  button.textContent = label;
+  return button;
+}
+function renderGuidedControls() {
+  if (!assistantEls.conversation) return;
+  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  if (!guidedFlow) return;
+  const shell = document.createElement("div");
+  shell.id = "guidedControls";
+  shell.className = "message assistant-message guided-controls-message";
+  const controls = document.createElement("div");
+  controls.className = guidedFlow.step === "summary" ? "guided-summary-card" : "guided-controls";
+  const values = guidedFlow.values;
+
+  if (guidedFlow.step === "summary") {
+    const title = document.createElement("h3");
+    title.textContent = values.title || "Schedule item";
+    const date = document.createElement("p");
+    date.textContent = formatKampalaDate(values.date);
+    const time = document.createElement("p");
+    time.textContent = values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed";
+    const category = document.createElement("p");
+    category.textContent = values.category || "Personal";
+    controls.append(title, date, time, category);
+    if (values.recurrence) {
+      const repeat = document.createElement("p");
+      repeat.textContent = `${values.recurrence.frequency[0].toUpperCase()}${values.recurrence.frequency.slice(1)} · every ${values.recurrence.interval}${values.recurrence.frequency === "weekly" ? ` · ${values.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ")}` : ""}`;
+      controls.appendChild(repeat);
+    }
+    if (values.notes) { const note = document.createElement("p"); note.textContent = values.notes; controls.appendChild(note); }
+    if (guidedFlow.conflictMessage) { const warning = document.createElement("p"); warning.className = "guided-conflict"; warning.textContent = guidedFlow.conflictMessage; controls.appendChild(warning); }
+    const actions = document.createElement("div");
+    actions.className = "guided-control-actions";
+    actions.append(guidedControlButton(guidedSaveInProgress ? "Adding…" : guidedFlow.conflictKey ? "Add anyway" : "Add to schedule", "confirm", null, "primary-button"), guidedControlButton("Edit", "edit"), guidedControlButton("Cancel", "cancel"));
+    actions.querySelector('[data-guided-action="confirm"]').disabled = guidedSaveInProgress;
+    controls.appendChild(actions);
+  } else if (guidedFlow.step === "switch_question") {
+    const actions = document.createElement("div");
+    actions.className = "guided-control-actions";
+    actions.append(guidedControlButton("Cancel creation and ask", "cancel_and_ask", null, "primary-button"), guidedControlButton("Keep creating", "keep_guided"));
+    controls.appendChild(actions);
+  } else {
+    const step = guidedFlow.step;
+    if (step === "type") {
+      controls.append(guidedControlButton("Activity", "type", "activity", "primary-button"), guidedControlButton("Task", "type", "task"), guidedControlButton("Routine", "type", "routine"));
+    } else if (step === "frequency") {
+      for (const [value, label] of [["daily", "Daily"], ["weekly", "Weekly"], ["monthly", "Monthly"]]) controls.appendChild(guidedControlButton(label, "frequency", value));
+    } else if (step === "category") {
+      for (const name of guidedCategoryNames()) controls.appendChild(guidedControlButton(name, "category", name));
+      if (values.itemType === "task") controls.appendChild(guidedControlButton("Skip category", "skip"));
+    } else if (step === "weekdays") {
+      GUIDED_WEEKDAYS.forEach((name, day) => {
+        const button = guidedControlButton(name, "weekday", day);
+        button.setAttribute("aria-pressed", String(values.weekdays.includes(day)));
+        controls.appendChild(button);
+      });
+      controls.appendChild(guidedControlButton("Continue", "continue_weekdays", null, "primary-button"));
+    } else if ((step === "start" || step === "end") && values.itemType === "routine") {
+      controls.appendChild(guidedControlButton("Skip time", "skip"));
+    } else if (step === "notes") {
+      controls.appendChild(guidedControlButton("Skip note", "skip"));
+    }
+    const actions = document.createElement("div");
+    actions.className = "guided-control-actions";
+    if (guidedSteps().indexOf(step) > 0) actions.appendChild(guidedControlButton("Back", "back"));
+    actions.appendChild(guidedControlButton("Cancel", "cancel"));
+    controls.appendChild(actions);
+  }
+  shell.appendChild(controls);
+  assistantEls.conversation.appendChild(shell);
+  scrollToBottom();
+}
+function guidedAdvance() {
+  const steps = guidedSteps();
+  const index = steps.indexOf(guidedFlow.step);
+  guidedFlow.step = steps[Math.min(index + 1, steps.length - 1)];
+}
+async function guidedAskCurrentStep() {
+  await saveGuidedFlow();
+  guidedAppendAssistant(guidedPrompt(guidedFlow.step));
+}
+function parseGuidedDate(text) {
+  const value = text.trim().toLowerCase();
+  const today = kampalaDate();
+  if (value === "today") return today;
+  if (value === "tomorrow") return addCalendarDays(today, 1);
+  const date = value;
+  return scheduleValidateDate(date) ? date : null;
+}
+function parseGuidedTime(text) {
+  const value = text.trim();
+  let match = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(value);
+  if (match) {
+    let hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (hour < 1 || hour > 12 || minute > 59) return null;
+    hour = (hour % 12) + (match[3].toUpperCase() === "PM" ? 12 : 0);
+    return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  }
+  match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match || !scheduleValidateTime(value)) return null;
+  return value;
+}
+function validateGuidedValues() {
+  const values = guidedFlow.values;
+  if (!values.title?.trim()) return "Enter a title.";
+  if (!values.date || !scheduleValidateDate(values.date)) return "Enter a valid date.";
+  if (values.itemType === "activity" && (!values.start || !scheduleValidateTime(values.start))) return "Select a start time.";
+  if (values.itemType === "activity" && (!values.end || !scheduleValidateTime(values.end))) return "Select an end time.";
+  if (values.start && !scheduleValidateTime(values.start)) return "Select a valid start time.";
+  if (values.end && !scheduleValidateTime(values.end)) return "Select a valid end time.";
+  if (values.start && values.end && values.end <= values.start) return "End time must be later than start time.";
+  if (["activity", "routine"].includes(values.itemType) && !values.category) return "Choose a category.";
+  if (values.category && !guidedCategoryNames().includes(values.category)) return "Choose a valid category.";
+  if (values.itemType === "routine") {
+    const recurrence = values.recurrence;
+    if (!recurrence || !["daily", "weekly", "monthly"].includes(recurrence.frequency)) return "Choose a routine frequency.";
+    if (!Number.isInteger(recurrence.interval) || recurrence.interval < 1 || recurrence.interval > 365) return "Enter a positive recurrence interval.";
+    if (recurrence.frequency === "weekly" && !recurrence.days.length) return "Select at least one weekday.";
+  }
+  return null;
+}
+async function handleGuidedAnswer(text) {
+  const answer = text.trim();
+  const values = guidedFlow.values;
+  const step = guidedFlow.step;
+  if (step === "switch_question" && ["yes", "cancel", "cancel creation"].includes(answer.toLowerCase())) { await handleGuidedControl("cancel_and_ask"); return; }
+  if (step === "switch_question" && ["no", "keep", "keep creating"].includes(answer.toLowerCase())) { await handleGuidedControl("keep_guided"); return; }
+  if (["cancel", "cancel schedule creation", "cancel creation"].includes(answer.toLowerCase())) { await cancelGuidedAdd(); return; }
+  if (step === "switch_question") { guidedAppendAssistant("Choose whether to cancel schedule creation or keep going with it."); return; }
+  if (step === "summary") {
+    const normalized = answer.toLowerCase();
+    if (["cancel", "cancel creation"].includes(normalized)) { await cancelGuidedAdd(); return; }
+    if (["edit", "back", "change"].includes(normalized)) { guidedFlow.step = "title"; await guidedAskCurrentStep(); return; }
+    guidedAppendAssistant("Use Add to schedule, Edit, or Cancel on the summary card.");
+    return;
+  }
+  if (step === "type") {
+    const type = answer.toLowerCase();
+    if (!["activity", "task", "routine"].includes(type)) { guidedAppendAssistant("Choose Activity, Task, or Routine."); return; }
+    values.itemType = type;
+  } else if (step === "title") {
+    if (!answer || answer.length > 200) { guidedAppendAssistant("Enter a title of 1 to 200 characters."); return; }
+    values.title = answer;
+  } else if (step === "date") {
+    const date = parseGuidedDate(answer);
+    if (!date) { guidedAppendAssistant("Enter a valid date as YYYY-MM-DD, today, or tomorrow."); return; }
+    values.date = date;
+  } else if (step === "start" || step === "end") {
+    if (!answer && values.itemType === "routine") values[step] = null;
+    else {
+      const time = parseGuidedTime(answer);
+      if (!time) { guidedAppendAssistant(`Enter a valid ${step} time, such as 2:00 PM or 14:00.`); return; }
+      values[step] = time;
+      if (step === "end" && values.start && time <= values.start) { guidedAppendAssistant("End time must be later than start time."); return; }
+    }
+  } else if (step === "interval") {
+    const interval = Number(answer);
+    if (!Number.isInteger(interval) || interval < 1 || interval > 365) { guidedAppendAssistant("Enter a positive whole number from 1 to 365."); return; }
+    values.recurrence.interval = interval;
+  } else if (step === "frequency") {
+    const frequency = answer.toLowerCase();
+    if (!["daily", "weekly", "monthly"].includes(frequency)) { guidedAppendAssistant("Choose daily, weekly, or monthly."); return; }
+    values.recurrence = { frequency, interval: 1, days: [] };
+    values.weekdays = [];
+  } else if (step === "weekdays") {
+    const parts = answer.toLowerCase().split(/[\s,]+/).filter(Boolean);
+    const days = parts.map(value => GUIDED_WEEKDAYS.findIndex(day => day.toLowerCase().startsWith(value))).filter(day => day >= 0);
+    if (!days.length || days.length !== parts.length) { guidedAppendAssistant("Enter weekday names such as Monday, Wednesday, or Friday."); return; }
+    values.weekdays = [...new Set(days)];
+    values.recurrence.days = values.weekdays;
+  } else if (step === "category") {
+    const category = guidedCategoryNames().find(name => name.toLowerCase() === answer.toLowerCase());
+    if (!category && !(values.itemType === "task" && !answer)) { guidedAppendAssistant("Choose one of the available categories, or skip this optional step."); return; }
+    if (category) values.category = category;
+  } else if (step === "notes") {
+    if (answer.length > 2000) { guidedAppendAssistant("Keep the note to 2,000 characters or fewer."); return; }
+    values.notes = answer;
+  }
+  if (step === "category" && values.itemType === "task" && !answer) values.category = null;
+  guidedAdvance();
+  await guidedAskCurrentStep();
+}
+async function cancelGuidedAdd() {
+  guidedFlow = null;
+  pendingQuickQuestionId = null;
+  await saveGuidedFlow();
+  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  appendEntry({ role: "assistant", text: "Schedule creation cancelled." });
+}
+async function confirmGuidedAdd() {
+  if (!guidedFlow || guidedSaveInProgress) return;
+  const validationError = validateGuidedValues();
+  if (validationError) { guidedFlow.step = validationError.startsWith("Select a start") ? "start" : validationError.startsWith("Select an end") ? "end" : validationError.startsWith("Choose a category") ? "category" : validationError.startsWith("Choose a routine") || validationError.startsWith("Enter a positive recurrence") ? "frequency" : validationError.startsWith("Select at least one weekday") ? "weekdays" : validationError.startsWith("Enter a valid date") ? "date" : "title"; await guidedAskCurrentStep(); return; }
+  const values = guidedFlow.values;
+  const updates = {
+    title: values.title.trim(), date: values.date, type: values.itemType, start: values.start || "", end: values.end || "",
+    category: values.category || "Personal", notes: values.notes.trim(), recurrence: values.recurrence, schedulePending: false
+  };
+  const candidate = { ...updates, id: "__guided_add_item__", status: "upcoming" };
+  const conflict = candidate.date && candidate.start && candidate.end
+    ? saDetectConflictsForDate(candidate.date, [...items, candidate]).find(item => item.firstItemId === candidate.id || item.secondItemId === candidate.id)
+    : null;
+  const conflictKey = conflict ? `${candidate.date}|${candidate.start}|${candidate.end}|${conflict.pairKey}` : "";
+  if (conflict && guidedFlow.conflictKey !== conflictKey) {
+    const otherTitle = conflict.firstItemId === candidate.id ? conflict.secondTitle : conflict.firstTitle;
+    guidedFlow.conflictKey = conflictKey;
+    guidedFlow.conflictMessage = `Schedule conflict: ${candidate.title} overlaps with ${otherTitle} from ${formatTime(conflict.overlapStart)} to ${formatTime(conflict.overlapEnd)}.`;
+    await saveGuidedFlow();
+    guidedAppendAssistant(`${guidedFlow.conflictMessage} You can edit the details or add it anyway.`);
+    return;
+  }
+  guidedSaveInProgress = true;
+  renderGuidedControls();
+  let result;
+  try { result = await saCreateItem({ ...updates, status: "upcoming", postponed: 0 }); }
+  catch { result = { success: false }; }
+  finally { guidedSaveInProgress = false; }
+  if (!result?.success) { guidedAppendAssistant("The item could not be saved. Try again."); return; }
+  if (result.item && typeof window.refreshAssistantScheduleItem === "function") window.refreshAssistantScheduleItem(result.item, "created");
+  const summary = guidedSummaryText(values);
+  guidedFlow = null;
+  pendingQuickQuestionId = null;
+  await saveGuidedFlow();
+  appendEntry({ role: "assistant", text: `Added to your schedule.\n${summary}` });
+  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+}
+async function handleGuidedControl(action, value) {
+  if (!guidedFlow) return;
+  if (action === "cancel") { await cancelGuidedAdd(); return; }
+  if (action === "cancel_and_ask") {
+    const queuedId = pendingQuickQuestionId;
+    await cancelGuidedAdd();
+    if (queuedId) await runQuickQuestion(queuedId);
+    return;
+  }
+  if (action === "keep_guided") {
+    guidedFlow.step = guidedFlow.returnStep || "type";
+    guidedFlow.returnStep = null;
+    delete guidedFlow.queuedQuickQuestion;
+    pendingQuickQuestionId = null;
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "back") {
+    const steps = guidedSteps();
+    const index = steps.indexOf(guidedFlow.step);
+    if (index > 0) guidedFlow.step = steps[index - 1];
+    guidedFlow.conflictKey = null;
+    guidedFlow.conflictMessage = null;
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "edit") {
+    guidedFlow.step = "title";
+    guidedFlow.conflictKey = null;
+    guidedFlow.conflictMessage = null;
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "confirm") { await confirmGuidedAdd(); return; }
+  if (action === "weekday") {
+    const day = Number(value);
+    const days = new Set(guidedFlow.values.weekdays);
+    if (days.has(day)) days.delete(day); else if (day >= 0 && day <= 6) days.add(day);
+    guidedFlow.values.weekdays = [...days].sort((a, b) => a - b);
+    guidedFlow.values.recurrence.days = guidedFlow.values.weekdays;
+    await saveGuidedFlow();
+    renderGuidedControls();
+    return;
+  }
+  if (action === "continue_weekdays") {
+    if (!guidedFlow.values.weekdays.length) { guidedAppendAssistant("Select at least one weekday."); return; }
+    appendEntry({ role: "user", text: guidedFlow.values.weekdays.map(day => GUIDED_WEEKDAYS[day]).join(", ") });
+    guidedAdvance();
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "type") {
+    guidedFlow.values.itemType = value;
+    appendEntry({ role: "user", text: value[0].toUpperCase() + value.slice(1) });
+    guidedAdvance();
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "frequency") {
+    guidedFlow.values.recurrence = { frequency: value, interval: 1, days: [] };
+    guidedFlow.values.weekdays = [];
+    appendEntry({ role: "user", text: value[0].toUpperCase() + value.slice(1) });
+    guidedAdvance();
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "category") {
+    guidedFlow.values.category = value;
+    appendEntry({ role: "user", text: value });
+    guidedAdvance();
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "skip") {
+    if (guidedFlow.step === "category") guidedFlow.values.category = null;
+    else if (guidedFlow.step === "notes") guidedFlow.values.notes = "";
+    else if (guidedFlow.step === "start" || guidedFlow.step === "end") guidedFlow.values[guidedFlow.step] = null;
+    const skipped = guidedFlow.step;
+    appendEntry({ role: "user", text: skipped === "notes" ? "Skip note" : skipped === "category" ? "Skip category" : "Skip time" });
+    guidedAdvance();
+    await guidedAskCurrentStep();
+  }
+}
+
+async function runQuickQuestion(id, { logUser = true } = {}) {
+  const spec = quickQuestionSpecs[id];
+  if (!spec || id === "guided_add") return;
+  const requestConvId = await ensureConversation();
+  if (logUser) appendEntry({ role: "user", text: spec.label });
+  const userMessages = conversation.filter(message => message.role === "user");
+  if (userMessages.length === 1 && requestConvId) {
+    firebaseStore.updateConversationSummary(requestConvId, { title: deriveConversationTitle(spec.label) }).catch(() => {});
+  }
+  let result;
+  try { result = spec.run(); }
+  catch {
+    result = { text: "I couldn't answer that right now." };
+  }
+  appendEntry({ role: "assistant", text: result.text, items: result.items || [] });
+  if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
+  scrollToBottom();
+  assistantEls.input?.focus();
+}
 
 function closeQuickQuestions() {
   if (!quickQuestionsOpen) return;
@@ -2768,35 +3354,30 @@ function refreshQuickQuestionsLayout() {
 }
 
 async function handleQuickQuestion(id) {
-  if (id === "open_add_item") { openAddDialog(); return; }
   const spec = quickQuestionSpecs[id];
   if (!spec) return;
-  let requestConvId;
   try {
-    requestConvId = await ensureConversation();
-  } catch (err) {
-    console.error("Failed to ensure conversation", err);
+    await ensureConversation();
+  } catch {
     showPersistenceFailure();
     return;
   }
-  appendEntry({ role: "user", text: spec.label });
-  const userMessages = conversation.filter(m => m.role === "user");
-  if (userMessages.length === 1 && requestConvId) {
-    const derivedTitle = deriveConversationTitle(spec.label);
-    firebaseStore.updateConversationSummary(requestConvId, { title: derivedTitle }).catch(() => {});
+  if (guidedFlow && id !== "guided_add") {
+    pendingQuickQuestionId = id;
+    guidedFlow.returnStep = guidedFlow.step;
+    guidedFlow.queuedQuickQuestion = id;
+    guidedFlow.step = "switch_question";
+    await saveGuidedFlow();
+    guidedAppendAssistant("You’re in the middle of creating a schedule item. Cancel it before asking this question?");
+    return;
   }
-  let result;
-  try {
-    result = spec.run();
-  } catch (err) {
-    console.error("Quick question failed", err);
-    result = { text: "I couldn't answer that right now." };
+  appendEntry({ role: "user", text: id === "guided_add" ? "Add something to my schedule." : spec.label });
+  if (id === "guided_add") {
+    await beginGuidedAdd();
+    return;
   }
-  if (!result) return;
-  appendEntry({ role: "assistant", text: result.text, items: result.items || [] });
-  if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
-  scrollToBottom();
-  assistantEls.input?.focus();
+  if (guidedFlow) { guidedFlow = null; await saveGuidedFlow(); }
+  await runQuickQuestion(id, { logUser: false });
 }
 
 function submitInput() {
@@ -2871,6 +3452,11 @@ assistantEls.quickQuestionsPanel?.addEventListener("click", event => {
   if (!button) return;
   closeQuickQuestions();
   handleQuickQuestion(button.dataset.quickQuestion);
+});
+assistantEls.conversation?.addEventListener("click", event => {
+  const button = event.target.closest("[data-guided-action]");
+  if (!button || button.disabled || !assistantEls.conversation.contains(button)) return;
+  handleGuidedControl(button.dataset.guidedAction, button.dataset.guidedValue).catch(() => showPersistenceFailure());
 });
 
 window.closeQuickQuestions = closeQuickQuestions;
@@ -3006,6 +3592,9 @@ assistantEls.confirmDeleteButton?.addEventListener("click", async () => {
   try {
     await firebaseStore.deleteConversation(targetId);
     composerDrafts.delete(targetId);
+    delete guidedFlowsByConversation[targetId];
+    if (wasActive) { guidedFlow = null; pendingQuickQuestionId = null; }
+    await saveGuidedFlow();
     deletingConversationId = null;
 
     if (wasActive) {

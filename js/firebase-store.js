@@ -266,6 +266,35 @@ export async function loadAssistantState() {
   const snapshot = await getDoc(userDoc("assistantState", "current"));
   return snapshot.exists() ? snapshot.data() : { activeConversationId: null, pendingClarification: null, planningContext: null, entityRegistry: [], pendingOperation: null, referencedSets: [] };
 }
+function cleanGuidedFlow(flow) {
+  if (!flow || typeof flow !== "object" || flow.type !== "create_schedule_item") return null;
+  const allowedSteps = new Set(["type", "title", "date", "start", "end", "frequency", "interval", "weekdays", "category", "notes", "summary", "switch_question"]);
+  const values = flow.values && typeof flow.values === "object" ? flow.values : {};
+  const recurrence = values.recurrence && typeof values.recurrence === "object" ? {
+    frequency: ["daily", "weekly", "monthly"].includes(values.recurrence.frequency) ? values.recurrence.frequency : null,
+    interval: Number.isInteger(values.recurrence.interval) && values.recurrence.interval > 0 ? values.recurrence.interval : 1,
+    days: Array.isArray(values.recurrence.days) ? [...new Set(values.recurrence.days.filter(day => Number.isInteger(day) && day >= 0 && day <= 6))].slice(0, 7) : []
+  } : null;
+  return {
+    type: "create_schedule_item",
+    step: allowedSteps.has(flow.step) ? flow.step : "type",
+    ...(allowedSteps.has(flow.returnStep) ? { returnStep: flow.returnStep } : {}),
+    ...(["schedule_today", "schedule_week", "schedule_month", "attention_now", "free_time_week"].includes(flow.queuedQuickQuestion) ? { queuedQuickQuestion: flow.queuedQuickQuestion } : {}),
+    values: {
+      itemType: ["activity", "task", "routine"].includes(values.itemType) ? values.itemType : null,
+      title: typeof values.title === "string" ? values.title.slice(0, 200) : null,
+      date: typeof values.date === "string" ? values.date.slice(0, 10) : null,
+      start: typeof values.start === "string" ? values.start.slice(0, 5) : null,
+      end: typeof values.end === "string" ? values.end.slice(0, 5) : null,
+      category: typeof values.category === "string" ? values.category.slice(0, 60) : null,
+      notes: typeof values.notes === "string" ? values.notes.slice(0, 2000) : "",
+      recurrence,
+      weekdays: Array.isArray(values.weekdays) ? [...new Set(values.weekdays.filter(day => Number.isInteger(day) && day >= 0 && day <= 6))].slice(0, 7) : []
+    },
+    ...(typeof flow.conflictKey === "string" ? { conflictKey: flow.conflictKey.slice(0, 200) } : {}),
+    ...(typeof flow.conflictMessage === "string" ? { conflictMessage: flow.conflictMessage.slice(0, 300) } : {})
+  };
+}
 export async function saveAssistantState(state) {
   const context = state.planningContext;
   const planningContext = context && typeof context === "object" ? {
@@ -313,6 +342,11 @@ export async function saveAssistantState(state) {
     alias: String(set.alias || set.title || "").slice(0, 100), targetIds: Array.isArray(set.targetIds || set.ids) ? [...new Set((set.targetIds || set.ids).filter(id => typeof id === "string"))].slice(0, 20) : [],
     updatedAt: String(set.updatedAt || new Date().toISOString()).slice(0, 40)
   })) : [];
+  const hasGuidedFlow = Object.prototype.hasOwnProperty.call(state, "guidedFlow");
+  const hasGuidedFlows = Object.prototype.hasOwnProperty.call(state, "guidedFlowsByConversation");
+  const guidedFlowsByConversation = hasGuidedFlows && state.guidedFlowsByConversation && typeof state.guidedFlowsByConversation === "object"
+    ? Object.fromEntries(Object.entries(state.guidedFlowsByConversation).slice(-20).map(([id, flow]) => [String(id).slice(0, 160), cleanGuidedFlow(flow)]).filter(([, flow]) => flow))
+    : {};
   await setDoc(userDoc("assistantState", "current"), {
     activeConversationId: state.activeConversationId || null,
     pendingClarification,
@@ -323,10 +357,12 @@ export async function saveAssistantState(state) {
     referencedSets,
     pendingOperation,
     lastConfirmedAction: state.lastConfirmedAction && typeof state.lastConfirmedAction === "object" ? state.lastConfirmedAction : null,
+    ...(hasGuidedFlow ? { guidedFlow: cleanGuidedFlow(state.guidedFlow) } : {}),
+    ...(hasGuidedFlows ? { guidedFlowsByConversation } : {}),
     updatedAt: serverTimestamp()
   }, { merge: true });
 }
-export async function clearAssistantState() { await saveAssistantState({ activeConversationId: null, pendingClarification: null, planningContext: null }); }
+export async function clearAssistantState() { await saveAssistantState({ activeConversationId: null, pendingClarification: null, planningContext: null, guidedFlow: null, guidedFlowsByConversation: {} }); }
 
 export async function createMemory(memory) {
   const ref = doc(userCollection("memories"));
