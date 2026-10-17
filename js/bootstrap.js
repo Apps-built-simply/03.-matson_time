@@ -1,13 +1,36 @@
-import { firebaseStore } from "./firebase-store.js";
-
 const loading = document.querySelector("#cloudLoading");
 const appShell = document.querySelector(".app-shell");
 const cloudError = document.querySelector("#cloudError");
 const retryButton = document.querySelector("#retryCloudButton");
+let loaderImage = document.querySelector("#appLoaderImage");
+const APP_LOADER_ANIMATION_CYCLE_MS = 2200; // The nine SVG animations share dur="2.2s".
+const APP_LOADER_MINIMUM_LOOPS = 3; // Keep startup visible for three complete animation loops.
+const APP_LOADER_MINIMUM_DURATION_MS = APP_LOADER_ANIMATION_CYCLE_MS * APP_LOADER_MINIMUM_LOOPS;
+let firebaseStore = null;
+let firebaseStorePromise = null;
 let activeUser = null;
 let scriptsLoaded = false;
+const loadedScripts = new Set();
 let cloudLoadInProgress = false;
 let anonymousSignInInProgress = false;
+let authInitializationPromise = null;
+let startupAttemptNumber = 0;
+let currentStartupAttempt = null;
+
+function loadFirebaseStore() {
+  if (firebaseStore) return Promise.resolve(firebaseStore);
+  if (!firebaseStorePromise) {
+    firebaseStorePromise = import("./firebase-store.js").then(module => {
+      if (!module.firebaseStore) throw new Error("Firebase store module unavailable.");
+      firebaseStore = module.firebaseStore;
+      return firebaseStore;
+    }).catch(error => {
+      firebaseStorePromise = null;
+      throw error;
+    });
+  }
+  return firebaseStorePromise;
+}
 
 const defaultCategories = [
   { id: "music", name: "Music", color: "#8B5CF6" },
@@ -19,24 +42,87 @@ const defaultCategories = [
 window.defaultCategories = defaultCategories;
 
 function showLoading() {
+  loading.classList.remove("has-error");
+  loading.removeAttribute("aria-hidden");
+  loading.setAttribute("aria-label", "Loading Matson Time.");
   loading.hidden = false;
   appShell.hidden = true;
   cloudError.hidden = true;
   retryButton.hidden = true;
 }
+function createMinimumLoaderDurationPromise(image, attempt) {
+  return new Promise(resolve => {
+    let finished = false;
+    let durationTimer = null;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      if (durationTimer !== null) window.clearTimeout(durationTimer);
+      image.removeEventListener("load", onLoad);
+      image.removeEventListener("error", onError);
+      resolve();
+    };
+    const onLoad = () => {
+      if (finished) return;
+      image.classList.add("is-ready");
+      durationTimer = window.setTimeout(finish, APP_LOADER_MINIMUM_DURATION_MS);
+    };
+    const onError = () => {
+      if (!image.dataset.assetFailureReported) {
+        image.dataset.assetFailureReported = "true";
+        image.hidden = true;
+        console.error("Matson Time application loader asset failed to load.");
+      }
+      finish();
+    };
+
+    attempt.cancelMinimumDuration = finish;
+    image.addEventListener("load", onLoad, { once: true });
+    image.addEventListener("error", onError, { once: true });
+    if (image.complete) {
+      if (image.naturalWidth > 0) onLoad();
+      else onError();
+    }
+  });
+}
+function startStartupAttempt({ restartLoader = false } = {}) {
+  currentStartupAttempt?.cancelMinimumDuration?.();
+  showLoading();
+  startupAttemptNumber += 1;
+
+  if (restartLoader) {
+    const nextImage = loaderImage.cloneNode(false);
+    nextImage.removeAttribute("hidden");
+    nextImage.classList.remove("is-ready");
+    delete nextImage.dataset.assetFailureReported;
+    nextImage.src = `assets/animations/app-loader.svg?startup-attempt=${startupAttemptNumber}`;
+    loaderImage.replaceWith(nextImage);
+    loaderImage = nextImage;
+  }
+
+  const attempt = { id: startupAttemptNumber, failed: false, cancelMinimumDuration: null };
+  currentStartupAttempt = attempt;
+  attempt.minimumDurationPromise = createMinimumLoaderDurationPromise(loaderImage, attempt);
+  return attempt;
+}
+function failCurrentStartupAttempt() {
+  if (!currentStartupAttempt || currentStartupAttempt.failed) return;
+  currentStartupAttempt.failed = true;
+  currentStartupAttempt.cancelMinimumDuration?.();
+}
 function showConnectionError() {
+  failCurrentStartupAttempt();
+  loading.classList.add("has-error");
+  loading.removeAttribute("aria-label");
   loading.hidden = false;
   appShell.hidden = true;
   cloudError.hidden = false;
   cloudError.textContent = "Matson Time could not connect. Try again.";
   retryButton.hidden = false;
 }
-function showCloudError(error) {
-  console.error("Cloud startup failed", { name: error?.name || "Error", message: String(error?.message || error) });
-  loading.hidden = false;
-  cloudError.hidden = false;
-  cloudError.textContent = "Matson Time couldn’t load your cloud data. Check your connection and retry.";
-  retryButton.hidden = false;
+function showCloudError() {
+  console.error("Matson Time startup could not complete.");
+  showConnectionError();
 }
 
 function parseLocalJson(key, fallback) {
@@ -120,50 +206,59 @@ async function migrateLocalData(user) {
 }
 
 async function loadCloudApp() {
-  if (!activeUser || cloudLoadInProgress) return;
+  const attempt = currentStartupAttempt;
+  if (!activeUser || cloudLoadInProgress || !attempt || attempt.failed) return;
   cloudLoadInProgress = true;
   showLoading();
   cloudError.hidden = true;
   retryButton.hidden = true;
   try {
-    await migrateLocalData(activeUser);
-    const [scheduleItems, categories, assistantState] = await Promise.all([
-      firebaseStore.loadScheduleItems(), firebaseStore.loadCategories(), firebaseStore.loadAssistantState()
-    ]);
-    if (!categories.length) throw new Error("No categories could be loaded.");
-    const recent = await firebaseStore.listRecentConversations(15);
-    const conversationId = assistantState.activeConversationId || recent[0]?.id || null;
-    let activeConversation = null;
-    if (conversationId) {
-      try { activeConversation = await firebaseStore.loadConversation(conversationId, 50); }
-      catch (error) {
-        if (!String(error?.message || "").includes("was not found")) throw error;
-        assistantState.activeConversationId = null;
-        await firebaseStore.saveAssistantState({ activeConversationId: null, pendingClarification: null, planningContext: assistantState.planningContext || null });
+    const applicationInitializationPromise = (async () => {
+      await migrateLocalData(activeUser);
+      const [scheduleItems, categories, assistantState] = await Promise.all([
+        firebaseStore.loadScheduleItems(), firebaseStore.loadCategories(), firebaseStore.loadAssistantState()
+      ]);
+      if (!categories.length) throw new Error("No categories could be loaded.");
+      const recent = await firebaseStore.listRecentConversations(15);
+      const conversationId = assistantState.activeConversationId || recent[0]?.id || null;
+      let activeConversation = null;
+      if (conversationId) {
+        try { activeConversation = await firebaseStore.loadConversation(conversationId, 50); }
+        catch (error) {
+          if (!String(error?.message || "").includes("was not found")) throw error;
+          assistantState.activeConversationId = null;
+          await firebaseStore.saveAssistantState({ activeConversationId: null, pendingClarification: null, planningContext: assistantState.planningContext || null });
+        }
       }
-    }
-    if (activeConversation && activeConversation.status !== "active") {
-      await firebaseStore.updateConversationSummary(conversationId, { status: "active" });
-      activeConversation.status = "active";
-      await firebaseStore.saveAssistantState({ activeConversationId: conversationId, pendingClarification: assistantState.pendingClarification || null, planningContext: assistantState.planningContext || null });
-      assistantState.activeConversationId = conversationId;
-    }
-    window.firebaseStore = firebaseStore;
-    window.initialScheduleItems = scheduleItems;
-    window.cloudCategories = categories;
-    window.initialAssistantState = assistantState;
-    window.initialConversation = activeConversation?.status === "active" ? activeConversation : null;
-    window.recentConversations = recent;
-    if (!scriptsLoaded) {
-      for (const source of ["js/data.js", "js/config.js", "js/schedule-actions.js", "js/app.js", "js/assistant.js", "js/progress.js"]) {
-        await loadClassicScript(source);
+      if (activeConversation && activeConversation.status !== "active") {
+        await firebaseStore.updateConversationSummary(conversationId, { status: "active" });
+        activeConversation.status = "active";
+        await firebaseStore.saveAssistantState({ activeConversationId: conversationId, pendingClarification: assistantState.pendingClarification || null, planningContext: assistantState.planningContext || null });
+        assistantState.activeConversationId = conversationId;
       }
-      scriptsLoaded = true;
-    }
+      window.firebaseStore = firebaseStore;
+      window.initialScheduleItems = scheduleItems;
+      window.cloudCategories = categories;
+      window.initialAssistantState = assistantState;
+      window.initialConversation = activeConversation?.status === "active" ? activeConversation : null;
+      window.recentConversations = recent;
+      if (!scriptsLoaded) {
+        for (const source of ["js/data.js", "js/config.js", "js/schedule-actions.js", "js/app.js", "js/assistant.js", "js/progress.js"]) {
+          if (loadedScripts.has(source)) continue;
+          await loadClassicScript(source);
+          loadedScripts.add(source);
+        }
+        scriptsLoaded = true;
+      }
+    })();
+    await Promise.all([applicationInitializationPromise, attempt.minimumDurationPromise]);
+    if (currentStartupAttempt !== attempt || attempt.failed) return;
     loading.hidden = true;
+    loading.classList.remove("has-error");
+    loading.removeAttribute("aria-hidden");
     appShell.hidden = false;
-  } catch (error) {
-    showCloudError(error);
+  } catch {
+    showCloudError();
   } finally {
     cloudLoadInProgress = false;
   }
@@ -193,15 +288,30 @@ async function connectAnonymously() {
 }
 
 retryButton.addEventListener("click", () => {
+  startStartupAttempt({ restartLoader: true });
   if (activeUser) loadCloudApp();
-  else connectAnonymously();
+  else if (firebaseStore) connectAnonymously();
+  else initializeCloudAuth();
 });
-firebaseStore.observeAuthState(user => {
-  if (!user) {
-    activeUser = null;
-    connectAnonymously();
-    return;
-  }
-  activeUser = user;
-  loadCloudApp();
-}, showConnectionError);
+
+function initializeCloudAuth() {
+  if (authInitializationPromise) return authInitializationPromise;
+  authInitializationPromise = loadFirebaseStore().then(store => {
+    store.observeAuthState(user => {
+      if (!user) {
+        activeUser = null;
+        connectAnonymously();
+        return;
+      }
+      activeUser = user;
+      loadCloudApp();
+    }, showConnectionError);
+  }).catch(() => {
+    authInitializationPromise = null;
+    showConnectionError();
+  });
+  return authInitializationPromise;
+}
+
+startStartupAttempt();
+initializeCloudAuth();

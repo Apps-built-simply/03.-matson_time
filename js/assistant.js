@@ -714,6 +714,7 @@ function showWaitingState() {
 
   assistantEls.conversation.appendChild(msg);
   waitingEl = msg;
+  updateAssistantEmptyState();
   if (shouldKeepBottom) {
     scrollToBottom();
   }
@@ -723,7 +724,19 @@ function removeWaitingState() {
   if (waitingEl) {
     waitingEl.remove();
     waitingEl = null;
+    updateAssistantEmptyState();
   }
+}
+
+function updateAssistantEmptyState() {
+  if (!assistantEls.empty || !assistantEls.conversation) return;
+  const hasActiveAssistantState = Boolean(
+    guidedFlow || waitingEl || currentProposal || pendingClarification ||
+    ["awaiting_confirmation", "executing"].includes(pendingOperation?.state)
+  );
+  const showEmptyState = conversation.length === 0 && !hasActiveAssistantState && assistantEls.conversation.childElementCount === 0;
+  assistantEls.empty.hidden = !showEmptyState;
+  assistantEls.conversation.hidden = showEmptyState;
 }
 
 function waitForPresentation(startedAt, minimumMs = 350) {
@@ -776,7 +789,7 @@ function revealAssistantMessage(targetElement, fullText, { onUpdate, signal } = 
 function appendEntry(entry, options = {}) {
   if (!entry.id) entry.id = crypto.randomUUID();
   conversation.push(entry);
-  if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
+  updateAssistantEmptyState();
   if (!options.skipRender) {
     renderConversationEntry(entry, options);
   }
@@ -925,7 +938,7 @@ function renderConversation(options = {}) {
       : entry;
     renderConversationEntry(displayEntry, { restoring: true, scrollToBottom: false });
   }
-  assistantEls.empty.hidden = conversation.length > 0;
+  updateAssistantEmptyState();
   if (conversation.length > 0) {
     scrollToBottom();
   }
@@ -3045,6 +3058,7 @@ async function beginGuidedAdd({ logUser = false } = {}) {
   if (logUser) appendEntry({ role: "user", text: "Add something to my schedule." });
   guidedCompletedFlow = null;
   guidedFlow = { id: crypto.randomUUID(), type: "create_schedule_item", step: "type", values: { ...GUIDED_ADD_INITIAL_VALUES, recurrence: null, weekdays: [] } };
+  updateAssistantEmptyState();
   await saveGuidedFlow();
   await guidedAppendAssistant(guidedPrompt("type"));
 }
@@ -3653,7 +3667,7 @@ async function runQuickQuestion(id, { logUser = true } = {}) {
     if (activeConversationId === requestConvId) removeWaitingState();
     await appendAssistantWithReveal({ role: "assistant", text: result.text, items: result.items || [] }, requestConvId);
     if (activeConversationId === requestConvId) {
-      if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
+      updateAssistantEmptyState();
       assistantEls.input?.focus();
     }
   } finally {

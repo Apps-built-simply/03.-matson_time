@@ -8,10 +8,13 @@
   <link rel="stylesheet" href="css/styles.css">
 </head>
 <body>
-  <section id="cloudLoading" class="cloud-loading" aria-live="polite">
-    <p id="cloudLoadingText">Loading Matson Time…</p>
-    <p id="cloudError" class="connection-error" role="alert" hidden></p>
-    <button id="retryCloudButton" class="secondary-button" type="button" hidden>Retry</button>
+  <section id="cloudLoading" class="cloud-loading" role="status" aria-live="polite" aria-label="Loading Matson Time.">
+    <div class="cloud-loading-content">
+      <img id="appLoaderImage" class="app-loader-image" src="assets/animations/app-loader.svg" alt="" aria-hidden="true" draggable="false">
+      <p id="cloudLoadingText">Loading Matson Time…</p>
+      <p id="cloudError" class="connection-error" role="alert" hidden></p>
+      <button id="retryCloudButton" class="secondary-button" type="button" hidden>Retry</button>
+    </div>
   </section>
 
   <div class="app-shell" hidden>
@@ -152,7 +155,7 @@
           </div>
 
           <div class="assistant-empty" id="assistantEmpty">
-            <p class="assistant-empty-prompt">How can I assist you?</p>
+            <img src="assets/animations/matson-assistant.svg" alt="" aria-hidden="true" draggable="false" class="assistant-empty-illustration" loading="eager" decoding="async">
           </div>
 
           <div class="conversation" id="conversation" aria-live="polite"></div>
