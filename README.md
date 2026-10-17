@@ -27,6 +27,10 @@ This first working build includes:
 - Simple schedule conflict warnings
 - Firebase Authentication and Cloud Firestore persistence
 
+## Typography assets
+
+The site bundles Inter and Manrope as local WOFF2 webfonts. Inter is sourced from [rsms/inter](https://github.com/rsms/inter) and Manrope from [Google Fonts](https://github.com/google/fonts/tree/main/ofl/manrope). Both are distributed under SIL Open Font License 1.1; the full license texts are in `assets/fonts/licenses/`. The app uses CSS-only `font-display: swap` and system-font fallbacks.
+
 ## Deploy to Vercel
 
 1. Import the GitHub repository into Vercel.

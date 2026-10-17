@@ -56,6 +56,8 @@ let sendInProgress = false;
 let newConversationInProgress = false;
 let waitingEl = null;
 let activeRevealController = null;
+let quickQuestionInProgress = false;
+let quickQuestionSelectionPending = false;
 let activeRequestId = null;
 let drawerConversations = [];
 let isDrawerOpen = false;
@@ -671,6 +673,7 @@ function scrollToBottom() {
 
 function showWaitingState() {
   if (waitingEl) return;
+  const shouldKeepBottom = isNearBottom();
   const msg = document.createElement("div");
   msg.className = "message assistant-message waiting-message";
   msg.id = "assistantWaiting";
@@ -703,7 +706,7 @@ function showWaitingState() {
 
   assistantEls.conversation.appendChild(msg);
   waitingEl = msg;
-  if (isNearBottom()) {
+  if (shouldKeepBottom) {
     scrollToBottom();
   }
 }
@@ -713,6 +716,11 @@ function removeWaitingState() {
     waitingEl.remove();
     waitingEl = null;
   }
+}
+
+function waitForPresentation(startedAt, minimumMs = 350) {
+  const remaining = Math.max(0, minimumMs - (performance.now() - startedAt));
+  return remaining ? new Promise(resolve => setTimeout(resolve, remaining)) : Promise.resolve();
 }
 
 function revealAssistantMessage(targetElement, fullText, { onUpdate, signal } = {}) {
@@ -759,6 +767,7 @@ function revealAssistantMessage(targetElement, fullText, { onUpdate, signal } = 
 
 function appendEntry(entry, options = {}) {
   conversation.push(entry);
+  if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
   if (!options.skipRender) {
     renderConversationEntry(entry, options);
   }
@@ -778,7 +787,17 @@ function appendEntry(entry, options = {}) {
   }
 }
 
+async function appendAssistantWithReveal(entry, conversationId = activeConversationId) {
+  if (activeConversationId !== conversationId) {
+    saveEntryForConversation(conversationId, entry);
+    return;
+  }
+  appendEntry(entry, { skipRender: true });
+  await renderConversationEntry(entry, { reveal: true });
+}
+
 function renderConversationEntry(entry, options = {}) {
+  const shouldKeepBottom = isNearBottom();
   const message = document.createElement("div");
   message.className = entry.role === "user" ? "message user-message" : "message assistant-message";
 
@@ -788,10 +807,28 @@ function renderConversationEntry(entry, options = {}) {
     bubble.textContent = entry.text;
     message.appendChild(bubble);
   } else {
+    const bubble = document.createElement("div");
+    bubble.className = "assistant-bubble";
     const text = document.createElement("p");
     text.className = "assistant-text";
-    message.appendChild(text);
+    bubble.appendChild(text);
+    message.appendChild(bubble);
 
+    let responseList = null;
+    let completionDetails = null;
+    const displayText = entry.kind === "guided_completion" ? String(entry.text || "").split("\n")[0] : entry.text;
+    if (entry.kind === "guided_completion") {
+      const details = String(entry.text || "").split("\n").slice(1).filter(Boolean);
+      if (details.length) {
+        completionDetails = document.createElement("div");
+        completionDetails.className = "guided-completed-summary";
+        for (const detail of details) {
+          const line = document.createElement("p");
+          line.textContent = detail;
+          completionDetails.appendChild(line);
+        }
+      }
+    }
     if (entry.items && entry.items.length) {
       const list = document.createElement("ul");
       list.className = "response-list";
@@ -805,35 +842,50 @@ function renderConversationEntry(entry, options = {}) {
         title.textContent = item.title;
         const status = document.createElement("span");
         status.className = "response-status";
+        const statusTone = String(item.status || "").toLowerCase().replaceAll(" ", "-");
+        if (["upcoming", "in-progress", "completed", "postponed", "awaiting-check-in", "overdue", "missed", "cancelled"].includes(statusTone)) {
+          status.classList.add(`status-${statusTone}`);
+        }
         status.textContent = item.status;
         row.append(time, title, status);
         list.appendChild(row);
       }
-      message.appendChild(list);
+      responseList = list;
     }
 
     if (options.reveal && !options.restoring) {
       activeRevealController?.abort();
       const controller = new AbortController();
       activeRevealController = controller;
-      const shouldKeepBottom = isNearBottom();
       assistantEls.conversation.appendChild(message);
       if (shouldKeepBottom) scrollToBottom();
+      let followLatest = shouldKeepBottom;
+      let lastAutoScrollTop = assistantEls.conversation.scrollTop;
 
-      return revealAssistantMessage(text, entry.text, {
+      return revealAssistantMessage(text, displayText, {
         signal: controller.signal,
         onUpdate: () => {
-          if (shouldKeepBottom) scrollToBottom();
+          if (followLatest && assistantEls.conversation.scrollTop < lastAutoScrollTop - 4) followLatest = false;
+          if (followLatest) {
+            scrollToBottom();
+            lastAutoScrollTop = assistantEls.conversation.scrollTop;
+          }
         }
+      }).then(() => {
+        if (responseList && message.isConnected) message.appendChild(responseList);
+        if (completionDetails && message.isConnected) message.appendChild(completionDetails);
+        if (followLatest) scrollToBottom();
       });
     } else {
-      text.textContent = entry.text;
+      text.textContent = displayText;
     }
+    if (responseList) message.appendChild(responseList);
+    if (completionDetails) message.appendChild(completionDetails);
   }
 
   assistantEls.conversation.appendChild(message);
   if (options.scrollToBottom !== false) {
-    if (isNearBottom() || options.forceScroll) {
+    if (shouldKeepBottom || options.forceScroll) {
       scrollToBottom();
     }
   }
@@ -844,6 +896,7 @@ function renderConversation(options = {}) {
   activeRevealController?.abort();
   removeWaitingState();
   assistantEls.conversation.replaceChildren();
+  if (assistantEls.scrollLatest) assistantEls.scrollLatest.hidden = true;
   for (const entry of conversation) {
     const displayEntry = entry.resolved === false
       ? { ...entry, text: `${entry.text} (This earlier proposal expired when you left the conversation; request it again to review it.)` }
@@ -2201,7 +2254,7 @@ async function sendMessage(rawText) {
     if (classification === "deterministic_query") {
       result = handleDeterministicQuery(text);
       if (result) {
-        appendEntry({ role: "assistant", text: result.text, items: result.items || [] });
+        await appendAssistantWithReveal({ role: "assistant", text: result.text, items: result.items || [] }, requestConvId);
         if (result.proposal || result.clarification) {
           handleProposalOrClarification(result, text);
         }
@@ -2944,15 +2997,24 @@ function guidedPrompt(step, flow = guidedFlow) {
   if (step === "notes") return "Would you like to add a note? Type it here or skip this step.";
   return "Review the schedule details below.";
 }
-function guidedAppendAssistant(text) {
-  appendEntry({ role: "assistant", text });
-  renderGuidedControls();
+async function guidedAppendAssistant(text, { wait = false, showControls = true, kind } = {}) {
+  const conversationId = activeConversationId;
+  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  const startedAt = performance.now();
+  if (wait && activeConversationId === conversationId) {
+    showWaitingState();
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    await waitForPresentation(startedAt, 350);
+  }
+  if (activeConversationId === conversationId) removeWaitingState();
+  await appendAssistantWithReveal({ role: "assistant", text, ...(kind ? { kind } : {}) }, conversationId);
+  if (showControls && activeConversationId === conversationId && guidedFlow) renderGuidedControls();
 }
 async function beginGuidedAdd({ logUser = false } = {}) {
   if (logUser) appendEntry({ role: "user", text: "Add something to my schedule." });
   guidedFlow = { type: "create_schedule_item", step: "type", values: { ...GUIDED_ADD_INITIAL_VALUES, recurrence: null, weekdays: [] } };
   await saveGuidedFlow();
-  guidedAppendAssistant(guidedPrompt("type"));
+  await guidedAppendAssistant(guidedPrompt("type"));
 }
 function guidedSummaryText(values) {
   const lines = [values.title, formatKampalaDate(values.date), values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed", values.category || "Personal"];
@@ -3047,9 +3109,22 @@ function guidedAdvance() {
   const index = steps.indexOf(guidedFlow.step);
   guidedFlow.step = steps[Math.min(index + 1, steps.length - 1)];
 }
-async function guidedAskCurrentStep() {
-  await saveGuidedFlow();
-  guidedAppendAssistant(guidedPrompt(guidedFlow.step));
+async function guidedAskCurrentStep({ wait = false } = {}) {
+  const conversationId = activeConversationId;
+  const prompt = guidedPrompt(guidedFlow.step);
+  const shouldWait = wait && guidedFlow.step !== "category";
+  assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  const startedAt = performance.now();
+  if (shouldWait && activeConversationId === conversationId) {
+    showWaitingState();
+    await new Promise(resolve => requestAnimationFrame(resolve));
+  }
+  const saved = saveGuidedFlow();
+  if (shouldWait) await waitForPresentation(startedAt, 350);
+  await saved;
+  if (activeConversationId === conversationId) removeWaitingState();
+  await appendAssistantWithReveal({ role: "assistant", text: prompt }, conversationId);
+  if (activeConversationId === conversationId && guidedFlow) renderGuidedControls();
 }
 function parseGuidedDate(text) {
   const value = text.trim().toLowerCase();
@@ -3099,66 +3174,66 @@ async function handleGuidedAnswer(text) {
   if (step === "switch_question" && ["yes", "cancel", "cancel creation"].includes(answer.toLowerCase())) { await handleGuidedControl("cancel_and_ask"); return; }
   if (step === "switch_question" && ["no", "keep", "keep creating"].includes(answer.toLowerCase())) { await handleGuidedControl("keep_guided"); return; }
   if (["cancel", "cancel schedule creation", "cancel creation"].includes(answer.toLowerCase())) { await cancelGuidedAdd(); return; }
-  if (step === "switch_question") { guidedAppendAssistant("Choose whether to cancel schedule creation or keep going with it."); return; }
+  if (step === "switch_question") { await guidedAppendAssistant("Choose whether to cancel schedule creation or keep going with it."); return; }
   if (step === "summary") {
     const normalized = answer.toLowerCase();
     if (["cancel", "cancel creation"].includes(normalized)) { await cancelGuidedAdd(); return; }
     if (["edit", "back", "change"].includes(normalized)) { guidedFlow.step = "title"; await guidedAskCurrentStep(); return; }
-    guidedAppendAssistant("Use Add to schedule, Edit, or Cancel on the summary card.");
+    await guidedAppendAssistant("Use Add to schedule, Edit, or Cancel on the summary card.");
     return;
   }
   if (step === "type") {
     const type = answer.toLowerCase();
-    if (!["activity", "task", "routine"].includes(type)) { guidedAppendAssistant("Choose Activity, Task, or Routine."); return; }
+    if (!["activity", "task", "routine"].includes(type)) { await guidedAppendAssistant("Choose Activity, Task, or Routine."); return; }
     values.itemType = type;
   } else if (step === "title") {
-    if (!answer || answer.length > 200) { guidedAppendAssistant("Enter a title of 1 to 200 characters."); return; }
+    if (!answer || answer.length > 200) { await guidedAppendAssistant("Enter a title of 1 to 200 characters."); return; }
     values.title = answer;
   } else if (step === "date") {
     const date = parseGuidedDate(answer);
-    if (!date) { guidedAppendAssistant("Enter a valid date as YYYY-MM-DD, today, or tomorrow."); return; }
+    if (!date) { await guidedAppendAssistant("Enter a valid date as YYYY-MM-DD, today, or tomorrow."); return; }
     values.date = date;
   } else if (step === "start" || step === "end") {
     if (!answer && values.itemType === "routine") values[step] = null;
     else {
       const time = parseGuidedTime(answer);
-      if (!time) { guidedAppendAssistant(`Enter a valid ${step} time, such as 2:00 PM or 14:00.`); return; }
+      if (!time) { await guidedAppendAssistant(`Enter a valid ${step} time, such as 2:00 PM or 14:00.`); return; }
       values[step] = time;
-      if (step === "end" && values.start && time <= values.start) { guidedAppendAssistant("End time must be later than start time."); return; }
+      if (step === "end" && values.start && time <= values.start) { await guidedAppendAssistant("End time must be later than start time."); return; }
     }
   } else if (step === "interval") {
     const interval = Number(answer);
-    if (!Number.isInteger(interval) || interval < 1 || interval > 365) { guidedAppendAssistant("Enter a positive whole number from 1 to 365."); return; }
+    if (!Number.isInteger(interval) || interval < 1 || interval > 365) { await guidedAppendAssistant("Enter a positive whole number from 1 to 365."); return; }
     values.recurrence.interval = interval;
   } else if (step === "frequency") {
     const frequency = answer.toLowerCase();
-    if (!["daily", "weekly", "monthly"].includes(frequency)) { guidedAppendAssistant("Choose daily, weekly, or monthly."); return; }
+    if (!["daily", "weekly", "monthly"].includes(frequency)) { await guidedAppendAssistant("Choose daily, weekly, or monthly."); return; }
     values.recurrence = { frequency, interval: 1, days: [] };
     values.weekdays = [];
   } else if (step === "weekdays") {
     const parts = answer.toLowerCase().split(/[\s,]+/).filter(Boolean);
     const days = parts.map(value => GUIDED_WEEKDAYS.findIndex(day => day.toLowerCase().startsWith(value))).filter(day => day >= 0);
-    if (!days.length || days.length !== parts.length) { guidedAppendAssistant("Enter weekday names such as Monday, Wednesday, or Friday."); return; }
+    if (!days.length || days.length !== parts.length) { await guidedAppendAssistant("Enter weekday names such as Monday, Wednesday, or Friday."); return; }
     values.weekdays = [...new Set(days)];
     values.recurrence.days = values.weekdays;
   } else if (step === "category") {
     const category = guidedCategoryNames().find(name => name.toLowerCase() === answer.toLowerCase());
-    if (!category && !(values.itemType === "task" && !answer)) { guidedAppendAssistant("Choose one of the available categories, or skip this optional step."); return; }
+    if (!category && !(values.itemType === "task" && !answer)) { await guidedAppendAssistant("Choose one of the available categories, or skip this optional step."); return; }
     if (category) values.category = category;
   } else if (step === "notes") {
-    if (answer.length > 2000) { guidedAppendAssistant("Keep the note to 2,000 characters or fewer."); return; }
+    if (answer.length > 2000) { await guidedAppendAssistant("Keep the note to 2,000 characters or fewer."); return; }
     values.notes = answer;
   }
   if (step === "category" && values.itemType === "task" && !answer) values.category = null;
   guidedAdvance();
-  await guidedAskCurrentStep();
+  await guidedAskCurrentStep({ wait: true });
 }
 async function cancelGuidedAdd() {
   guidedFlow = null;
   pendingQuickQuestionId = null;
   await saveGuidedFlow();
   assistantEls.conversation.querySelector("#guidedControls")?.remove();
-  appendEntry({ role: "assistant", text: "Schedule creation cancelled." });
+  await guidedAppendAssistant("Schedule creation cancelled.", { showControls: false });
 }
 async function confirmGuidedAdd() {
   if (!guidedFlow || guidedSaveInProgress) return;
@@ -3179,7 +3254,7 @@ async function confirmGuidedAdd() {
     guidedFlow.conflictKey = conflictKey;
     guidedFlow.conflictMessage = `Schedule conflict: ${candidate.title} overlaps with ${otherTitle} from ${formatTime(conflict.overlapStart)} to ${formatTime(conflict.overlapEnd)}.`;
     await saveGuidedFlow();
-    guidedAppendAssistant(`${guidedFlow.conflictMessage} You can edit the details or add it anyway.`);
+    await guidedAppendAssistant(`${guidedFlow.conflictMessage} You can edit the details or add it anyway.`);
     return;
   }
   guidedSaveInProgress = true;
@@ -3188,14 +3263,14 @@ async function confirmGuidedAdd() {
   try { result = await saCreateItem({ ...updates, status: "upcoming", postponed: 0 }); }
   catch { result = { success: false }; }
   finally { guidedSaveInProgress = false; }
-  if (!result?.success) { guidedAppendAssistant("The item could not be saved. Try again."); return; }
+  if (!result?.success) { await guidedAppendAssistant("The item could not be saved. Try again."); return; }
   if (result.item && typeof window.refreshAssistantScheduleItem === "function") window.refreshAssistantScheduleItem(result.item, "created");
   const summary = guidedSummaryText(values);
   guidedFlow = null;
   pendingQuickQuestionId = null;
   await saveGuidedFlow();
-  appendEntry({ role: "assistant", text: `Added to your schedule.\n${summary}` });
   assistantEls.conversation.querySelector("#guidedControls")?.remove();
+  await guidedAppendAssistant(`Added to your schedule.\n${summary}`, { showControls: false, kind: "guided_completion" });
 }
 async function handleGuidedControl(action, value) {
   if (!guidedFlow) return;
@@ -3242,17 +3317,17 @@ async function handleGuidedControl(action, value) {
     return;
   }
   if (action === "continue_weekdays") {
-    if (!guidedFlow.values.weekdays.length) { guidedAppendAssistant("Select at least one weekday."); return; }
+    if (!guidedFlow.values.weekdays.length) { await guidedAppendAssistant("Select at least one weekday."); return; }
     appendEntry({ role: "user", text: guidedFlow.values.weekdays.map(day => GUIDED_WEEKDAYS[day]).join(", ") });
     guidedAdvance();
-    await guidedAskCurrentStep();
+    await guidedAskCurrentStep({ wait: true });
     return;
   }
   if (action === "type") {
     guidedFlow.values.itemType = value;
     appendEntry({ role: "user", text: value[0].toUpperCase() + value.slice(1) });
     guidedAdvance();
-    await guidedAskCurrentStep();
+    await guidedAskCurrentStep({ wait: true });
     return;
   }
   if (action === "frequency") {
@@ -3260,14 +3335,14 @@ async function handleGuidedControl(action, value) {
     guidedFlow.values.weekdays = [];
     appendEntry({ role: "user", text: value[0].toUpperCase() + value.slice(1) });
     guidedAdvance();
-    await guidedAskCurrentStep();
+    await guidedAskCurrentStep({ wait: true });
     return;
   }
   if (action === "category") {
     guidedFlow.values.category = value;
     appendEntry({ role: "user", text: value });
     guidedAdvance();
-    await guidedAskCurrentStep();
+    await guidedAskCurrentStep({ wait: true });
     return;
   }
   if (action === "skip") {
@@ -3277,28 +3352,40 @@ async function handleGuidedControl(action, value) {
     const skipped = guidedFlow.step;
     appendEntry({ role: "user", text: skipped === "notes" ? "Skip note" : skipped === "category" ? "Skip category" : "Skip time" });
     guidedAdvance();
-    await guidedAskCurrentStep();
+    await guidedAskCurrentStep({ wait: true });
   }
 }
 
 async function runQuickQuestion(id, { logUser = true } = {}) {
   const spec = quickQuestionSpecs[id];
-  if (!spec || id === "guided_add") return;
-  const requestConvId = await ensureConversation();
-  if (logUser) appendEntry({ role: "user", text: spec.label });
-  const userMessages = conversation.filter(message => message.role === "user");
-  if (userMessages.length === 1 && requestConvId) {
-    firebaseStore.updateConversationSummary(requestConvId, { title: deriveConversationTitle(spec.label) }).catch(() => {});
+  if (!spec || id === "guided_add" || quickQuestionInProgress) return;
+  quickQuestionInProgress = true;
+  let requestConvId;
+  try {
+    requestConvId = await ensureConversation();
+    if (logUser) appendEntry({ role: "user", text: spec.label });
+    const userMessages = conversation.filter(message => message.role === "user");
+    if (userMessages.length === 1 && requestConvId) {
+      firebaseStore.updateConversationSummary(requestConvId, { title: deriveConversationTitle(spec.label) }).catch(() => {});
+    }
+
+    const waitingStartedAt = performance.now();
+    showWaitingState();
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    let result;
+    try { result = spec.run(); }
+    catch { result = { text: "I couldn't answer that right now." }; }
+    await waitForPresentation(waitingStartedAt, 350);
+    if (activeConversationId === requestConvId) removeWaitingState();
+    await appendAssistantWithReveal({ role: "assistant", text: result.text, items: result.items || [] }, requestConvId);
+    if (activeConversationId === requestConvId) {
+      if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
+      assistantEls.input?.focus();
+    }
+  } finally {
+    if (activeConversationId === requestConvId) removeWaitingState();
+    quickQuestionInProgress = false;
   }
-  let result;
-  try { result = spec.run(); }
-  catch {
-    result = { text: "I couldn't answer that right now." };
-  }
-  appendEntry({ role: "assistant", text: result.text, items: result.items || [] });
-  if (assistantEls.empty) assistantEls.empty.hidden = conversation.length > 0;
-  scrollToBottom();
-  assistantEls.input?.focus();
 }
 
 function closeQuickQuestions() {
@@ -3350,34 +3437,39 @@ function refreshQuickQuestionsLayout() {
   const available = Math.floor(composerRect.top - viewportTop - 12);
   panel.style.maxHeight = `${Math.max(72, available)}px`;
   panel.style.maxWidth = `${Math.max(180, Math.min(320, window.innerWidth - composerRect.left - 24))}px`;
-  scrollToBottom();
 }
 
 async function handleQuickQuestion(id) {
   const spec = quickQuestionSpecs[id];
-  if (!spec) return;
+  if (!spec || quickQuestionInProgress || quickQuestionSelectionPending) return;
+  quickQuestionSelectionPending = true;
   try {
-    await ensureConversation();
-  } catch {
-    showPersistenceFailure();
-    return;
+    try {
+      await ensureConversation();
+    } catch {
+      showPersistenceFailure();
+      return;
+    }
+    if (guidedFlow && id !== "guided_add") {
+      pendingQuickQuestionId = id;
+      guidedFlow.returnStep = guidedFlow.step;
+      guidedFlow.queuedQuickQuestion = id;
+      guidedFlow.step = "switch_question";
+      await saveGuidedFlow();
+      await guidedAppendAssistant("You’re in the middle of creating a schedule item. Cancel it before asking this question?");
+      return;
+    }
+    if (quickQuestionsOpen) closeQuickQuestions();
+    if (id === "guided_add") {
+      appendEntry({ role: "user", text: "Add something to my schedule." });
+      await beginGuidedAdd();
+      return;
+    }
+    if (guidedFlow) { guidedFlow = null; await saveGuidedFlow(); }
+    await runQuickQuestion(id);
+  } finally {
+    quickQuestionSelectionPending = false;
   }
-  if (guidedFlow && id !== "guided_add") {
-    pendingQuickQuestionId = id;
-    guidedFlow.returnStep = guidedFlow.step;
-    guidedFlow.queuedQuickQuestion = id;
-    guidedFlow.step = "switch_question";
-    await saveGuidedFlow();
-    guidedAppendAssistant("You’re in the middle of creating a schedule item. Cancel it before asking this question?");
-    return;
-  }
-  appendEntry({ role: "user", text: id === "guided_add" ? "Add something to my schedule." : spec.label });
-  if (id === "guided_add") {
-    await beginGuidedAdd();
-    return;
-  }
-  if (guidedFlow) { guidedFlow = null; await saveGuidedFlow(); }
-  await runQuickQuestion(id, { logUser: false });
 }
 
 function submitInput() {
@@ -3645,7 +3737,7 @@ assistantEls.conversation?.addEventListener("scroll", () => {
   if (!assistantEls.scrollLatest) return;
   if (isNearBottom(60)) {
     assistantEls.scrollLatest.hidden = true;
-  } else if (assistantEls.conversation.scrollHeight - assistantEls.conversation.scrollTop - assistantEls.conversation.clientHeight > 140) {
+  } else {
     assistantEls.scrollLatest.hidden = false;
   }
 });
