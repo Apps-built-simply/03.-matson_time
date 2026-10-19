@@ -43,7 +43,7 @@ const failedAttentionVisualAssets = new Set();
 
 const els = {
   todayView: document.querySelector("#todayView"), calendarView: document.querySelector("#calendarView"), assistantView: document.querySelector("#assistantView"), progressView: document.querySelector("#progressView"),
-  todayMain: document.querySelector("#todayMain"), emptyDay: document.querySelector("#emptyDayState"), emptyAdd: document.querySelector("#emptyAddButton"), attentionSection: document.querySelector("#attentionSection"), todayScheduleSection: document.querySelector("#todayScheduleSection"),
+  todayMain: document.querySelector("#todayMain"), emptyDay: document.querySelector("#emptyDayState"), emptyAdd: document.querySelector("#emptyAddButton"), scheduleCat: document.querySelector("#scheduleCat"), attentionSection: document.querySelector("#attentionSection"), todayScheduleSection: document.querySelector("#todayScheduleSection"),
   list: document.querySelector("#scheduleList"), count: document.querySelector("#scheduleCount"),
   now: document.querySelector("#nowCard"), conflict: document.querySelector("#conflictNotice"),
   monthYear: document.querySelector("#monthYear"), calendarGrid: document.querySelector("#calendarGrid"), calendarCard: document.querySelector("#calendarCard"),
@@ -73,6 +73,11 @@ const els = {
   closeEventDetailButton: document.querySelector("#closeEventDetailButton"), closeEventDetailAction: document.querySelector("#closeEventDetailAction"), editEventDetailButton: document.querySelector("#editEventDetailButton"),
   eventDetailTrigger: null, eventDetailItemId: null
 };
+
+els.scheduleCat.addEventListener("error", () => {
+  els.scheduleCat.hidden = true;
+  console.error("Matson Time Today schedule illustration failed to load.");
+}, { once: true });
 
 const categorySelect = document.querySelector('#addForm select[name="category"]');
 if (categorySelect && window.cloudCategories?.length) {
@@ -377,9 +382,22 @@ function render() {
   const todayState = resolveTodayState(todayItems, heroItems);
   els.todayMain.dataset.todayState = todayState;
   const hasTodayItems = todayItems.length > 0;
-  els.emptyDay.hidden = hasTodayItems;
+  const isResolvedDay = todayState === "resolved_day";
+  els.emptyDay.hidden = todayState === "active_day";
+  els.emptyDay.classList.toggle("is-resolved", isResolvedDay);
+  if (isResolvedDay) {
+    els.emptyDay.removeAttribute("aria-labelledby");
+    els.emptyDay.setAttribute("aria-label", "Nothing needs your attention right now.");
+  } else {
+    els.emptyDay.setAttribute("aria-labelledby", "emptyDayTitle");
+    els.emptyDay.removeAttribute("aria-label");
+  }
+  els.emptyDay.querySelector("#emptyDayTitle").hidden = isResolvedDay;
+  els.emptyDay.querySelector("#emptyDayCopy").textContent = isResolvedDay
+    ? "Nothing needs your attention right now."
+    : "Nothing is scheduled for today.";
   els.todayMain.classList.toggle("is-empty", !hasTodayItems);
-  els.attentionSection.hidden = !hasTodayItems;
+  els.attentionSection.hidden = todayState !== "active_day";
   els.todayScheduleSection.hidden = !hasTodayItems;
 
   if (hasTodayItems) {

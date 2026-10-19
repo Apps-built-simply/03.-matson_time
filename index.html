@@ -33,9 +33,11 @@
 
       <main id="todayMain" class="container today-main">
         <section id="emptyDayState" class="empty-day" hidden aria-labelledby="emptyDayTitle">
+          <div class="schedule-cat-stage">
+            <img id="scheduleCat" src="assets/animations/schedule-cat.svg" alt="" aria-hidden="true" draggable="false" class="schedule-cat" loading="eager" decoding="async">
+          </div>
           <h2 id="emptyDayTitle">Your day is open.</h2>
-          <img src="assets/illustrations/empty-day-cat.svg" alt="" aria-hidden="true" draggable="false" class="empty-state-cat" loading="eager" decoding="async">
-          <p>Nothing is scheduled for today.</p>
+          <p id="emptyDayCopy">Nothing is scheduled for today.</p>
           <button id="emptyAddButton" class="empty-add" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
             <span>Add something</span>
