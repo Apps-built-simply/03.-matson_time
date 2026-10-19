@@ -183,7 +183,7 @@ export async function loadConversation(id, max = 50) {
       kind: typeof value.kind === "string" ? value.kind.slice(0, 40) : "assistant_message",
       referencedItemIds: Array.isArray(value.referencedItemIds) ? value.referencedItemIds.filter(id => typeof id === "string").slice(0, 20) : [],
       deletedItemIds: Array.isArray(value.deletedItemIds) ? value.deletedItemIds.filter(id => typeof id === "string").slice(0, 20) : [],
-      proposalSummary: typeof value.proposalSummary === "string" ? value.proposalSummary.slice(0, 300) : null,
+      proposalSummary: typeof value.proposalSummary === "string" ? value.proposalSummary.slice(0, 100000) : null,
       resolved: value.resolved !== false, guidedFlowId: typeof value.guidedFlowId === "string" ? value.guidedFlowId : null, guidedStepId: typeof value.guidedStepId === "string" ? value.guidedStepId : null, createdAt: value.createdAt || null
     };
   }).reverse();
@@ -216,6 +216,14 @@ export async function addConversationMessage(conversationId, message) {
   metadata.updatedAt = serverTimestamp();
   await updateDoc(userDoc("conversations", conversationId), metadata);
   return ref.id;
+}
+export async function updateConversationMessage(conversationId, messageId, changes) {
+  if (!conversationId || !messageId || !changes || typeof changes !== "object") return;
+  const allowed = ["resolved", "proposalSummary", "text", "kind"];
+  const safeChanges = Object.fromEntries(Object.entries(changes).filter(([key]) => allowed.includes(key)).map(([key, value]) => [key, key === "proposalSummary" ? String(value || "").slice(0, 100000) : value]));
+  await updateDoc(doc(userCollection("conversations", conversationId, "messages"), messageId), safeChanges);
+  const messages = conversationMessageCache.get(conversationId) || [];
+  conversationMessageCache.set(conversationId, messages.map(message => message.id === messageId ? { ...message, ...safeChanges } : message));
 }
 export async function deleteConversation(conversationId) {
   if (!conversationId) return;
@@ -328,7 +336,7 @@ export async function saveAssistantState(state) {
   const pending = state.pendingClarification;
   const pendingClarification = pending && typeof pending === "object" ? {
     intent: String(pending.intent || "").slice(0, 40),
-    knownFields: Object.fromEntries(["type", "title", "date", "start", "end"].filter(key => pending.knownFields?.[key] != null).map(key => [key, String(pending.knownFields[key]).slice(0, 120)])),
+    knownFields: Object.fromEntries(["type", "title", "date", "start", "end", "category", "notes", "rawMessage", "timePeriod", "frequency", "recurrenceJson", "targetId", "candidateIds"].filter(key => pending.knownFields?.[key] != null).map(key => [key, String(pending.knownFields[key]).slice(0, key === "rawMessage" ? 1000 : 500)])),
     missingFields: Array.isArray(pending.missingFields) ? pending.missingFields.slice(0, 8).map(value => String(value).slice(0, 40)) : []
   } : null;
   const entityRegistry = Array.isArray(state.entityRegistry) ? state.entityRegistry.slice(-10).filter(entity => entity && typeof entity.id === "string" && entity.id).map(entity => ({
@@ -422,7 +430,7 @@ export function tokenizeKeywords(text) {
 export const firebaseStore = {
   observeAuthState, signInAnonymouslyWhenNeeded, getCurrentUser,
   loadScheduleItems, createScheduleItem, updateScheduleItem, deleteScheduleItem, writeSchedulePlanBatch, loadCategories, createCategory, updateCategory,
-  createConversation, listRecentConversations, loadConversation, addConversationMessage, deleteConversation, resolveUnresolvedProposals, markConversationItemDeleted, markConversationItemsDeleted, updateConversationSummary, searchConversationSummaries,
+  createConversation, listRecentConversations, loadConversation, addConversationMessage, updateConversationMessage, deleteConversation, resolveUnresolvedProposals, markConversationItemDeleted, markConversationItemsDeleted, updateConversationSummary, searchConversationSummaries,
   loadAssistantState, saveAssistantState, clearAssistantState,
   createMemory, updateMemory, listActiveMemories, searchMemories, tokenizeKeywords
 };

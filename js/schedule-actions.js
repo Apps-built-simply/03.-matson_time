@@ -14,17 +14,14 @@ function scheduleValidateTime(value) {
 function scheduleValidateItem(item) {
   if (!item || !["activity", "task", "routine"].includes(item.type)) return "Item type is invalid";
   if (!item.title || !item.title.trim()) return "Title is required";
-  const pendingSchedule = item.status === "postponed" && item.schedulePending === true;
+  const pendingSchedule = item.schedulePending === true;
   if (!pendingSchedule && !scheduleValidateDate(item.date)) return "Valid date (YYYY-MM-DD) is required";
   if (pendingSchedule && (item.date || item.start || item.end)) return "An undecided schedule cannot include a date or time";
   if (item.start && !scheduleValidateTime(item.start)) return "Valid start time (HH:mm) is required";
   if (item.end && !scheduleValidateTime(item.end)) return "Valid end time (HH:mm) is required";
   if (item.start && item.end && item.start >= item.end) return "End time must be after start time";
-  if (item.type === "activity" && !pendingSchedule) {
-    if (!scheduleValidateTime(item.start)) return "Valid start time (HH:mm) is required for activities";
-    if (!scheduleValidateTime(item.end)) return "Valid end time (HH:mm) is required for activities";
-    if (item.start >= item.end) return "End time must be after start time";
-  }
+  if (item.type === "activity" && !pendingSchedule && item.start && !scheduleValidateTime(item.start)) return "Valid start time (HH:mm) is required for activities";
+  if (item.type === "activity" && !pendingSchedule && item.end && !scheduleValidateTime(item.end)) return "Valid end time (HH:mm) is required for activities";
   if (item.category && !saGetAvailableCategories().includes(item.category)) return "Category is invalid";
   if (item.recurrence && (!(["daily", "weekly", "monthly"].includes(item.recurrence.frequency)) || !Number.isInteger(item.recurrence.interval) || item.recurrence.interval < 1 || !Array.isArray(item.recurrence.days) || item.recurrence.days.some(day => !Number.isInteger(day) || day < 0 || day > 6))) return "Recurrence is invalid";
   return null;
@@ -45,18 +42,21 @@ async function saCreateItem(item) {
   const error = scheduleValidateItem(item);
   if (error) return { success: false, error };
   const newItem = {
-    id: crypto.randomUUID(),
+    id: typeof item.id === "string" && item.id ? item.id : crypto.randomUUID(),
     title: item.title.trim(),
-    date: item.date,
+    date: item.schedulePending ? null : item.date,
     type: item.type,
     start: item.start || "",
     end: item.end || "",
     category: item.category || "Personal",
     notes: item.notes?.trim() || "",
     status: "upcoming",
-    postponed: 0
+    postponed: 0,
+    schedulePending: item.schedulePending === true
   };
   if (item.recurrence) newItem.recurrence = item.recurrence;
+  const existing = items.find(candidate => candidate.id === newItem.id);
+  if (existing) return { success: true, item: existing, alreadyCreated: true };
   try { await firebaseStore.createScheduleItem(newItem); }
   catch {
     console.error("schedule_create_failed");

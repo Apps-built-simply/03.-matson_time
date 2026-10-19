@@ -593,6 +593,17 @@ section { margin-top: 28px; }
 .response-status.status-overdue { color: var(--status-overdue); }
 .response-status.status-missed { color: var(--status-missed); }
 .response-status.status-cancelled { color: var(--status-cancelled); }
+.response-list[data-progressive] > *,
+.schedule-completion-card[data-progressive] > p,
+.proposal .reveal-pending,
+.choice-reveal-pending { opacity: 0; transform: translateY(4px); }
+.response-list > .is-revealed,
+.schedule-completion-card > .is-revealed,
+.proposal .is-revealed,
+.guided-choice-row.is-revealed { opacity: 1; transform: translateY(0); transition: opacity 160ms ease-out, transform 160ms ease-out; }
+.schedule-completion-card .completion-label { display: inline-block; min-width: 72px; margin-right: 10px; color: var(--color-text-secondary); font-weight: 400; }
+.schedule-completion-card .completion-value { color: var(--color-text); }
+.schedule-completion-card p + p { padding-top: 5px; border-top: 1px solid var(--guided-divider); }
 
 /* Waiting State */
 .waiting-message { margin-bottom: 14px; }
@@ -1014,6 +1025,7 @@ section { margin-top: 28px; }
 .proposal { margin: 16px 0; padding: 16px; border: 1px solid var(--color-border); border-radius: var(--radius); background: var(--color-surface); }
 .proposal-header h3 { margin: 0 0 12px; font-size: 1rem; font-weight: 600; color: var(--color-text); }
 .proposal-details { display: grid; gap: 8px; margin-bottom: 12px; }
+.proposal .conflict { padding: 9px 11px; border: 0; border-radius: 6px; background: rgba(154, 83, 24, .16); color: #f4b46d; box-shadow: none; }
 .detail-row { display: flex; justify-content: space-between; gap: 12px; }
 .detail-label { color: var(--color-text-secondary); font-size: .82rem; }
 .detail-value { color: var(--color-text); font-size: .88rem; font-weight: 500; }
@@ -1039,6 +1051,14 @@ section { margin-top: 28px; }
   .quick-question { transition: none; }
   .quick-questions-control svg { transition: none; }
   .scroll-latest-button { scroll-behavior: auto; }
+  .response-list[data-progressive] > *,
+  .response-list > .is-revealed,
+  .schedule-completion-card[data-progressive] > p,
+  .schedule-completion-card > .is-revealed,
+  .proposal .reveal-pending,
+  .proposal .is-revealed,
+  .choice-reveal-pending,
+  .guided-choice-row.is-revealed { opacity: 1; transform: none; transition: none; }
 }
 .guided-summary-card .guided-conflict { color: #fca5a5; }
 .guided-summary-card .guided-summary-type { margin-top: -4px; font-size: .78rem; }

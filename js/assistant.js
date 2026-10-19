@@ -55,7 +55,10 @@ let isComposing = false;
 let sendInProgress = false;
 let newConversationInProgress = false;
 let waitingEl = null;
+let waitingStartedAt = null;
 let activeRevealController = null;
+let responseRevealQueue = Promise.resolve();
+const scheduleProposalRegistry = new Map();
 let quickQuestionInProgress = false;
 let quickQuestionSelectionPending = false;
 const GUIDED_LAUNCHER_PENDING_KEY = `matson-time-guided-launcher-pending-${firebaseStore.getCurrentUser().uid}`;
@@ -68,7 +71,7 @@ let contextMenuConv = null;
 let contextMenuTriggerEl = null;
 let deletingConversationId = null;
 let renamingConversationId = null;
-let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ id: message.id, role: message.role, text: message.text, kind: message.kind, guidedFlowId: message.guidedFlowId, guidedStepId: message.guidedStepId, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [], deletedItemIds: message.deletedItemIds || [] })) : [];
+let conversation = Array.isArray(window.initialConversation?.messages) ? window.initialConversation.messages.map(message => ({ id: message.id, role: message.role, text: message.text, kind: message.kind, proposalSummary: message.proposalSummary || null, guidedFlowId: message.guidedFlowId, guidedStepId: message.guidedStepId, resolved: message.resolved, referencedItemIds: message.referencedItemIds || [], deletedItemIds: message.deletedItemIds || [] })) : [];
 let activeConversationId = window.initialConversation?.id || window.initialAssistantState?.activeConversationId || null;
 let guidedFlowsByConversation = window.initialAssistantState?.guidedFlowsByConversation && typeof window.initialAssistantState.guidedFlowsByConversation === "object" ? { ...window.initialAssistantState.guidedFlowsByConversation } : {};
 const initialGuidedFlow = activeConversationId ? (guidedFlowsByConversation[activeConversationId] || (window.initialAssistantState?.activeConversationId === activeConversationId ? window.initialAssistantState?.guidedFlow : null)) : null;
@@ -217,7 +220,7 @@ function saveEntryForConversation(convId, entry) {
     kind: entry.kind || (entry.role === "user" ? "user_message" : "assistant_message"),
     referencedItemIds: entry.referencedItemIds || [],
     deletedItemIds: [],
-    proposalSummary: entry.proposalSummary || null,
+    proposalSummary: encodeStructuredEntry(entry),
     resolved: entry.resolved !== false,
     ...(entry.guidedFlowId ? { guidedFlowId: entry.guidedFlowId, guidedStepId: entry.guidedStepId } : {})
   };
@@ -592,6 +595,7 @@ async function openConversation(id) {
       id: message.id, role: message.role,
       text: message.text,
       kind: message.kind,
+      proposalSummary: message.proposalSummary || null,
       guidedFlowId: message.guidedFlowId, guidedStepId: message.guidedStepId,
       resolved: message.resolved !== false,
       referencedItemIds: message.referencedItemIds || [],
@@ -608,12 +612,14 @@ async function openConversation(id) {
     guidedFlow = guidedCompletedFlow ? null : savedGuidedFlow;
     pendingQuickQuestionId = guidedFlow?.queuedQuickQuestion || null;
     if (guidedFlow) guidedFlowsByConversation[id] = guidedFlow;
-    pendingClarification = isActive ? state.pendingClarification : null;
+    pendingClarification = isActive ? state.pendingClarification : restoreNaturalClarificationFromConversation(conversation);
     activePlanningContext = isActive ? state.planningContext : null;
     entityRegistry = isActive && Array.isArray(state.entityRegistry) ? state.entityRegistry.slice(-10) : [];
     pendingOperation = isActive ? state.pendingOperation || null : null;
     referencedSets = isActive && Array.isArray(state.referencedSets) ? state.referencedSets.slice(-5) : [];
     lastConfirmedAction = isActive ? state.lastConfirmedAction || null : null;
+    currentProposal = restorePendingScheduleProposal(conversation, id);
+    if (currentProposal?.confirmationState === "failed") persistScheduleProposalState(currentProposal, "failed").catch(() => {});
 
     await firebaseStore.saveAssistantState({
       activeConversationId: id,
@@ -682,6 +688,7 @@ function scrollToBottom() {
 
 function showWaitingState() {
   if (waitingEl) return;
+  waitingStartedAt = performance.now();
   const shouldKeepBottom = isNearBottom();
   const msg = document.createElement("div");
   msg.className = "message assistant-message waiting-message";
@@ -725,6 +732,7 @@ function removeWaitingState() {
   if (waitingEl) {
     waitingEl.remove();
     waitingEl = null;
+    waitingStartedAt = null;
     updateAssistantEmptyState();
   }
 }
@@ -743,6 +751,59 @@ function updateAssistantEmptyState() {
 function waitForPresentation(startedAt, minimumMs = 350) {
   const remaining = Math.max(0, minimumMs - (performance.now() - startedAt));
   return remaining ? new Promise(resolve => setTimeout(resolve, remaining)) : Promise.resolve();
+}
+
+function restoreStructuredEntry(entry) {
+  if (!entry || entry.items?.length || typeof entry.proposalSummary !== "string" || !entry.proposalSummary.startsWith("matson-structured-v1:")) return entry;
+  try {
+    const value = JSON.parse(entry.proposalSummary.slice("matson-structured-v1:".length));
+    return { ...entry, proposalSummary: value.proposalSummary || null, items: Array.isArray(value.items) ? value.items : [], scheduleItem: value.scheduleItem || null, proposalSnapshot: value.proposalSnapshot || null };
+  } catch { return entry; }
+}
+
+function restorePendingScheduleProposal(entries, conversationId) {
+  for (const rawEntry of [...(entries || [])].reverse()) {
+    if (rawEntry.role !== "assistant" || rawEntry.kind !== "proposal_summary" || rawEntry.resolved !== false) continue;
+    const entry = restoreStructuredEntry(rawEntry);
+    const snapshot = entry.proposalSnapshot;
+    if (!snapshot?.id || snapshot.sourceConversationId !== conversationId || !snapshot.action?.type) continue;
+    if (!["create_item", "update_item", "reschedule_item", "postpone_item", "cancel_item", "complete_item"].includes(snapshot.action.type)) continue;
+    const state = snapshot.confirmationState === "confirming" ? "failed" : snapshot.confirmationState;
+    if (!["pending", "failed"].includes(state)) continue;
+    const proposal = registerScheduleProposal({
+      id: snapshot.id,
+      conversationId,
+      operation: snapshot.operation,
+      confirmationState: state,
+      lifecycle: state,
+      action: snapshot.action,
+      message: entry.text,
+      source: "local",
+      originalItem: snapshot.action.targetId ? saFindItemById(snapshot.action.targetId) : null,
+      summaryMessageId: rawEntry.id,
+      summaryText: entry.text
+    }, conversationId);
+    return proposal;
+  }
+  return null;
+}
+
+function encodeStructuredEntry(entry) {
+  if (!entry.items?.length && !entry.scheduleItem && !entry.proposalSnapshot) return entry.proposalSummary || null;
+  return "matson-structured-v1:" + JSON.stringify({ proposalSummary: entry.proposalSummary || null, items: Array.isArray(entry.items) ? entry.items.slice(0, 200) : [], scheduleItem: entry.scheduleItem || null, proposalSnapshot: entry.proposalSnapshot || null });
+}
+
+function revealStructuredRows(container, signal, onUpdate) {
+  if (!container?.children?.length) return Promise.resolve();
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const rows = [...container.children];
+  if (reduced) { rows.forEach(row => row.classList.add("is-revealed")); onUpdate?.(); return Promise.resolve(); }
+  return rows.reduce((queue, row) => queue.then(() => new Promise(resolve => {
+    if (signal?.aborted || !container.isConnected) { resolve(); return; }
+    row.classList.add("is-revealed");
+    onUpdate?.();
+    setTimeout(resolve, Math.max(35, Math.min(85, Math.floor(520 / Math.max(rows.length, 1)))));
+  })), Promise.resolve());
 }
 
 function revealAssistantMessage(targetElement, fullText, { onUpdate, signal } = {}) {
@@ -791,7 +852,9 @@ function appendEntry(entry, options = {}) {
   if (!entry.id) entry.id = crypto.randomUUID();
   conversation.push(entry);
   updateAssistantEmptyState();
-  if (!options.skipRender) {
+  if (entry.role === "assistant" && !options.skipRender && !options.restoring) {
+    appendAssistantWithReveal(entry, activeConversationId);
+  } else if (!options.skipRender) {
     renderConversationEntry(entry, options);
   }
   const message = {
@@ -799,7 +862,7 @@ function appendEntry(entry, options = {}) {
     role: entry.role, text: entry.text, kind: entry.kind || (entry.role === "user" ? "user_message" : "assistant_message"),
     referencedItemIds: entry.referencedItemIds || [],
     deletedItemIds: entityRegistry.filter(entity => entity.deleted && (entry.referencedItemIds || []).includes(entity.id)).map(entity => entity.id),
-    proposalSummary: entry.proposalSummary || null,
+    proposalSummary: encodeStructuredEntry(entry),
     resolved: entry.resolved !== false,
     ...(entry.guidedFlowId ? { guidedFlowId: entry.guidedFlowId, guidedStepId: entry.guidedStepId } : {})
   };
@@ -816,11 +879,24 @@ async function appendAssistantWithReveal(entry, conversationId = activeConversat
     saveEntryForConversation(conversationId, entry);
     return;
   }
-  appendEntry(entry, { skipRender: true });
-  await renderConversationEntry(entry, { reveal: true });
+  if (!conversation.some(existing => existing.id === entry.id)) appendEntry(entry, { skipRender: true });
+  const reveal = async () => {
+    if (activeConversationId !== conversationId) return;
+    const startedAt = waitingStartedAt || performance.now();
+    if (!waitingEl) showWaitingState();
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    await waitForPresentation(startedAt, 350);
+    if (activeConversationId !== conversationId) return;
+    removeWaitingState();
+    await renderConversationEntry(entry, { reveal: true });
+  };
+  const task = responseRevealQueue.catch(() => {}).then(reveal);
+  responseRevealQueue = task.catch(() => {});
+  return task;
 }
 
 function renderConversationEntry(entry, options = {}) {
+  entry = restoreStructuredEntry(entry);
   const shouldKeepBottom = isNearBottom();
   const message = document.createElement("div");
   message.className = entry.role === "user" ? "message user-message" : "message assistant-message";
@@ -835,6 +911,7 @@ function renderConversationEntry(entry, options = {}) {
     const bubble = document.createElement("div");
     bubble.className = "assistant-bubble";
     if (entry.kind === "guided_completion") { message.tabIndex = -1; bubble.setAttribute("role", "status"); bubble.setAttribute("aria-live", "polite"); bubble.setAttribute("aria-atomic", "true"); }
+    if (entry.kind === "schedule_completion") message.tabIndex = -1;
     const text = document.createElement("p");
     text.className = "assistant-text";
     bubble.appendChild(text);
@@ -861,18 +938,19 @@ function renderConversationEntry(entry, options = {}) {
       list.className = "response-list";
       let lastDate = null;
       for (const item of entry.items) {
-        if (item.date && item.date !== lastDate) {
+        const group = item.date || item.groupLabel || null;
+        if (group && group !== lastDate) {
           const heading = document.createElement("li");
           heading.className = "response-date-heading";
-          heading.textContent = formatKampalaDate(item.date, { weekday: "long", month: "long", day: "numeric" });
+          heading.textContent = item.date ? formatKampalaDate(item.date, { weekday: "long", month: "long", day: "numeric" }) : String(item.groupLabel);
           list.appendChild(heading);
-          lastDate = item.date;
+          lastDate = group;
         }
         const row = document.createElement("li");
         row.className = "response-row";
         const time = document.createElement("span");
         time.className = "response-time";
-        time.textContent = item.time;
+        time.textContent = item.time || (item.date ? "Time not set" : "Date not set");
         const title = document.createElement("span");
         title.className = "response-title";
         title.textContent = item.title;
@@ -882,11 +960,29 @@ function renderConversationEntry(entry, options = {}) {
         if (["upcoming", "in-progress", "completed", "postponed", "awaiting-check-in", "overdue", "missed", "cancelled"].includes(statusTone)) {
           status.classList.add(`status-${statusTone}`);
         }
-        status.textContent = item.status;
+        status.textContent = item.status || "Upcoming";
         row.append(time, title, status);
         list.appendChild(row);
       }
       responseList = list;
+    }
+    if (entry.kind === "schedule_completion" && entry.scheduleItem) {
+      const item = entry.scheduleItem;
+      completionDetails = document.createElement("div");
+      completionDetails.className = "guided-completed-summary schedule-completion-card";
+      const addField = (label, value, className = "") => {
+        const line = document.createElement("p");
+        if (className) line.className = className;
+        const key = document.createElement("span"); key.className = "completion-label"; key.textContent = label;
+        const content = document.createElement("span"); content.className = "completion-value"; content.textContent = value;
+        line.append(key, content); completionDetails.appendChild(line);
+      };
+      addField("Title", item.title || "Schedule item", "guided-completed-title");
+      addField("Date", item.date ? formatKampalaDate(item.date, { weekday: "long", month: "long", day: "numeric" }) : "Date not set");
+      addField("Time", item.start ? `${formatKampalaTime(item.start)}${item.end ? ` – ${formatKampalaTime(item.end)}` : ""}` : "Time not set");
+      if (item.category) addField("Category", item.category);
+      if (item.notes) addField("Note", item.notes);
+      if (item.recurrence) addField("Repeats", `${item.recurrence.frequency} · every ${item.recurrence.interval}`);
     }
 
     if (options.reveal && !options.restoring) {
@@ -907,9 +1003,28 @@ function renderConversationEntry(entry, options = {}) {
             lastAutoScrollTop = assistantEls.conversation.scrollTop;
           }
         }
-      }).then(() => {
-        if (responseList && message.isConnected) message.appendChild(responseList);
-        if (completionDetails && message.isConnected) message.appendChild(completionDetails);
+      }).then(async () => {
+        if (displayText && entry.kind !== "guided_completion" && message.isConnected) {
+          const announcement = document.createElement("span");
+          announcement.className = "sr-only";
+          announcement.setAttribute("role", "status");
+          announcement.setAttribute("aria-live", "polite");
+          announcement.setAttribute("aria-atomic", "true");
+          announcement.textContent = displayText;
+          bubble.appendChild(announcement);
+        }
+        if (responseList && message.isConnected) {
+          responseList.dataset.progressive = "true";
+          message.appendChild(responseList);
+          await revealStructuredRows(responseList, controller.signal, () => { if (followLatest) scrollToBottom(); });
+          delete responseList.dataset.progressive;
+        }
+        if (completionDetails && message.isConnected) {
+          completionDetails.dataset.progressive = "true";
+          message.appendChild(completionDetails);
+          await revealStructuredRows(completionDetails, controller.signal, () => { if (followLatest) scrollToBottom(); });
+          delete completionDetails.dataset.progressive;
+        }
         if (followLatest) scrollToBottom();
       });
     } else {
@@ -934,7 +1049,9 @@ function renderConversation(options = {}) {
   assistantEls.conversation.replaceChildren();
   if (assistantEls.scrollLatest) assistantEls.scrollLatest.hidden = true;
   for (const entry of conversation) {
-    const displayEntry = entry.resolved === false
+    const restoredProposalId = restoreStructuredEntry(entry).proposalSnapshot?.id;
+    const hasActiveProposal = entry.resolved === false && currentProposal?.id === restoredProposalId;
+    const displayEntry = entry.resolved === false && !hasActiveProposal
       ? { ...entry, text: `${entry.text} (This earlier proposal expired when you left the conversation; request it again to review it.)` }
       : entry;
     renderConversationEntry(displayEntry, { restoring: true, scrollToBottom: false });
@@ -944,9 +1061,61 @@ function renderConversation(options = {}) {
     scrollToBottom();
   }
   renderGuidedControls();
+  renderNaturalPendingChoices();
+  if (currentProposal?.conversationId === activeConversationId) renderProposal(currentProposal);
 }
 
-function renderProposal(proposal) {
+async function renderNaturalChoiceControls(choices, { reveal = true } = {}) {
+  assistantEls.conversation.querySelectorAll(".natural-choice-controls").forEach(node => node.remove());
+  const shell = document.createElement("div");
+  shell.className = "message assistant-message guided-controls-message natural-choice-controls";
+  const card = document.createElement("div");
+  card.className = "guided-choice-card";
+  card.setAttribute("role", "group");
+  card.setAttribute("aria-label", "Choose a schedule detail");
+  for (const [value, label] of choices) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "guided-choice-row";
+    button.dataset.naturalChoice = value;
+    button.setAttribute("aria-label", label);
+    button.disabled = reveal;
+    if (reveal) { button.setAttribute("aria-disabled", "true"); button.classList.add("choice-reveal-pending"); }
+    const marker = document.createElement("span");
+    marker.className = "guided-choice-square";
+    marker.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.className = "guided-choice-label";
+    text.textContent = label;
+    button.append(marker, text);
+    card.appendChild(button);
+  }
+  shell.appendChild(card);
+  assistantEls.conversation.appendChild(shell);
+  scrollToBottom();
+  const buttons = [...card.querySelectorAll("button")];
+  if (!reveal) return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    buttons.forEach(button => { button.classList.remove("choice-reveal-pending"); button.classList.add("is-revealed"); button.disabled = false; button.removeAttribute("aria-disabled"); });
+    return;
+  }
+  for (const button of buttons) {
+    button.classList.remove("choice-reveal-pending");
+    button.classList.add("is-revealed");
+    await new Promise(resolve => setTimeout(resolve, 55));
+  }
+  buttons.forEach(button => { button.disabled = false; button.removeAttribute("aria-disabled"); });
+}
+
+function renderNaturalPendingChoices() {
+  const pending = pendingClarification;
+  const rawMessage = pending?.knownFields?.rawMessage;
+  if (!rawMessage || !["natural_create", "natural_edit_target", "natural_edit_time"].includes(pending.intent)) return;
+  const result = processNaturalScheduleCommand(rawMessage, {});
+  if (result.choices?.length) renderNaturalChoiceControls(result.choices, { reveal: false });
+}
+
+async function renderProposal(proposal, { reveal = false } = {}) {
   const container = document.createElement("div");
   container.className = "proposal";
   container.dataset.proposalId = proposal.id || "current";
@@ -990,16 +1159,18 @@ function renderProposal(proposal) {
     renderPlanDetails(details, proposal);
   } else if (proposal.action?.item) {
     const item = proposal.action.item;
+    addDetailRow(details, "Title", item.title || "Schedule item");
     addDetailRow(details, "Type", item.type);
-    addDetailRow(details, "Date", item.date || "");
-    if (item.start) addDetailRow(details, "Start", item.start);
-    if (item.end) addDetailRow(details, "End", item.end);
+    addDetailRow(details, "Date", item.date ? formatDateLabel(item.date) : "Date not set");
+    addDetailRow(details, "Time", item.start ? formatTime(item.start) + (item.end ? "–" + formatTime(item.end) : "") : "Time not set");
     addDetailRow(details, "Category", item.category);
+    if (item.notes) addDetailRow(details, "Note", item.notes);
+    if (item.recurrence) addDetailRow(details, "Repeats", item.recurrence.frequency + " · every " + item.recurrence.interval + (item.recurrence.frequency === "weekly" ? " · " + item.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ") : ""));
   } else if (proposal.action?.targetId) {
     const target = saFindItemById(proposal.action.targetId) || proposal.originalItem;
     if (target) {
       addDetailRow(details, "Item", target.title);
-      addDetailRow(details, "Date", formatDateLabel(target.date));
+      addDetailRow(details, "Date", target.date ? formatDateLabel(target.date) : "Date not set");
       if (target.start) addDetailRow(details, "Current time", `${formatTime(target.start)}${target.end ? `–${formatTime(target.end)}` : ""}`);
     }
     if (proposal.action.type === "delete_item") addDetailRow(details, "Warning", "Permanent deletion cannot be undone through normal app controls.");
@@ -1011,7 +1182,7 @@ function renderProposal(proposal) {
     const conflictTitle = document.createElement("strong");
     conflictTitle.textContent = "Schedule conflict:";
     conflictRow.appendChild(conflictTitle);
-    conflictRow.appendChild(document.createTextNode(` ${proposal.conflict.items.join(" and ")} overlap.`));
+  conflictRow.appendChild(document.createTextNode(` ${proposal.conflict.items.join(" and ")} overlap${proposal.conflict.date ? ` on ${formatDateLabel(proposal.conflict.date)}` : ""}${proposal.conflict.start && proposal.conflict.end ? ` from ${formatTime(proposal.conflict.start)} to ${formatTime(proposal.conflict.end)}` : ""}.`));
     details.appendChild(conflictRow);
   }
 
@@ -1026,21 +1197,28 @@ function renderProposal(proposal) {
     const changes = proposal.action.changes;
     const labels = { title: "New title", date: "New date", start: "New start", end: "New end", category: "Category", notes: "Notes", status: "Status" };
     for (const [field, label] of Object.entries(labels)) if (changes[field] != null && !(field === "date" && (changes.start || changes.end))) addDetailRow(details, label, field === "date" ? formatDateLabel(changes[field]) : changes[field]);
+    if (changes.schedulePending) { addDetailRow(details, "New date", "Date not set"); addDetailRow(details, "New time", "Time not set"); }
   }
 
   if (proposal.action?.postponeMinutes) {
     addDetailRow(details, "Postpone by", `${proposal.action.postponeMinutes} minutes`);
+  }
+  if (proposal.action?.type === "postpone_item" && proposal.action.schedule) {
+    const schedule = proposal.action.schedule;
+    addDetailRow(details, "New date", schedule.schedulePending ? "Date not set" : (schedule.date ? formatDateLabel(schedule.date) : "Date not set"));
+    addDetailRow(details, "New time", schedule.schedulePending || !schedule.start ? "Time not set" : formatTime(schedule.start) + (schedule.end ? "–" + formatTime(schedule.end) : ""));
   }
 
   container.appendChild(details);
 
   const actionsEl = document.createElement("div");
   actionsEl.className = "proposal-actions";
+  actionsEl.hidden = reveal;
   const confirmBtn = document.createElement("button");
   confirmBtn.className = "primary-button";
   confirmBtn.dataset.proposalId = proposal.id || "current";
   const planDeletes = proposal.plan?.actions?.some(action => action.type === "delete_item");
-  confirmBtn.textContent = proposal.bulkAction?.type === "delete_items" || proposal.bulkAction?.type === "deduplicate_items" || proposal.action?.type === "delete_item" ? "Delete permanently" : proposal.bulkAction?.type === "cancel_items" ? "Cancel items" : planDeletes ? "Confirm plan with permanent deletion" : proposal.plan ? "Confirm plan" : "Confirm";
+  confirmBtn.textContent = proposal.action?.type === "create_item" ? "Add to schedule" : ["update_item", "reschedule_item"].includes(proposal.action?.type) ? "Confirm change" : proposal.bulkAction?.type === "delete_items" || proposal.bulkAction?.type === "deduplicate_items" || proposal.action?.type === "delete_item" ? "Delete permanently" : proposal.bulkAction?.type === "cancel_items" ? "Cancel items" : planDeletes ? "Confirm plan with permanent deletion" : proposal.plan ? "Confirm plan" : "Confirm";
   confirmBtn.dataset.action = "confirm";
   const editBtn = document.createElement("button");
   editBtn.className = "secondary-button";
@@ -1055,6 +1233,19 @@ function renderProposal(proposal) {
 
   assistantEls.conversation.appendChild(container);
   assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
+  if (reveal) {
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const content = [header, ...details.children];
+    if (!reduced) for (const row of content) row.classList.add("reveal-pending");
+    for (const row of content) {
+      if (!reduced) await new Promise(resolve => setTimeout(resolve, 45));
+      row.classList.remove("reveal-pending");
+      row.classList.add("is-revealed");
+    }
+    actionsEl.hidden = false;
+    actionsEl.classList.add("is-revealed");
+    actionsEl.querySelectorAll("button").forEach(button => { button.disabled = false; button.removeAttribute("aria-disabled"); });
+  }
 }
 
 function renderPlanDetails(container, proposal) {
@@ -1167,6 +1358,8 @@ function getProposalTitle(proposal) {
   }
   if (proposal.plan) return proposal.plan.title || "Proposed plan";
   const actionType = proposal.action?.type;
+  if (actionType === "create_item" && proposal.action.item?.title) return proposal.action.item.title;
+  if (proposal.action?.targetId && ["update_item", "reschedule_item", "postpone_item"].includes(actionType)) return (saFindItemById(proposal.action.targetId) || proposal.originalItem)?.title || "Review schedule change";
   switch (actionType) {
     case "create_item": return "Propose new item";
     case "update_item": return "Propose update";
@@ -1209,6 +1402,8 @@ function classifyRequest(message) {
     /what.*have.*tomorrow/i,
     /what.*have.*friday/i,
     /what.*schedule.*week/i,
+    /what.*(?:have|schedule).*(?:this week|next week|this month|next month)/i,
+    /what.*(?:unscheduled|still needs? (?:a )?(?:date|time)|not scheduled|missing from my schedule|need a date|need a time)/i,
     /anything overdue/i,
     /any.*conflict/i,
     /awaiting check.in/i,
@@ -1259,22 +1454,22 @@ function classifyRequest(message) {
 }
 
 function resolveDateOffset(days) {
-  const date = new Date();
-  date.setDate(date.getDate() + days);
-  return localDateString(date);
+  return shiftIsoDate(kampalaToday(), days);
 }
 
 function resolveWeekday(weekday) {
   const weekdays = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
   const target = weekdays[weekday.toLowerCase()];
   if (target === undefined) return null;
-  const now = new Date();
-  const currentDay = now.getDay();
+  const today = kampalaToday();
+  const currentDay = new Date(today + "T12:00:00Z").getUTCDay();
   let diff = target - currentDay;
-  if (diff < 0 || (diff === 0 && now.getHours() >= 12)) diff += 7;
-  const date = new Date();
-  date.setDate(date.getDate() + diff);
-  return localDateString(date);
+  if (diff < 0) diff += 7;
+  if (diff === 0) {
+    const hour = Number(new Intl.DateTimeFormat("en-GB", { timeZone: "Africa/Kampala", hour: "2-digit", hourCycle: "h23" }).format(new Date()));
+    if (hour >= 12) diff = 7;
+  }
+  return shiftIsoDate(today, diff);
 }
 
 function resolveRelativeDate(token) {
@@ -1295,6 +1490,7 @@ function answerHaveToday() {
   const sorted = sortForDate(todayItemsList);
   if (!sorted.length) return { text: "You have nothing planned for today." };
   const items = sorted.map(item => ({
+    date: item.date,
     time: itemTime(item),
     title: item.title,
     status: item.status.replace("-", " ")
@@ -1392,6 +1588,7 @@ function answerHaveDate(dateStr) {
   const sorted = sortForDate(dateItems);
   if (!sorted.length) return { text: `Nothing is planned for ${formatDateLabel(dateStr)}.` };
   const items = sorted.map(item => ({
+    date: item.date,
     time: itemTime(item),
     title: item.title,
     status: item.status.replace("-", " ")
@@ -1400,7 +1597,7 @@ function answerHaveDate(dateStr) {
 }
 
 function answerWeekSchedule() {
-  const today = localDateString(new Date());
+  const today = kampalaToday();
   const weekItems = saGetWeekItems(today);
   if (!weekItems.length) return { text: "Nothing is scheduled for this week." };
   const byDate = {};
@@ -1411,10 +1608,32 @@ function answerWeekSchedule() {
   const items = [];
   for (const dateStr of Object.keys(byDate).sort()) {
     for (const item of sortForDate(byDate[dateStr])) {
-      items.push({ time: `${formatDateLabel(dateStr)}${item.start ? " at " + formatTime(item.start) : ""}`, title: item.title, status: item.status.replace("-", " ") });
+      items.push({ date: dateStr, time: itemTime(item), title: item.title, status: item.status.replace("-", " ") });
     }
   }
   return { text: `This week has ${weekItems.length} planned item${weekItems.length === 1 ? "" : "s"}.`, items };
+}
+
+function answerNaturalDateRange(startDate, endDate, label) {
+  const selected = items.filter(item => item.date && item.date >= startDate && item.date <= endDate && !["cancelled", "missed"].includes(item.status)).sort((a, b) => a.date.localeCompare(b.date) || (a.start || "").localeCompare(b.start || ""));
+  if (!selected.length) return { text: "Nothing is scheduled for " + label + "." };
+  return { text: "You have " + selected.length + " item" + (selected.length === 1 ? "" : "s") + " scheduled for " + label + ".", items: selected.map(item => ({ date: item.date, time: formatDateLabel(item.date) + (item.start ? " at " + formatTime(item.start) : " · Time not set"), title: item.title, status: item.status.replace("-", " ") })) };
+}
+
+function answerUnscheduledItems(message) {
+  const text = message.toLowerCase();
+  const wantDate = /\b(?:date|day)\b/.test(text) && !/\btime\b/.test(text);
+  const wantTime = /\btime\b/.test(text) && !/\bdate\b/.test(text);
+  const selected = items.filter(item => {
+    if (["cancelled", "completed", "missed"].includes(item.status)) return false;
+    const dateMissing = item.schedulePending === true || !item.date;
+    const timeMissing = item.type !== "task" && (!item.start || !item.end);
+    return wantDate ? dateMissing : wantTime ? timeMissing : dateMissing || timeMissing;
+  });
+  if (!selected.length) return { text: "No schedule items are waiting for more details." };
+  const rows = selected.map(item => ({ date: item.date || null, groupLabel: item.date ? null : "Date not set", time: item.start ? formatTime(item.start) + (item.end ? "–" + formatTime(item.end) : "") : item.type === "task" ? "Anytime" : "Time not set", title: item.title, status: !item.date ? "Date not set" : item.type !== "task" && (!item.start || !item.end) ? "Time not set" : "Details incomplete" }));
+  const groups = new Set(rows.map(row => row.status));
+  return { text: "Here are the plans that still need details: " + [...groups].join(", ") + ".", items: rows };
 }
 
 function answerOverdue() {
@@ -1499,14 +1718,35 @@ function answerAtTime(dateStr, timeStr) {
 function handleDeterministicQuery(message) {
   const text = message.trim().toLowerCase().replace(/\s+/g, " ").replace(/[.?]+$/i, "");
 
+  if (/\b(?:unscheduled|still needs? (?:a )?(?:date|time)|not scheduled|missing from my schedule|need a date|need a time)\b/.test(text)) return answerUnscheduledItems(text);
   if (/what.*have.*today|what.*doing.*today/i.test(text)) return answerHaveToday();
   if (/what should i do now/i.test(text)) return answerWhatNow();
+  if (/what.*(?:have|schedule).*(?:next week)/i.test(text)) {
+    const today = kampalaToday();
+    const monday = shiftIsoDate(today, -((new Date(today + "T12:00:00Z").getUTCDay() + 6) % 7) + 7);
+    return answerNaturalDateRange(monday, shiftIsoDate(monday, 6), "next week");
+  }
+  if (/what.*(?:have|schedule).*(?:this week)/i.test(text)) {
+    const today = kampalaToday();
+    const monday = shiftIsoDate(today, -((new Date(today + "T12:00:00Z").getUTCDay() + 6) % 7));
+    return answerNaturalDateRange(monday, shiftIsoDate(monday, 6), "this week");
+  }
+  if (/what.*(?:have|schedule).*(?:this month)/i.test(text)) {
+    const today = kampalaToday();
+    const start = today.slice(0, 8) + "01";
+    const [year, month] = today.split("-").map(Number);
+    const endDate = new Date(Date.UTC(year, month, 0, 12));
+    const end = endDate.getUTCFullYear() + "-" + String(endDate.getUTCMonth() + 1).padStart(2, "0") + "-" + String(endDate.getUTCDate()).padStart(2, "0");
+    return answerNaturalDateRange(start, end, "this month");
+  }
   if (/what.*coming next|what.*next/i.test(text) && !/studio/i.test(text)) return answerComingNext();
   if (/what.*remaining today|what.*still.*today/i.test(text)) return answerRemaining();
   if (/what.*complete.*today/i.test(text)) return answerCompletedToday();
   if (/what.*miss.*this week/i.test(text)) return answerMissedWeek();
   if (/what.*have.*tomorrow/i.test(text)) return answerHaveDate(resolveDateOffset(1));
   if (/what.*have.*friday/i.test(text)) return answerHaveDate(resolveWeekday("friday") || resolveDateOffset(0));
+  const requestedDate = extractDateEntities(text);
+  if (requestedDate.date && /\b(?:what|show|list|schedule)\b/.test(text)) return answerHaveDate(requestedDate.date);
   if (/what.*schedule.*week|show.*schedule.*week/i.test(text)) return answerWeekSchedule();
   if (/anything overdue|what.*overdue/i.test(text)) return answerOverdue();
   if (/any.*conflict/i.test(text)) return answerConflicts();
@@ -1989,16 +2229,6 @@ function buildProposalFromGeminiResponse(response) {
   return proposal;
 }
 
-function renderProposalMessage(text) {
-  const message = document.createElement("div");
-  message.className = "message assistant-message proposal-message";
-  const p = document.createElement("p");
-  p.textContent = text;
-  message.appendChild(p);
-  assistantEls.conversation.appendChild(message);
-  assistantEls.conversation.scrollTop = assistantEls.conversation.scrollHeight;
-}
-
 function parseCommandTime(text) {
   const match = /\b(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b/i.exec(text);
   if (!match) return null;
@@ -2007,17 +2237,441 @@ function parseCommandTime(text) {
   return String(hour).padStart(2, "0") + ":" + (match[2] || "00");
 }
 
+function normalizeScheduleLanguage(message) {
+  return String(message || "").normalize("NFKC").replace(/[’‘]/g, "'").replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
+}
+
+function kampalaToday() {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Kampala", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const part = type => parts.find(entry => entry.type === type)?.value || "00";
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+function shiftIsoDate(dateText, amount) {
+  const [year, month, day] = dateText.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + amount, 12));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+}
+
+function extractDateEntities(message) {
+  const text = normalizeScheduleLanguage(message).toLowerCase();
+  const explicit = /\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/.exec(text);
+  if (explicit) {
+    const value = `${explicit[1]}-${explicit[2].padStart(2, "0")}-${explicit[3].padStart(2, "0")}`;
+    if (scheduleValidateDate(value)) return { date: value, source: "explicit" };
+  }
+  if (/\bday after tomorrow\b/.test(text)) return { date: shiftIsoDate(kampalaToday(), 2), source: "relative" };
+  if (/\btomorrow\b/.test(text)) return { date: shiftIsoDate(kampalaToday(), 1), source: "relative" };
+  if (/\byesterday\b/.test(text)) return { date: shiftIsoDate(kampalaToday(), -1), source: "relative" };
+  if (/\btoday\b/.test(text)) return { date: kampalaToday(), source: "relative" };
+  const weekdays = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+  const match = /\b(next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/.exec(text);
+  if (match) {
+    const today = kampalaToday();
+    const day = new Date(`${today}T12:00:00Z`).getUTCDay();
+    const target = weekdays[match[2]];
+    let offset = (target - day + 7) % 7;
+    if (match[1] || offset === 0) offset += 7;
+    return { date: shiftIsoDate(today, offset), source: "weekday" };
+  }
+  if (/\b(?:date|day) (?:is )?(?:not decided|unknown|undecided|not set)\b|\b(?:don't|do not|haven't) know (?:the )?(?:date|day)\b/.test(text)) return { date: null, source: "undecided" };
+  return { date: null, source: "missing" };
+}
+
+function timeToMinutes(hourText, minuteText, meridiem, contextPeriod) {
+  let hour = Number(hourText);
+  const minute = Number(minuteText || 0);
+  if (hour > 23 || minute > 59) return null;
+  const period = (meridiem || contextPeriod || "").toLowerCase();
+  if (period === "am" || period === "pm") {
+    if (hour < 1 || hour > 12) return null;
+    hour %= 12;
+    if (period === "pm") hour += 12;
+  }
+  return hour * 60 + minute;
+}
+
+function minutesToTime(total) {
+  if (!Number.isInteger(total) || total < 0 || total >= 24 * 60) return null;
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function extractDurationChange(message) {
+  const text = normalizeScheduleLanguage(message).toLowerCase();
+  const words = { one: 1, an: 1, a: 1, two: 2, three: 3, four: 4, five: 5 };
+  const match = /\b(one|an|a|two|three|four|five|\d+)\s+(hour|minute)s?\s+(later|earlier)\b/.exec(text);
+  if (match) return { minutes: (words[match[1]] || Number(match[1])) * (match[2] === "hour" ? 60 : 1) * (match[3] === "earlier" ? -1 : 1), kind: "shift" };
+  const setDuration = /\b(?:make|set|change)\b.*?\b(one|an|a|two|three|four|five|\d+)\s+hours?\b/.exec(text);
+  if (setDuration) return { minutes: (words[setDuration[1]] || Number(setDuration[1])) * 60, kind: "set" };
+  return null;
+}
+
+function extractTimeEntities(message) {
+  const text = normalizeScheduleLanguage(message).toLowerCase();
+  if (/\b(?:time|hour) (?:is )?(?:not decided|unknown|undecided|not set)\b|\b(?:don't|do not|haven't) know (?:the )?time\b|\btime\s*(?:tbd|to be decided)\b/.test(text)) return { start: null, end: null, source: "undecided" };
+  const period = /\b(?:morning|this morning)\b/.test(text) ? "am" : /\b(?:afternoon|evening|tonight|this evening)\b/.test(text) ? "pm" : "";
+  const range = /\b(?:from|between)\s+(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?\s+(?:to|and|-)\s+(\d{1,2})(?::([0-5]\d))?\s*(am|pm)?\b/i.exec(text);
+  if (range) {
+    if (!range[3] && !range[6] && !period && Number(range[1]) <= 12 && Number(range[4]) <= 12) return { ambiguous: true, source: "range" };
+    let firstPeriod = range[3] || range[6] || period;
+    let secondPeriod = range[6] || range[3] || period;
+    let startMinutes = timeToMinutes(range[1], range[2], range[3], firstPeriod);
+    let endMinutes = timeToMinutes(range[4], range[5], range[6], secondPeriod);
+    if (startMinutes == null || endMinutes == null) return { ambiguous: true, source: "range" };
+    if (!range[3] && range[6] && startMinutes > endMinutes && startMinutes >= 12 * 60) startMinutes -= 12 * 60;
+    if (range[3] && !range[6] && endMinutes <= startMinutes) endMinutes += 12 * 60;
+    const start = minutesToTime(startMinutes);
+    const end = minutesToTime(endMinutes);
+    if (!start || !end || start >= end) return { ambiguous: true, source: "range" };
+    return { start, end, source: "range" };
+  }
+  const exact24 = /\b(?:at\s+)?([01]?\d|2[0-3]):([0-5]\d)\b/.exec(text);
+  if (exact24) return { start: `${String(Number(exact24[1])).padStart(2, "0")}:${exact24[2]}`, end: null, source: "exact" };
+  const single = /\b(?:at\s+)?(\d{1,2})(?::([0-5]\d))?\s*(am|pm)\b|\b(?:at\s+)?(\d{1,2})(?::([0-5]\d))?\s+(?:in the )?(morning|afternoon|evening|tonight)\b|\b(noon|midnight)\b/i.exec(text);
+  if (!single) return { start: null, end: null, source: "missing" };
+  if (single[7]) return { start: single[7].toLowerCase() === "noon" ? "12:00" : "00:00", end: null, source: "exact" };
+  const meridiem = single[3] || (single[6] === "morning" ? "am" : single[6] ? "pm" : "");
+  const hour = single[1] || single[4];
+  const minute = single[2] || single[5];
+  if (!meridiem && Number(hour) <= 12) return { ambiguous: true, source: "single" };
+  const value = timeToMinutes(hour, minute, meridiem, "");
+  return value == null ? { ambiguous: true, source: "single" } : { start: minutesToTime(value), end: null, source: "exact" };
+}
+
+function extractRecurrenceEntities(message) {
+  const text = normalizeScheduleLanguage(message).toLowerCase();
+  if (!/\b(?:every|daily|weekly|each morning|weekdays)\b/.test(text)) return null;
+  const dayMap = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+  const days = Object.entries(dayMap).filter(([name]) => new RegExp(`\\b${name}s?\\b`).test(text)).map(([, day]) => day);
+  if (/\b(?:every day|daily|each morning|every morning)\b/.test(text)) return { frequency: "daily", interval: 1, days: [] };
+  if (/\b(?:weekdays|every weekday)\b/.test(text)) return { frequency: "weekly", interval: 1, days: [1, 2, 3, 4, 5] };
+  if (days.length) return { frequency: "weekly", interval: 1, days };
+  const interval = /\bevery\s+(\d+)\s+(day|week|month)s?\b/.exec(text);
+  if (interval) return { frequency: ({ day: "daily", week: "weekly", month: "monthly" })[interval[2]], interval: Math.max(1, Number(interval[1])), days: [] };
+  return null;
+}
+
+function inferScheduleType(message, recurrence, hasTime) {
+  const text = normalizeScheduleLanguage(message).toLowerCase();
+  if (recurrence) return { type: "routine", confidence: 0.98 };
+  if (/\b(meeting|appointment|interview|match|class|session|event|flight|consultation)\b/.test(text)) return { type: "activity", confidence: 0.98 };
+  if (/\b(?:send|buy|review|pay|remember to|submit|collect|pick up|clean|cook|finish|call)\b/.test(text)) return { type: "task", confidence: 0.91 };
+  if (hasTime) return { type: "activity", confidence: 0.82 };
+  if (/\b(?:i have|book|attend|go to)\b/.test(text)) return { type: "activity", confidence: 0.78 };
+  return { type: "task", confidence: 0.6 };
+}
+
+function inferScheduleCategory(message) {
+  const text = normalizeScheduleLanguage(message).toLowerCase();
+  const mappings = [
+    ["Health", /\b(gym|workout|doctor|hospital|medicine|run|exercise)\b/],
+    ["Meetings", /\b(meeting|interview|appointment|consultation)\b/],
+    ["Music", /\b(studio|rehearsal|dj|mix|playlist|recording|performance)\b/],
+    ["Travel", /\b(flight|airport|trip|journey|hotel|travel)\b/],
+    ["Personal", /\b(shopping|cooking|errands|cleaning|family|personal)\b/]
+  ];
+  const available = saGetAvailableCategories();
+  const found = mappings.find(([category, pattern]) => available.includes(category) && pattern.test(text));
+  return found?.[0] || "Personal";
+}
+
+function extractScheduleTitle(message) {
+  let title = normalizeScheduleLanguage(message).replace(/[.!?]+$/g, "").trim();
+  title = title.replace(/^(?:(?:please|can you|could you)\s+)?(?:i have|i've got|i need to|i need|remember that i need to|remember to|remember|add|create|schedule|put|note|book|set up)\s+/i, "");
+  title = title.replace(/^a\s+(?=(?:meeting|appointment|task|event|activity|routine)\b)/i, "");
+  title = title.replace(/\s*(?:,?\s+but\s+(?:i\s+)?(?:don't|do not|haven't|have not)\s+know\b).*$/i, "");
+  title = title.replace(/\s*(?:,?\s+)?(?:from|between)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+(?:to|and|-)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?.*$/i, "");
+  title = title.replace(/\s+\d{4}-\d{2}-\d{2}\b.*$/i, "");
+  title = title.replace(/\s+\b(?:today|tomorrow|yesterday|next\s+week|this\s+week|this\s+weekend|next\s+month|this\s+month|sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b.*$/i, "");
+  title = title.replace(/\s+\b(?:every\s+day|daily|weekdays|every\s+weekday|every\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)).*$/i, "");
+  title = title.replace(/\s*(?:at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|\d{1,2}(?::\d{2})?\s*(?:am|pm)).*$/i, "");
+  title = title.replace(/\s*(?:,?\s+)?(?:time|date)\s+(?:is\s+)?(?:not decided|unknown|undecided|not set|tbd).*$/i, "");
+  return title.replace(/^[\s,;:.-]+|[\s,;:.-]+$/g, "").replace(/\s+/g, " ").replace(/^\w/, char => char.toUpperCase());
+}
+
+function calculateInterpretationConfidence({ intent, title, typeConfidence = 0, target, date, time }) {
+  if (target) return 0.94;
+  if (intent === "create" && title && typeConfidence >= 0.78) return 0.91;
+  if (intent === "create" && title) return 0.68;
+  if (date?.source === "undecided" || time?.source === "undecided") return 0.86;
+  return 0.35;
+}
+
+function activeScheduleItems() {
+  return items.filter(item => !["completed", "cancelled", "missed"].includes(item.status));
+}
+
+function resolveScheduleItemReference(message, conversationContext = {}) {
+  if (conversationContext.pendingClarification?.intent === "natural_selected_target") {
+    const selected = items.find(item => item.id === conversationContext.pendingClarification.knownFields?.targetId);
+    if (selected) return { item: selected, matches: [selected], confidence: 0.98 };
+  }
+  const text = normalizeScheduleLanguage(message).toLowerCase();
+  const lastResult = [...conversation].reverse().find(entry => Array.isArray(entry.referencedItemIds) && entry.referencedItemIds.length);
+  const recentIds = lastResult?.referencedItemIds || [];
+  const uniqueRecent = [...new Set(recentIds)].map(id => items.find(item => item.id === id)).filter(Boolean);
+  const ordinal = /\b(?:the\s+)?(first|second|third|last)\s+(?:one|item|event|activity|task|routine)\b/i.exec(text);
+  if (ordinal && uniqueRecent.length) {
+    const index = ordinal[1].toLowerCase() === "first" ? 0 : ordinal[1].toLowerCase() === "second" ? 1 : ordinal[1].toLowerCase() === "third" ? 2 : uniqueRecent.length - 1;
+    return { item: uniqueRecent[index] || null, matches: uniqueRecent, confidence: uniqueRecent[index] ? 0.98 : 0 };
+  }
+  if (/\b(?:it|that|this one|the same one)\b/.test(text) && uniqueRecent.length) return { item: uniqueRecent[0], matches: [uniqueRecent[0]], confidence: 0.9 };
+  const candidates = activeScheduleItems();
+  const matchDate = extractDateEntities(text).date;
+  const tokens = text.replace(/\b(?:move|shift|push|reschedule|postpone|change|update|edit|cancel|complete|finish|mark|done|the|a|an|my|item|event|activity|task|routine|to|on|at|from|with|tomorrow|today|friday|monday|tuesday|wednesday|thursday|saturday|sunday|next|this|in|morning|evening|am|pm)\b/gi, " ").replace(/\b\d{1,2}(?::\d{2})?\b/g, " ").replace(/[^\p{L}\p{N} ]/gu, " ").split(/\s+/).filter(token => token.length > 1);
+  const scored = candidates.map(item => {
+    const titleTokens = item.title.toLowerCase().replace(/[^\p{L}\p{N} ]/gu, " ").split(/\s+/).filter(token => token.length > 1);
+    const overlap = titleTokens.filter(token => tokens.includes(token)).length;
+    const exact = text.includes(item.title.toLowerCase()) ? 3 : 0;
+    const dateBoost = matchDate && item.date === matchDate ? 1 : 0;
+    const recency = uniqueRecent.some(recent => recent.id === item.id) ? 0.5 : 0;
+    return { item, score: exact + overlap + dateBoost + recency };
+  }).filter(candidate => candidate.score > 0).sort((a, b) => b.score - a.score);
+  if (!scored.length) return { item: null, matches: [], confidence: 0 };
+  const best = scored.filter(candidate => candidate.score === scored[0].score).map(candidate => candidate.item);
+  return { item: best.length === 1 ? best[0] : null, matches: best, confidence: best.length === 1 ? Math.min(0.97, 0.65 + scored[0].score * 0.1) : 0.5 };
+}
+
+function buildNaturalActionProposal(action, message, item = null) {
+  return registerScheduleProposal({ action, message, conflict: null, originalMessage: message, source: "local", ...(item ? { originalItem: { ...item } } : {}) });
+}
+
+function registerScheduleProposal(proposal, conversationId = activeConversationId) {
+  if (!proposal.id) proposal.id = crypto.randomUUID();
+  proposal.conversationId = conversationId || proposal.conversationId || activeConversationId || null;
+  proposal.lifecycle = proposal.lifecycle || "pending";
+  proposal.confirmationState = proposal.confirmationState || "pending";
+  proposal.operation = proposal.operation || (proposal.action?.type === "create_item" ? "schedule.create" : proposal.action?.type === "update_item" || proposal.action?.type === "reschedule_item" ? "schedule.update" : proposal.action?.type === "postpone_item" ? "schedule.postpone" : proposal.action?.type === "cancel_item" ? "schedule.cancel" : proposal.action?.type === "complete_item" ? "schedule.complete" : proposal.action?.type || "schedule.plan");
+  if (proposal.action) proposal.action.operation = proposal.operation;
+  if (proposal.action && !proposal.conflict) proposal.conflict = findProposalConflict(proposal.action, proposal.id);
+  scheduleProposalRegistry.set(proposal.id, proposal);
+  return proposal;
+}
+
+function makeProposalSnapshot(proposal) {
+  const action = proposal?.action || {};
+  const item = action.item;
+  return {
+    id: proposal.id,
+    summaryMessageId: proposal.summaryMessageId || null,
+    operation: proposal.operation,
+    confirmationState: proposal.confirmationState,
+    sourceConversationId: proposal.conversationId,
+    action: {
+      type: action.type || null,
+      operation: action.operation || proposal.operation,
+      targetId: action.targetId || null,
+      item: item ? { type: item.type, title: item.title, date: item.schedulePending ? null : (item.date || null), schedulePending: item.schedulePending === true, start: item.start || null, end: item.end || null, category: item.category || "Personal", notes: item.notes || "", recurrence: item.recurrence || null } : null,
+      changes: action.changes ? { ...action.changes } : null,
+      schedule: action.schedule ? { ...action.schedule } : null
+    }
+  };
+}
+
+function makeProposalSummaryEntry(proposal, text, referencedItemIds = []) {
+  proposal.summaryText = text;
+  const entry = { id: crypto.randomUUID(), role: "assistant", text, kind: "proposal_summary", proposalSummary: text, proposalSnapshot: makeProposalSnapshot(proposal), resolved: false, referencedItemIds };
+  proposal.summaryMessageId = entry.id;
+  entry.proposalSnapshot = makeProposalSnapshot(proposal);
+  return entry;
+}
+
+async function persistScheduleProposalState(proposal, confirmationState) {
+  proposal.confirmationState = confirmationState;
+  proposal.lifecycle = confirmationState;
+  const entry = proposal.summaryMessageId ? conversation.find(message => message.id === proposal.summaryMessageId) : null;
+  if (entry) {
+    entry.proposalSnapshot = makeProposalSnapshot(proposal);
+    entry.proposalSummary = entry.proposalSummary || proposal.message || "";
+    entry.resolved = confirmationState === "resolved";
+  }
+  if (proposal.summaryMessageId && proposal.conversationId) {
+    await persistenceQueue.catch(() => {});
+    await firebaseStore.updateConversationMessage(proposal.conversationId, proposal.summaryMessageId, {
+      resolved: confirmationState === "resolved",
+      proposalSummary: encodeStructuredEntry({ proposalSummary: proposal.summaryText || proposal.message || "", proposalSnapshot: makeProposalSnapshot(proposal) })
+    });
+  }
+}
+
+function restoreNaturalClarificationFromConversation(entries) {
+  const index = entries.findLastIndex(entry => entry.role === "assistant" && (
+    ["What should I call it?", "What would you like to add?", "Do you mean 5:00 AM or 5:00 PM?", "I found more than one possible match. Which one do you mean?"].includes(entry.text)
+    || /^I found .+\. Is that the item you mean\?$/.test(entry.text || "")
+  ));
+  if (index < 0) return null;
+  const original = [...entries.slice(0, index)].reverse().find(entry => entry.role === "user");
+  if (!original) return null;
+  return processNaturalScheduleCommand(original.text, {}).pending || null;
+}
+
+function processNaturalScheduleCommand(message, conversationContext = {}) {
+  const normalized = normalizeScheduleLanguage(message);
+  const lower = normalized.toLowerCase();
+  const pending = conversationContext.pendingClarification;
+
+  if (pending?.intent === "natural_edit_target") {
+    const targetId = pending.knownFields?.targetId;
+    if (targetId && pending.knownFields?.rawMessage) {
+      return processNaturalScheduleCommand(pending.knownFields.rawMessage, { pendingClarification: { intent: "natural_selected_target", knownFields: { targetId } } });
+    }
+  }
+
+  if (/\b(?:what do i have|what is on|show|list).*(?:today|tomorrow|this week|next week|this month)\b/.test(lower)) return { handled: false };
+
+  const recurrence = extractRecurrenceEntities(normalized);
+  const date = extractDateEntities(normalized);
+  const time = extractTimeEntities(normalized);
+  const explicitCreate = /\b(?:add|create|schedule|put|note|remember|book)\b/.test(lower);
+  const hasScheduleNoun = /\b(meeting|appointment|interview|match|class|session|event|flight|consultation|gym|workout|studio|rehearsal|task|routine|reminder|errand|shopping|cooking|call|review|payment|medicine)\b/.test(lower);
+  const creationIntent = Boolean(recurrence || explicitCreate || (hasScheduleNoun && /\b(?:i have|i've got|i need to|i need|going to|attend)\b/.test(lower)));
+
+  if (pending?.intent === "natural_create") {
+    const known = pending.knownFields || {};
+    const continued = `${known.rawMessage || ""} ${normalized}`.trim();
+    let answeredTime = extractTimeEntities(continued);
+    if (pending.missingFields?.includes("type")) {
+      const selectedType = /\bactivity\b/i.test(normalized) ? "activity" : /\btask\b/i.test(normalized) ? "task" : /\broutine\b/i.test(normalized) ? "routine" : null;
+      if (!selectedType) return { handled: true, clarification: "What would you like to add?", choices: [["activity", "Activity"], ["task", "Task"], ["routine", "Routine"]], pending };
+      known.type = selectedType;
+      pending.missingFields = pending.missingFields.filter(field => field !== "type");
+    }
+    if (pending.missingFields?.includes("time_period")) {
+      const periodAnswer = /\b(am|pm)\b/i.exec(normalized)?.[1]?.toLowerCase();
+      const rawRange = /\b(?:from|between)\s+\d{1,2}(?::[0-5]\d)?\s*(?:am|pm)?\s+(?:to|and|-)\s+\d{1,2}(?::[0-5]\d)?\s*(?:am|pm)?\b/i.exec(known.rawMessage || "");
+      const rawTime = /(?:at\s+)?(\d{1,2})(?::([0-5]\d))?/i.exec(known.rawMessage || "");
+      if (periodAnswer && rawRange) {
+        answeredTime = extractTimeEntities(rawRange[0] + " " + periodAnswer);
+      } else if (periodAnswer && rawTime) {
+        const minutes = timeToMinutes(rawTime[1], rawTime[2], periodAnswer, "");
+        answeredTime = { start: minutesToTime(minutes), end: null, source: "exact" };
+      }
+    }
+    if (pending.missingFields?.includes("title") && !known.title) {
+      const proposedTitle = extractScheduleTitle(normalized);
+      if (proposedTitle && !/^(?:meeting|appointment|event|activity|task|routine|item|something)$/i.test(proposedTitle)) {
+        known.title = proposedTitle;
+        pending.knownFields = known;
+        pending.missingFields = [];
+      }
+    }
+    const title = known.title || extractScheduleTitle(normalized);
+    if (pending.missingFields?.includes("time_period") && answeredTime.ambiguous) return { handled: true, clarification: "Please choose a clear time, such as 5 AM or 5 PM.", pending };
+    if (pending.missingFields?.includes("time_period") && !answeredTime.start) return { handled: true, clarification: "Do you mean 5:00 AM or 5:00 PM?", pending };
+    if (answeredTime.ambiguous && !pending.missingFields?.includes("time_period")) return { handled: true, clarification: "Do you mean 5:00 AM or 5:00 PM?", choices: [["am", "5:00 AM"], ["pm", "5:00 PM"]], pending: { intent: "natural_create", knownFields: { ...known, title, rawMessage: continued }, missingFields: ["time_period"] } };
+    let recurrence = null;
+    try { recurrence = known.recurrenceJson ? JSON.parse(known.recurrenceJson) : null; } catch {}
+    const hasDate = Boolean(known.date);
+    const item = { type: known.type || "activity", title, date: hasDate ? known.date : null, start: hasDate ? (answeredTime.start || known.start || "") : "", end: hasDate ? (answeredTime.end || known.end || "") : "", category: known.category || "Personal", notes: known.notes || "", recurrence, schedulePending: !hasDate };
+    if (!title || /^(?:meeting|appointment|event|activity|task|routine|item|something)$/i.test(title)) return { handled: true, clarification: "What should I call it?", pending: { intent: "natural_create", knownFields: { ...known, rawMessage: continued }, missingFields: ["title"] } };
+    return { handled: true, proposal: buildNaturalActionProposal({ type: "create_item", item }, message), response: item.schedulePending ? "I’ve added the known details. Review the schedule item below; its date and time can be set later." : "I’ve added the known details. You can set the time later. Review the schedule item below." };
+  }
+
+  if (pending?.intent === "natural_edit_time") {
+    const target = items.find(item => item.id === pending.knownFields?.targetId);
+    const period = /\b(am|pm)\b/i.exec(normalized)?.[1]?.toLowerCase();
+    const rawTime = /(?:to|at)\s+(\d{1,2})(?::([0-5]\d))?/i.exec(pending.knownFields?.rawMessage || "");
+    const minutes = period && rawTime ? timeToMinutes(rawTime[1], rawTime[2], period, "") : null;
+    const start = minutesToTime(minutes);
+    if (!target || !start) return { handled: true, clarification: "Do you mean 5:00 AM or 5:00 PM?", pending };
+    const changes = { start, schedulePending: false };
+    if (target.start && target.end) {
+      const duration = Number(target.end.slice(0, 2)) * 60 + Number(target.end.slice(3)) - Number(target.start.slice(0, 2)) * 60 - Number(target.start.slice(3));
+      changes.end = minutesToTime(minutes + duration) || "";
+    } else if (target.end) changes.end = target.end;
+    return { handled: true, proposal: buildNaturalActionProposal({ type: "update_item", targetId: target.id, item: null, changes, postponeMinutes: null }, "I found " + target.title + " and prepared the change below.", target) };
+  }
+
+  const actionIntent = /\b(?:move|shift|push|reschedule|postpone|change|update|edit|set|make|cancel|call off|complete|finish(?:ed)?|mark done|mark .* done|add (?:a )?note to)\b/.test(lower);
+  if (actionIntent) {
+    const resolved = resolveScheduleItemReference(normalized, conversationContext);
+    if (!resolved.item) {
+      if (resolved.matches.length > 1) return { handled: true, clarification: "I found more than one possible match. Which one do you mean?", matches: resolved.matches, choices: resolved.matches.map(item => ["target:" + item.id, item.title + " · " + (item.date ? formatDateLabel(item.date) : "Date not set") + " · " + (item.start ? formatTime(item.start) : "Time not set")]), pending: { intent: "natural_edit_target", knownFields: { rawMessage: normalized, candidateIds: JSON.stringify(resolved.matches.map(item => item.id)) }, missingFields: ["target"] } };
+      if (resolved.matches.length === 1) return { handled: true, clarification: "I found " + resolved.matches[0].title + ". Is that the item you mean?", matches: resolved.matches, choices: [["target:" + resolved.matches[0].id, resolved.matches[0].title + " · " + (resolved.matches[0].date ? formatDateLabel(resolved.matches[0].date) : "Date not set") + " · " + (resolved.matches[0].start ? formatTime(resolved.matches[0].start) : "Time not set")]], pending: { intent: "natural_edit_target", knownFields: { rawMessage: normalized, candidateIds: JSON.stringify(resolved.matches.map(item => item.id)) }, missingFields: ["target"] } };
+      if (/\b(?:it|that|this one|the same one|first one|second one|third one)\b/.test(lower) || actionIntent) return { handled: true, clarification: "I couldn’t find that schedule item." };
+      return { handled: false };
+    }
+    const target = resolved.item;
+    if (/\b(?:cancel|call off)\b/.test(lower)) return { handled: true, proposal: buildNaturalActionProposal({ type: "cancel_item", targetId: target.id, item: null, changes: null, postponeMinutes: null }, `Cancel ${target.title}? Its history will be preserved.`, target) };
+    if (/\b(?:complete|finish|mark .* done|done with)\b/.test(lower)) return { handled: true, proposal: buildNaturalActionProposal({ type: "complete_item", targetId: target.id, item: null, changes: null, postponeMinutes: null }, `Mark ${target.title} as completed?`, target) };
+    if (time.ambiguous) return { handled: true, clarification: "Do you mean 5:00 AM or 5:00 PM?", choices: [["am", "5:00 AM"], ["pm", "5:00 PM"]], pending: { intent: "natural_edit_time", knownFields: { targetId: target.id, rawMessage: normalized }, missingFields: ["time_period"] } };
+    const changes = {};
+    if (date.source !== "missing") changes.date = date.date;
+    const durationChange = extractDurationChange(normalized);
+    if (!time.start && durationChange && target.start) {
+      const oldStart = Number(target.start.slice(0, 2)) * 60 + Number(target.start.slice(3));
+      const dayOffset = durationChange.kind === "shift" ? Math.floor((oldStart + durationChange.minutes) / 1440) : 0;
+      const newStart = durationChange.kind === "shift" ? oldStart + durationChange.minutes - dayOffset * 1440 : oldStart;
+      const oldEnd = target.end ? Number(target.end.slice(0, 2)) * 60 + Number(target.end.slice(3)) : null;
+      const newEnd = oldEnd == null ? null : durationChange.kind === "shift" ? oldEnd + durationChange.minutes - dayOffset * 1440 : newStart + durationChange.minutes;
+      if (newStart < 0 || newStart >= 1440 || newEnd != null && (newEnd >= 1440 || newEnd <= newStart)) return { handled: true, clarification: "That change would cross midnight. What date should I use?" };
+      changes.start = minutesToTime(newStart);
+      if (newEnd != null) changes.end = minutesToTime(newEnd);
+      if (dayOffset && target.date) changes.date = shiftIsoDate(target.date, dayOffset);
+    }
+    if (time.start) {
+      changes.start = time.start;
+      if (time.end) changes.end = time.end;
+      else if (target.start && target.end) {
+        const oldDuration = Number(target.end.slice(0, 2)) * 60 + Number(target.end.slice(3)) - Number(target.start.slice(0, 2)) * 60 - Number(target.start.slice(3));
+        changes.end = minutesToTime(Number(time.start.slice(0, 2)) * 60 + Number(time.start.slice(3)) + oldDuration) || "";
+      } else if (target.end) changes.end = target.end;
+    }
+    const category = inferScheduleCategory(normalized);
+    if (/\b(?:category|as|to)\s+(?:personal|health|meetings|music|travel)\b/i.test(normalized) && saGetAvailableCategories().includes(category)) changes.category = category;
+    const note = /\b(?:note|saying)\s+(.+)$/i.exec(normalized);
+    if (note) changes.notes = note[1].replace(/[.!?]+$/, "").trim();
+    const newTitle = /\b(?:change|rename)\s+(?:the\s+)?(?:title|name)\s+(?:to\s+)?(.+)$/i.exec(normalized);
+    if (newTitle) changes.title = newTitle[1].trim();
+    if (/\bpostpone\b/.test(lower) && !time.start && date.source === "missing" && /\b(?:don't|do not|don't know|unknown|not sure)\b/.test(lower)) {
+      Object.assign(changes, { date: null, start: "", end: "", schedulePending: true, status: "postponed" });
+    }
+    if (!Object.keys(changes).length) return { handled: false };
+    changes.schedulePending ??= target.schedulePending === true && !changes.date && !changes.start && !changes.end;
+    if (/\bpostpone\b/.test(lower)) {
+      const schedule = changes.schedulePending ? { schedulePending: true } : {
+        date: changes.date !== undefined ? changes.date : target.date,
+        start: changes.start !== undefined ? changes.start : (target.start || ""),
+        end: changes.end !== undefined ? changes.end : (target.end || ""),
+        schedulePending: false
+      };
+      return { handled: true, proposal: buildNaturalActionProposal({ type: "postpone_item", targetId: target.id, item: null, changes: null, schedule, postponeMinutes: null }, "I found " + target.title + " and prepared the postponement below.", target) };
+    }
+    const updated = { ...target, ...changes };
+    return { handled: true, proposal: buildNaturalActionProposal({ type: "update_item", targetId: target.id, item: null, changes, postponeMinutes: null }, `I found ${target.title} and prepared the change below.`, target), proposedItem: updated };
+  }
+
+  if (!creationIntent) return { handled: false };
+  const typeInfo = inferScheduleType(normalized, recurrence, Boolean(time.start || time.end));
+  const title = extractScheduleTitle(normalized);
+  const confidence = calculateInterpretationConfidence({ intent: "create", title, typeConfidence: typeInfo.confidence, date, time });
+  if (confidence < 0.55) return { handled: false, confidence };
+  if (title && !/^(?:meeting|appointment|event|activity|task|routine|item|something)$/i.test(title) && typeInfo.confidence < 0.7) {
+    return { handled: true, clarification: "What would you like to add?", choices: [["activity", "Activity"], ["task", "Task"], ["routine", "Routine"]], pending: { intent: "natural_create", knownFields: { title, date: date.date, category: inferScheduleCategory(normalized), recurrenceJson: recurrence ? JSON.stringify(recurrence) : "", rawMessage: normalized }, missingFields: ["type"] } };
+  }
+  if (!title || /^(?:meeting|appointment|event|activity|task|routine|item|something)$/i.test(title)) {
+    return { handled: true, clarification: "What should I call it?", pending: { intent: "natural_create", knownFields: { type: typeInfo.type, date: date.date, category: inferScheduleCategory(normalized), recurrenceJson: recurrence ? JSON.stringify(recurrence) : "", rawMessage: normalized }, missingFields: ["title"] } };
+  }
+  if (time.ambiguous) {
+    return { handled: true, clarification: "Do you mean 5:00 AM or 5:00 PM?", choices: [["am", "5:00 AM"], ["pm", "5:00 PM"]], pending: { intent: "natural_create", knownFields: { type: typeInfo.type, title, date: date.date, category: inferScheduleCategory(normalized), recurrenceJson: recurrence ? JSON.stringify(recurrence) : "", rawMessage: normalized }, missingFields: ["time_period"] } };
+  }
+  const item = { type: typeInfo.type, title, date: date.date, start: time.start || "", end: time.end || "", category: inferScheduleCategory(normalized), notes: "", recurrence, schedulePending: !date.date };
+  if (item.schedulePending) { item.date = null; item.start = ""; item.end = ""; }
+  return { handled: true, proposal: buildNaturalActionProposal({ type: "create_item", item }, message), response: time.source === "undecided" ? "I’ve added the known details. You can set the time later." : "I’ve structured the item below." };
+}
+
 function makeScope(scopeType, extra = {}) {
-  const today = localDateString(new Date());
+  const today = kampalaToday();
   const scope = { scopeType, startDate: null, endDate: null, statuses: ["upcoming", "in-progress", "postponed", "overdue", "awaiting-check-in"], itemTypes: [], categories: [], titleQuery: null, includeCompleted: false, includeCancelled: false, ...extra };
   if (scopeType === "today") scope.startDate = scope.endDate = today;
-  if (scopeType === "tomorrow") { const date = parseLocalDate(today); date.setDate(date.getDate() + 1); scope.startDate = scope.endDate = localDateString(date); }
+  if (scopeType === "tomorrow") scope.startDate = scope.endDate = shiftIsoDate(today, 1);
   if (scopeType === "specific_date" && scope.startDate) scope.endDate = scope.startDate;
   if (scopeType === "current_week" || scopeType === "next_week") {
-    const start = parseLocalDate(today); start.setDate(start.getDate() - ((start.getDay() + 6) % 7) + (scopeType === "next_week" ? 7 : 0));
-    const end = new Date(start); end.setDate(end.getDate() + 6); scope.startDate = localDateString(start); scope.endDate = localDateString(end);
+    const weekday = new Date(`${today}T00:00:00Z`).getUTCDay();
+    const start = shiftIsoDate(today, -((weekday + 6) % 7) + (scopeType === "next_week" ? 7 : 0));
+    scope.startDate = start; scope.endDate = shiftIsoDate(start, 6);
   }
-  if (scopeType === "current_month") { scope.startDate = today.slice(0, 7) + "-01"; const end = parseLocalDate(scope.startDate); end.setMonth(end.getMonth() + 1); end.setDate(0); scope.endDate = localDateString(end); }
+  if (scopeType === "current_month") { scope.startDate = today.slice(0, 7) + "-01"; const [year, month] = today.split("-").map(Number); scope.endDate = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10); }
   if (["completed", "missed", "cancelled", "overdue"].includes(scopeType)) { scope.statuses = [scopeType]; scope.includeCompleted = scopeType === "completed"; scope.includeCancelled = scopeType === "cancelled"; }
   if (scopeType === "all_active") scope.statuses = ["upcoming", "in-progress", "postponed", "overdue", "awaiting-check-in"];
   if (scopeType === "absolutely_all") { scope.statuses = []; scope.includeCompleted = true; scope.includeCancelled = true; }
@@ -2055,12 +2709,13 @@ function inferBulkScope(text) {
   return scope;
 }
 
-function presentBulkProposal(type, scope, selected, message) {
-  if (!selected.length) { pendingOperation = null; pendingClarification = null; savePlanningContext(); appendEntry({ role: "assistant", text: "I couldn't find items in that scope." }); return; }
-  if (selected.length > 450) { pendingOperation = null; pendingClarification = null; savePlanningContext(); appendEntry({ role: "assistant", text: "That scope is too large for one safe batch. Narrow the date range or item type first." }); return; }
+async function presentBulkProposal(type, scope, selected, message) {
+  if (!selected.length) { pendingOperation = null; pendingClarification = null; savePlanningContext(); await appendAssistantWithReveal({ role: "assistant", text: "I couldn't find items in that scope." }); return; }
+  if (selected.length > 450) { pendingOperation = null; pendingClarification = null; savePlanningContext(); await appendAssistantWithReveal({ role: "assistant", text: "That scope is too large for one safe batch. Narrow the date range or item type first." }); return; }
   currentProposal = createTrustedBulkProposal(type, scope, selected, message);
-  appendEntry({ role: "assistant", text: message, kind: "proposal_summary", proposalSummary: message, resolved: false, referencedItemIds: selected.map(item => item.id) });
-  renderProposal(currentProposal);
+  currentProposal = registerScheduleProposal(currentProposal);
+  await appendAssistantWithReveal(makeProposalSummaryEntry(currentProposal, message, selected.map(item => item.id)));
+  await renderProposal(currentProposal, { reveal: true });
 }
 
 function createTrustedBulkProposal(type, scope, selected, message) {
@@ -2068,7 +2723,7 @@ function createTrustedBulkProposal(type, scope, selected, message) {
   const targetIds = Object.freeze(selected.map(item => item.id));
   const frozenScope = Object.freeze({ ...scope, statuses: Object.freeze([...(scope.statuses || [])]), itemTypes: Object.freeze([...(scope.itemTypes || [])]), categories: Object.freeze([...(scope.categories || [])]) });
   const bulkAction = Object.freeze({ type, scope: frozenScope, targetIds, affectedCount: targetIds.length, items: Object.freeze(selected.map(item => Object.freeze({ ...item }))) });
-  currentProposal = { id: proposalId, bulkAction, confirmationSnapshot: Object.freeze({ proposalId, targetIds: Object.freeze([...targetIds]), scope: frozenScope }), lifecycle: "awaiting_confirmation", message, source: "application" };
+  currentProposal = registerScheduleProposal({ id: proposalId, bulkAction, confirmationSnapshot: Object.freeze({ proposalId, targetIds: Object.freeze([...targetIds]), scope: frozenScope }), lifecycle: "awaiting_confirmation", message, source: "application" });
   pendingOperation = { intent: type === "delete_items" || type === "deduplicate_items" ? "destructive_method" : "bulk_operation", state: "awaiting_confirmation", proposalId, targetIds: [...targetIds], scope: { ...scope }, operation: type };
   savePlanningContext();
   return currentProposal;
@@ -2090,21 +2745,21 @@ function detectDuplicatePair(text) {
   return groups.length === 1 && groups[0].items.length === 2 ? groups[0].items : null;
 }
 
-function proposeDuplicateCleanup(pair, newStart) {
+async function proposeDuplicateCleanup(pair, newStart) {
   const sorted = [...pair].sort((a, b) => (a.createdAt?.toMillis?.() ?? new Date(a.createdAt || 0).getTime()) - (b.createdAt?.toMillis?.() ?? new Date(b.createdAt || 0).getTime()));
   const keep = sorted[0], remove = sorted[1];
   const duration = Number(keep.end.slice(0, 2)) * 60 + Number(keep.end.slice(3)) - Number(keep.start.slice(0, 2)) * 60 - Number(keep.start.slice(3));
   const endMinutes = newStart ? Number(newStart.slice(0, 2)) * 60 + Number(newStart.slice(3)) + duration : 0;
   const end = newStart ? String(Math.floor(endMinutes / 60)).padStart(2, "0") + ":" + String(endMinutes % 60).padStart(2, "0") : null;
-  currentProposal = { id: crypto.randomUUID(), plan: { title: "Clean up duplicate " + keep.title, actions: [
+  currentProposal = registerScheduleProposal({ id: crypto.randomUUID(), plan: { title: "Clean up duplicate " + keep.title, actions: [
     { type: "delete_item", targetId: remove.id, item: null, changes: null, postponeMinutes: null },
     { type: "reschedule_item", targetId: keep.id, item: null, changes: { start: newStart, end }, postponeMinutes: null }
-  ] }, message: "I recommend keeping the older " + keep.title + ", permanently deleting the newer duplicate, and moving the remaining session" + (newStart ? " to " + formatTime(newStart) + " while preserving its duration." : ". Permanent deletion cannot be undone through normal app controls."), source: "local" };
-  appendEntry({ role: "assistant", text: currentProposal.message, kind: "proposal_summary", proposalSummary: currentProposal.message, resolved: false, referencedItemIds: [remove.id, keep.id] });
-  renderProposal(currentProposal);
+  ] }, message: "I recommend keeping the older " + keep.title + ", permanently deleting the newer duplicate, and moving the remaining session" + (newStart ? " to " + formatTime(newStart) + " while preserving its duration." : ". Permanent deletion cannot be undone through normal app controls."), source: "local" });
+  await appendAssistantWithReveal(makeProposalSummaryEntry(currentProposal, currentProposal.message, [remove.id, keep.id]));
+  await renderProposal(currentProposal, { reveal: true });
 }
 
-function routePendingOperation(text) {
+async function routePendingOperation(text) {
   if (!pendingOperation && pendingClarification && ["bulk_scope", "clear_scope", "destructive_method", "clear_method"].includes(pendingClarification.intent)) {
     const intent = pendingClarification.intent === "clear_scope" ? "bulk_scope" : pendingClarification.intent === "clear_method" ? "destructive_method" : pendingClarification.intent;
     pendingOperation = { intent, state: intent === "bulk_scope" ? "collecting_scope" : "collecting_method", knownFields: pendingClarification.knownFields || {}, scope: pendingClarification.knownFields?.scope || null, operation: pendingClarification.knownFields?.operation || null };
@@ -2130,7 +2785,7 @@ function routePendingOperation(text) {
     if (operation) {
       const selected = items.filter(item => saItemMatchesScope(item, scope));
       pendingOperation = null; pendingClarification = null;
-      presentBulkProposal(operation, scope, selected, bulkProposalMessage(operation, scope, selected.length));
+      await presentBulkProposal(operation, scope, selected, bulkProposalMessage(operation, scope, selected.length));
       return true;
     }
     pendingOperation = { intent: "destructive_method", state: "collecting_method", scope, knownFields: { scopeType } };
@@ -2148,7 +2803,7 @@ function routePendingOperation(text) {
     const operation = explicitDelete ? "delete_items" : "cancel_items";
     pendingOperation = { ...pendingOperation, operation, state: "ready_for_proposal" };
     pendingClarification = null;
-    presentBulkProposal(operation, scope, selected, bulkProposalMessage(operation, scope, selected.length));
+    await presentBulkProposal(operation, scope, selected, bulkProposalMessage(operation, scope, selected.length));
     return true;
   }
   if (pendingOperation.intent === "deduplicate_and_reschedule") {
@@ -2157,13 +2812,13 @@ function routePendingOperation(text) {
     const pair = (pendingOperation.targetIds || []).map(id => saFindItemById(id)).filter(Boolean);
     if (pair.length !== 2) { pendingOperation = null; pendingClarification = null; appendEntry({ role: "assistant", text: "Those schedule items have changed. Please describe the duplicate cleanup again." }); savePlanningContext(); return true; }
     pendingOperation = null; pendingClarification = null; savePlanningContext();
-    proposeDuplicateCleanup(pair, time);
+    await proposeDuplicateCleanup(pair, time);
     return true;
   }
   return false;
 }
 
-function routeBulkCommand(text) {
+async function routeBulkCommand(text) {
   const lower = text.toLowerCase();
   if (/\bduplicate|repeated|repetition\b/.test(lower) && /\b(move|reschedule|postpone|remainder|remaining|rest)\b/.test(lower)) {
     const pair = detectDuplicatePair(text);
@@ -2182,7 +2837,7 @@ function routeBulkCommand(text) {
     const remove = chosen.flatMap(group => group.items.slice(1));
     if (!remove.length) { appendEntry({ role: "assistant", text: "I couldn't find exact duplicate schedule items to remove." }); return true; }
     const scope = makeScope("referenced_items", { statuses: [], includeCompleted: true, includeCancelled: true });
-    presentBulkProposal("deduplicate_items", scope, remove, `Keep the oldest item in each exact duplicate group and permanently delete ${remove.length} newer duplicate${remove.length === 1 ? "" : "s"}?`); return true;
+    await presentBulkProposal("deduplicate_items", scope, remove, `Keep the oldest item in each exact duplicate group and permanently delete ${remove.length} newer duplicate${remove.length === 1 ? "" : "s"}?`); return true;
   }
   const bulkIntent = /\b(clear|wipe|empty|free|remove|delete|cancel|complete|mark).*(\ball\b|\bevery\b|\beverything\b|\brest\b|\bremainder\b|\bduplicates?\b)|\b(cancel|delete) the week\b/.test(lower);
   if (!bulkIntent) return false;
@@ -2197,7 +2852,7 @@ function routeBulkCommand(text) {
   }
   if (!op) { askOperationClarification("Should I cancel those items and preserve their history, or delete them permanently?", { intent: "destructive_method", state: "collecting_method", scope }); return true; }
   const selected = items.filter(item => saItemMatchesScope(item, scope));
-  presentBulkProposal(op, scope, selected, bulkProposalMessage(op, scope, selected.length));
+  await presentBulkProposal(op, scope, selected, bulkProposalMessage(op, scope, selected.length));
   return true;
 }
 
@@ -2235,6 +2890,7 @@ async function sendMessage(rawText) {
   if (requestConvId) {
     composerDrafts.delete(requestConvId);
   }
+  const requestPendingClarification = pendingClarification;
   updateComposerHeight();
   updateSendButtonState();
 
@@ -2250,6 +2906,8 @@ async function sendMessage(rawText) {
 
     const structuredGuidedStep = guidedFlow && ["type", "date", "time_range", "category"].includes(guidedFlow.step);
     if (!structuredGuidedStep) appendEntry({ role: "user", text, ...(guidedFlow?.id ? { guidedFlowId: guidedFlow.id, guidedStepId: guidedFlow.step } : {}) });
+    showWaitingState();
+    await new Promise(resolve => requestAnimationFrame(resolve));
 
     if (guidedFlow) {
       await handleGuidedAnswer(text);
@@ -2268,11 +2926,11 @@ async function sendMessage(rawText) {
       return;
     }
 
-    if (routePendingOperation(text)) {
+    if (activeConversationId === requestConvId && await routePendingOperation(text)) {
       saveConversation();
       return;
     }
-    if (routeBulkCommand(text)) {
+    if (activeConversationId === requestConvId && await routeBulkCommand(text)) {
       saveConversation();
       return;
     }
@@ -2282,7 +2940,7 @@ async function sendMessage(rawText) {
       const normalizedRecallText = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
       const recallItems = saGetRelevantItemsForContext(text, 20).filter(item => item.title && normalizedRecallText.includes(item.title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()));
       recallItems.forEach(item => rememberScheduleEntity(item, "recalled", [item.title, "that", "it"]));
-      if (recallItems.length) await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+      if (recallItems.length && activeConversationId === requestConvId) await firebaseStore.saveAssistantState({ activeConversationId: requestConvId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
     }
     const classification = recallContext ? "analytical_query" : classifyRequest(text);
 
@@ -2291,7 +2949,12 @@ async function sendMessage(rawText) {
     if (classification === "deterministic_query") {
       result = handleDeterministicQuery(text);
       if (result) {
-        await appendAssistantWithReveal({ role: "assistant", text: result.text, items: result.items || [] }, requestConvId);
+        const resultIds = [...new Set((result.items || []).flatMap(row => items.filter(item => item.title === row.title && (!row.date || item.date === row.date)).map(item => item.id)))];
+        if (resultIds.length && activeConversationId === requestConvId) {
+          referencedSets = [...referencedSets.filter(set => set.alias !== "last result"), { alias: "last result", targetIds: resultIds, updatedAt: new Date().toISOString() }].slice(-5);
+          await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+        }
+        await appendAssistantWithReveal({ role: "assistant", text: result.text, items: result.items || [], referencedItemIds: resultIds }, requestConvId);
         if (result.proposal || result.clarification) {
           handleProposalOrClarification(result, text);
         }
@@ -2300,20 +2963,50 @@ async function sendMessage(rawText) {
       }
     }
 
-    currentProposal = null;
+    const naturalResult = processNaturalScheduleCommand(text, { pendingClarification: requestPendingClarification });
+    if (naturalResult.handled) {
+      if (naturalResult.clarification) {
+        if (activeConversationId === requestConvId) {
+          pendingClarification = naturalResult.pending || { intent: "natural_schedule", knownFields: {}, missingFields: ["target"] };
+          await firebaseStore.saveAssistantState({ activeConversationId: requestConvId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+        }
+        await appendAssistantWithReveal({ role: "assistant", text: naturalResult.clarification, items: [] }, requestConvId);
+        if (activeConversationId === requestConvId && naturalResult.choices?.length) await renderNaturalChoiceControls(naturalResult.choices);
+        if (activeConversationId === requestConvId && naturalResult.matches?.length) {
+          const matchingIds = naturalResult.matches.map(item => item.id);
+          referencedSets = [...referencedSets.filter(set => set.alias !== "last result"), { alias: "last result", targetIds: matchingIds, updatedAt: new Date().toISOString() }].slice(-5);
+          await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction });
+        }
+        saveConversation();
+        return;
+      }
+      if (naturalResult.proposal) {
+        const proposal = registerScheduleProposal(naturalResult.proposal, requestConvId);
+        if (activeConversationId === requestConvId) { pendingClarification = null; currentProposal = proposal; }
+        const proposalText = naturalResult.response || proposal.message;
+        const targetIds = proposal.action.targetId ? [proposal.action.targetId] : [];
+        await appendAssistantWithReveal(makeProposalSummaryEntry(proposal, proposalText, targetIds), requestConvId);
+        if (activeConversationId === requestConvId) await renderProposal(proposal, { reveal: true });
+        saveConversation();
+        return;
+      }
+    }
+
+    if (activeConversationId === requestConvId) currentProposal = null;
 
     if (classification === "direct_interface_action") {
       const directResult = handleDirectInterfaceAction(text);
       if (directResult.proposal) {
-        currentProposal = directResult.proposal;
-        appendEntry({ role: "assistant", text: directResult.proposal.message, kind: "proposal_summary", proposalSummary: directResult.proposal.message, resolved: false });
-        renderProposal(currentProposal);
+        const proposal = registerScheduleProposal(directResult.proposal, requestConvId);
+        if (activeConversationId === requestConvId) currentProposal = proposal;
+        await appendAssistantWithReveal(makeProposalSummaryEntry(proposal, directResult.proposal.message), requestConvId);
+        if (activeConversationId === requestConvId) await renderProposal(proposal, { reveal: true });
         saveConversation();
         return;
       }
       if (directResult.clarification) {
         pendingClarification = { intent: "unknown", knownFields: {}, missingFields: ["target"] };
-        appendEntry({ role: "assistant", text: directResult.clarification });
+      await appendAssistantWithReveal({ role: "assistant", text: directResult.clarification }, requestConvId);
         saveConversation();
         return;
       }
@@ -2331,27 +3024,21 @@ async function sendMessage(rawText) {
         geminiResponse = await callGeminiEndpoint(text, classification === "analytical_planning", recallContext);
       } catch {
         if (activeConversationId === requestConvId) {
-          removeWaitingState();
           appendEntry({ role: "assistant", text: "The schedule assistant is temporarily busy. Please try again." });
         }
         return;
       }
 
-      if (activeConversationId === requestConvId) {
-        removeWaitingState();
-      }
-
       result = processGeminiResponse(geminiResponse);
 
       if (result.proposal) {
-        currentProposal = result.proposal;
+        currentProposal = registerScheduleProposal(result.proposal, requestConvId);
         const explanation = result.message || "Here's a proposed action.";
-        const entry = { role: "assistant", text: explanation, kind: "proposal_summary", proposalSummary: explanation, resolved: false };
+        const entry = makeProposalSummaryEntry(currentProposal, explanation);
         if (activeConversationId === requestConvId) {
-          appendEntry(entry, { skipRender: true });
-          await renderConversationEntry(entry, { reveal: true });
+          await appendAssistantWithReveal(entry, requestConvId);
           if (activeConversationId === requestConvId) {
-            renderProposal(currentProposal);
+            await renderProposal(currentProposal, { reveal: true });
           }
         } else {
           saveEntryForConversation(requestConvId, entry);
@@ -2363,8 +3050,7 @@ async function sendMessage(rawText) {
       if (result.clarification) {
         const entry = { role: "assistant", text: result.message };
         if (activeConversationId === requestConvId) {
-          appendEntry(entry, { skipRender: true });
-          await renderConversationEntry(entry, { reveal: true });
+          await appendAssistantWithReveal(entry, requestConvId);
         } else {
           saveEntryForConversation(requestConvId, entry);
         }
@@ -2374,8 +3060,7 @@ async function sendMessage(rawText) {
 
       const entry = { role: "assistant", text: result.message, items: result.items || [] };
       if (activeConversationId === requestConvId) {
-        appendEntry(entry, { skipRender: true });
-        await renderConversationEntry(entry, { reveal: true });
+        await appendAssistantWithReveal(entry, requestConvId);
       } else {
         saveEntryForConversation(requestConvId, entry);
       }
@@ -2389,7 +3074,6 @@ async function sendMessage(rawText) {
   } catch (err) {
     console.error("Assistant message handling error", err);
     if (activeConversationId === requestConvId) {
-      removeWaitingState();
       appendEntry({ role: "assistant", text: "An error occurred while processing your request. Please try again." });
     }
   } finally {
@@ -2401,8 +3085,188 @@ async function sendMessage(rawText) {
 function handleProposalOrClarification(result, message) {
 }
 
+function scheduleCompletionPayload(item) {
+  return {
+    title: item.title,
+    date: item.date || null,
+    start: item.start || null,
+    end: item.end || null,
+    category: item.category || "Personal",
+    notes: item.notes || "",
+    recurrence: item.recurrence || null,
+    status: item.status || "upcoming"
+  };
+}
+
+function findProposalConflict(action, proposalId) {
+  let candidate;
+  if (action.type === "create_item") candidate = { ...action.item, id: `proposal:${proposalId}` };
+  else if (["update_item", "reschedule_item"].includes(action.type)) {
+    const original = saFindItemById(action.targetId);
+    if (!original) return null;
+    candidate = { ...original, ...(action.changes || {}), id: original.id };
+  } else if (action.type === "postpone_item") {
+    const original = saFindItemById(action.targetId);
+    if (!original) return null;
+    candidate = { ...original, ...(action.schedule || {}), id: original.id };
+  } else return null;
+  if (candidate.type !== "activity" || !candidate.date || !candidate.start || !candidate.end) return null;
+  const pool = action.type === "create_item" ? [...items, candidate] : [...items.filter(item => item.id !== candidate.id), candidate];
+  const conflict = saDetectConflictsForDate(candidate.date, pool).find(entry => entry.firstItemId === candidate.id || entry.secondItemId === candidate.id);
+  return conflict ? { items: [conflict.firstTitle, conflict.secondTitle], date: conflict.date, start: conflict.overlapStart, end: conflict.overlapEnd } : null;
+}
+
+async function confirmScheduleProposal(proposalId, conversationId) {
+  const proposal = scheduleProposalRegistry.get(proposalId) || (currentProposal?.id === proposalId ? currentProposal : null);
+  if (!proposal || !proposal.action || proposal.conversationId !== conversationId) return { success: false, error: "Proposal is no longer available." };
+  if (proposal.confirmationState === "resolved") return proposal.confirmationResult || { success: true, item: proposal.resultItem || null, alreadyResolved: true };
+  if (proposal.confirmationState === "confirming") return { success: false, alreadyConfirming: true };
+  if (!["pending", "failed"].includes(proposal.confirmationState)) return { success: false, error: "Proposal is no longer available." };
+
+  await persistScheduleProposalState(proposal, "confirming").catch(() => console.warn("proposal_confirmation_failed"));
+  const action = proposal.action;
+  let writeSucceeded = false;
+  let successResult = null;
+  let successResponse = "Your schedule item has been updated.";
+  if (activeConversationId === conversationId) {
+    assistantEls.conversation.querySelectorAll(`.proposal[data-proposal-id="${proposalId}"] button`).forEach(button => { button.disabled = true; button.setAttribute("aria-disabled", "true"); });
+    if (!waitingEl) showWaitingState();
+    pendingOperation = { intent: "schedule_proposal", state: "executing", proposalId, operation: proposal.operation, targetIds: action.targetId ? [action.targetId] : [] };
+    await firebaseStore.saveAssistantState({ activeConversationId: conversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction }).catch(showPersistenceFailure);
+  }
+
+  try {
+    let result;
+    let responseText;
+    let operation;
+    if (action.type === "create_item") {
+      const sourceItem = action.item || {};
+      const normalized = {
+        id: proposalId,
+        type: sourceItem.type,
+        title: typeof sourceItem.title === "string" ? sourceItem.title.trim() : "",
+        date: sourceItem.schedulePending === true ? null : (sourceItem.date || null),
+        schedulePending: sourceItem.schedulePending === true,
+        start: sourceItem.schedulePending === true ? "" : (sourceItem.start || ""),
+        end: sourceItem.schedulePending === true ? "" : (sourceItem.end || ""),
+        category: sourceItem.category || "Personal",
+        notes: typeof sourceItem.notes === "string" ? sourceItem.notes.trim() : "",
+        recurrence: sourceItem.recurrence || null
+      };
+      const validationError = scheduleValidateItem(normalized);
+      if (validationError) { console.warn("natural_proposal_validation_failed"); throw new Error(validationError); }
+      action.item = normalized;
+      proposal.conflict = findProposalConflict(action, proposalId);
+      result = await saCreateItem(normalized);
+      operation = "schedule.create";
+      responseText = "Added to your schedule.";
+    } else if (["update_item", "reschedule_item"].includes(action.type)) {
+      const target = saFindItemById(action.targetId);
+      if (!target) throw new Error("Item no longer exists.");
+      const changes = { ...(action.changes || {}) };
+      if (Object.prototype.hasOwnProperty.call(changes, "date")) changes.date = changes.schedulePending ? null : (changes.date || null);
+      if (Object.prototype.hasOwnProperty.call(changes, "start")) changes.start = changes.start || "";
+      if (Object.prototype.hasOwnProperty.call(changes, "end")) changes.end = changes.end || "";
+      const candidate = { ...target, ...changes };
+      const validationError = scheduleValidateItem(candidate);
+      if (validationError) { console.warn("natural_proposal_validation_failed"); throw new Error(validationError); }
+      action.changes = changes;
+      proposal.conflict = findProposalConflict(action, proposalId);
+      result = action.type === "reschedule_item"
+        ? await saRescheduleItem(action.targetId, candidate.date, candidate.start, candidate.end)
+        : await saUpdateItem(action.targetId, changes);
+      operation = "schedule.update";
+      responseText = "Your schedule item has been updated.";
+    } else if (action.type === "postpone_item") {
+      result = await saPostponeItem(action.targetId, action.schedule || action.postponeMinutes || 15);
+      operation = "schedule.postpone";
+      responseText = "Your schedule item has been postponed.";
+    } else if (action.type === "cancel_item") {
+      result = await saCancelItem(action.targetId);
+      operation = "schedule.cancel";
+      responseText = "Your schedule item has been cancelled.";
+    } else if (action.type === "complete_item") {
+      result = await saCompleteItem(action.targetId);
+      operation = "schedule.complete";
+      responseText = "Your schedule item has been marked complete.";
+    } else return { success: false, unsupported: true };
+
+    if (!result?.success || !result.item) throw new Error(result?.error || "Schedule save failed.");
+    writeSucceeded = true;
+    await persistScheduleProposalState(proposal, "resolved").catch(() => console.warn("proposal_confirmation_failed"));
+    proposal.resultItem = result.item;
+    proposal.confirmationResult = { success: true, item: result.item };
+    successResult = result;
+    successResponse = responseText;
+    lastConfirmedAction = { type: operation, targetId: result.item.id, proposalId, confirmedAt: new Date().toISOString() };
+    if (activeConversationId === conversationId) {
+      const proposalElement = assistantEls.conversation.querySelector(`.proposal[data-proposal-id="${proposalId}"]`);
+      proposalElement?.remove();
+      if (currentProposal?.id === proposalId) currentProposal = null;
+      conversation.forEach(entry => { if (entry.kind === "proposal_summary" && entry.resolved === false) entry.resolved = true; });
+      rememberScheduleEntity(result.item, action.type === "create_item" ? "created" : action.type === "update_item" || action.type === "reschedule_item" ? "updated" : action.type === "postpone_item" ? "postponed" : action.type === "cancel_item" ? "cancelled" : "completed", ["that", "it", result.item.title]);
+    }
+    await firebaseStore.resolveUnresolvedProposals(conversationId).catch(() => {});
+    if (activeConversationId === conversationId) {
+      pendingOperation = null;
+      await firebaseStore.saveAssistantState({ activeConversationId: conversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation: null, referencedSets, lastConfirmedAction }).catch(showPersistenceFailure);
+      const completion = { id: proposal.completionEntryId || crypto.randomUUID(), role: "assistant", kind: "schedule_completion", text: responseText, scheduleItem: scheduleCompletionPayload(result.item), referencedItemIds: [result.item.id] };
+      proposal.completionEntryId = completion.id;
+      await appendAssistantWithReveal(completion, conversationId);
+      assistantEls.conversation.lastElementChild?.focus({ preventScroll: true });
+      await persistenceQueue;
+      await firebaseStore.updateConversationSummary(conversationId, conversationSummary("active")).catch(showPersistenceFailure);
+    } else {
+      const completion = { id: proposal.completionEntryId || crypto.randomUUID(), role: "assistant", kind: "schedule_completion", text: responseText, scheduleItem: scheduleCompletionPayload(result.item), referencedItemIds: [result.item.id] };
+      proposal.completionEntryId = completion.id;
+      saveEntryForConversation(conversationId, completion);
+    }
+    return proposal.confirmationResult;
+  } catch (error) {
+    if (writeSucceeded && successResult?.item) {
+      proposal.confirmationState = "resolved";
+      proposal.lifecycle = "resolved";
+      proposal.confirmationResult ||= { success: true, item: successResult.item };
+      if (activeConversationId === conversationId) {
+        assistantEls.conversation.querySelector(`.proposal[data-proposal-id="${proposalId}"]`)?.remove();
+        if (currentProposal?.id === proposalId) currentProposal = null;
+        if (!conversation.some(entry => entry.id === proposal.completionEntryId)) {
+          const completion = { id: proposal.completionEntryId || crypto.randomUUID(), role: "assistant", kind: "schedule_completion", text: successResponse, scheduleItem: scheduleCompletionPayload(successResult.item), referencedItemIds: [successResult.item.id] };
+          proposal.completionEntryId = completion.id;
+          await appendAssistantWithReveal(completion, conversationId).catch(() => {});
+        }
+      } else if (!proposal.completionEntryId) {
+        const completion = { id: crypto.randomUUID(), role: "assistant", kind: "schedule_completion", text: successResponse, scheduleItem: scheduleCompletionPayload(successResult.item), referencedItemIds: [successResult.item.id] };
+        proposal.completionEntryId = completion.id;
+        saveEntryForConversation(conversationId, completion);
+      }
+      return proposal.confirmationResult;
+    }
+    await persistScheduleProposalState(proposal, "failed").catch(() => console.warn("proposal_confirmation_failed"));
+    proposal.confirming = false;
+    console.warn("proposal_confirmation_failed");
+    if (activeConversationId === conversationId) {
+      pendingOperation = { intent: "schedule_proposal", state: "failed", proposalId, operation: proposal.operation, targetIds: action.targetId ? [action.targetId] : [] };
+      await firebaseStore.saveAssistantState({ activeConversationId: conversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction }).catch(showPersistenceFailure);
+      const proposalElement = assistantEls.conversation.querySelector(`.proposal[data-proposal-id="${proposalId}"]`);
+      proposalElement?.querySelectorAll("button").forEach(button => { button.disabled = false; button.removeAttribute("aria-disabled"); });
+      await appendAssistantWithReveal({ role: "assistant", text: "The schedule item could not be saved. Try again." }, conversationId);
+      proposalElement?.querySelector('[data-action="confirm"]')?.focus({ preventScroll: true });
+    } else {
+      saveEntryForConversation(conversationId, { role: "assistant", text: "The schedule item could not be saved. Try again." });
+    }
+    return { success: false, error: "The schedule item could not be saved. Try again." };
+  } finally {
+    if (activeConversationId === conversationId && waitingEl && proposal.confirmationState !== "confirming") removeWaitingState();
+  }
+}
+
 async function confirmProposal() {
   if (!currentProposal) return;
+  if (currentProposal.action && ["create_item", "update_item", "reschedule_item", "postpone_item", "cancel_item", "complete_item"].includes(currentProposal.action.type)) {
+    await confirmScheduleProposal(currentProposal.id, currentProposal.conversationId || activeConversationId);
+    return;
+  }
   if (currentProposal.bulkAction && currentProposal.lifecycle === "failed" && pendingOperation?.state === "failed" && pendingOperation.proposalId === currentProposal.id) {
     currentProposal.lifecycle = "awaiting_confirmation";
     pendingOperation.state = "awaiting_confirmation";
@@ -2421,40 +3285,6 @@ async function confirmProposal() {
   let result;
 
   switch (action.type) {
-    case "create_item":
-      if (!action.item) {
-        showProcessingError("Missing item data.");
-        return;
-      }
-      result = await saCreateItem(action.item);
-      if (!result.success) {
-        showProcessingError(result.error);
-        return;
-      }
-      rememberScheduleEntity(result.item, "created", ["that", "it", result.item.title]);
-      appendEntry({ role: "assistant", text: `Created "${result.item.title}" for ${formatDateLabel(result.item.date)}.`, referencedItemIds: [result.item.id] });
-      break;
-
-    case "complete_item":
-      result = await saCompleteItem(action.targetId);
-      if (!result.success) {
-        showProcessingError(result.error);
-        return;
-      }
-      rememberScheduleEntity(result.item, "completed", ["that", "it"]);
-      appendEntry({ role: "assistant", text: `Marked "${result.item.title}" as completed.`, referencedItemIds: [result.item.id] });
-      break;
-
-    case "cancel_item":
-      result = await saCancelItem(action.targetId);
-      if (!result.success) {
-        showProcessingError(result.error);
-        return;
-      }
-      rememberScheduleEntity(result.item, "cancelled", ["that", "it"]);
-      appendEntry({ role: "assistant", text: `Cancelled "${result.item.title}".`, referencedItemIds: [result.item.id] });
-      break;
-
     case "restore_item":
       result = await saRestoreItem(action.targetId);
       if (!result.success) { currentProposal.confirming = false; showProcessingError(result.error); return; }
@@ -2478,60 +3308,6 @@ async function confirmProposal() {
       }
       rememberScheduleEntity(result.item, "missed", ["that", "it"]);
       appendEntry({ role: "assistant", text: `Marked "${result.item.title}" as missed.`, referencedItemIds: [result.item.id] });
-      break;
-
-    case "reschedule_item":
-      const target = saFindItemById(action.targetId);
-      if (!target) {
-        showProcessingError("Item no longer exists.");
-        return;
-      }
-      const changes = action.changes || {};
-      const nextItem = { ...target, ...changes, schedulePending: false };
-      if (!nextItem.date || !nextItem.start || !nextItem.end || nextItem.start >= nextItem.end) {
-        showProcessingError("Missing new schedule details.");
-        return;
-      }
-      const conflictCheck = saDetectConflictsForDate(nextItem.date, [...items.filter(item => item.id !== action.targetId), nextItem])
-        .find(conflict => conflict.firstItemId === nextItem.id || conflict.secondItemId === nextItem.id);
-      if (conflictCheck) renderProposalMessage(`Warning: ${conflictCheck.firstTitle} and ${conflictCheck.secondTitle} overlap on ${formatDateLabel(nextItem.date)} from ${formatTime(conflictCheck.overlapStart)} to ${formatTime(conflictCheck.overlapEnd)}.`);
-      result = await saRescheduleItem(action.targetId, nextItem.date, nextItem.start, nextItem.end);
-      if (!result.success) {
-        showProcessingError(result.error);
-        return;
-      }
-      rememberScheduleEntity(result.item, "rescheduled", ["that", "it"]);
-      appendEntry({ role: "assistant", text: `Moved "${result.item.title}" to ${formatDateLabel(result.item.date)} from ${formatTime(result.item.start)} to ${formatTime(result.item.end)}.`, referencedItemIds: [result.item.id] });
-      break;
-
-    case "update_item":
-      const updateTarget = saFindItemById(action.targetId);
-      if (!updateTarget) {
-        showProcessingError("Item no longer exists.");
-        return;
-      }
-      result = await saUpdateItem(action.targetId, action.changes || {});
-      if (!result.success) {
-        showProcessingError(result.error);
-        return;
-      }
-      rememberScheduleEntity(result.item, "updated", ["that", "it"]);
-      appendEntry({ role: "assistant", text: `Updated "${result.item.title}".`, referencedItemIds: [result.item.id] });
-      break;
-
-    case "postpone_item":
-      const postponeTarget = saFindItemById(action.targetId);
-      if (!postponeTarget) {
-        showProcessingError("Item no longer exists.");
-        return;
-      }
-      result = await saPostponeItem(action.targetId, action.postponeMinutes || 15);
-      if (!result.success) {
-        showProcessingError(result.error);
-        return;
-      }
-      appendEntry({ role: "assistant", text: `Postponed "${result.item.title}" by ${result.postponedMinutes} minutes.` });
-      rememberScheduleEntity(result.item, "postponed", ["that", "it"]);
       break;
 
     default:
@@ -2676,6 +3452,11 @@ async function editProposal() {
   await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
   conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
 
+  if (proposal.action?.type === "update_item" && proposal.action.targetId) {
+    window.startAssistantScheduleEdit(proposal.action.targetId, { proposedChanges: proposal.action.changes || {} });
+    return;
+  }
+
   if (proposal.action?.item) {
     const item = proposal.action.item;
     if (proposal.action.type === "update" || proposal.action.type === "reschedule") {
@@ -2722,12 +3503,12 @@ async function cancelProposal() {
 }
 
 function showProcessingError(message) {
-  appendEntry({ role: "assistant", text: message });
-  if (currentProposal) {
-    currentProposal.confirming = false;
-    assistantEls.conversation.querySelector(".proposal")?.remove();
-    renderProposal(currentProposal);
-  }
+  const proposal = currentProposal;
+  if (proposal) proposal.confirming = false;
+  assistantEls.conversation.querySelector(".proposal")?.remove();
+  appendAssistantWithReveal({ role: "assistant", text: message }).then(() => {
+    if (proposal && currentProposal?.id === proposal.id) renderProposal(proposal, { reveal: true });
+  });
 }
 
 function updateComposerHeight() {
@@ -3051,7 +3832,6 @@ async function guidedAppendAssistant(text, { wait = false, showControls = true, 
     await new Promise(resolve => requestAnimationFrame(resolve));
     await waitForPresentation(startedAt, 350);
   }
-  if (activeConversationId === conversationId) removeWaitingState();
   await appendAssistantWithReveal({ role: "assistant", text, ...(kind ? { kind } : {}), ...(guidedFlow?.id ? { guidedFlowId: guidedFlow.id, guidedStepId: guidedFlow.step } : {}) }, conversationId);
   if (kind === "guided_completion" && activeConversationId === conversationId) assistantEls.conversation?.lastElementChild?.focus({ preventScroll: true });
   if (showControls && activeConversationId === conversationId && guidedFlow) renderGuidedControls();
@@ -3202,10 +3982,11 @@ async function startAssistantScheduleEdit(itemId, options = {}) {
     updateSendButtonState();
     loadDrawerConversations().catch(() => {});
 
-    const proposedDate = options?.proposedDate || item.date || "";
-    const proposedStart = options?.proposedStart !== undefined && options.proposedStart !== "" ? options.proposedStart : (item.start || null);
-    const proposedEnd = options?.proposedEnd !== undefined && options.proposedEnd !== "" ? options.proposedEnd : (item.end || null);
-    const hasProposedChanges = Boolean(options?.proposedDate || options?.proposedStart || options?.proposedEnd);
+    const proposedChanges = options?.proposedChanges && typeof options.proposedChanges === "object" ? options.proposedChanges : {};
+    const proposedDate = Object.prototype.hasOwnProperty.call(proposedChanges, "date") ? (proposedChanges.date || "") : (options?.proposedDate || item.date || "");
+    const proposedStart = Object.prototype.hasOwnProperty.call(proposedChanges, "start") ? (proposedChanges.start || null) : (options?.proposedStart !== undefined && options.proposedStart !== "" ? options.proposedStart : (item.start || null));
+    const proposedEnd = Object.prototype.hasOwnProperty.call(proposedChanges, "end") ? (proposedChanges.end || null) : (options?.proposedEnd !== undefined && options.proposedEnd !== "" ? options.proposedEnd : (item.end || null));
+    const hasProposedChanges = Object.keys(proposedChanges).length > 0 || Boolean(options?.proposedDate || options?.proposedStart || options?.proposedEnd);
     const step = options?.step || (hasProposedChanges ? "summary" : "edit_choice");
 
     guidedCompletedFlow = null;
@@ -3216,17 +3997,19 @@ async function startAssistantScheduleEdit(itemId, options = {}) {
       originalItem: { ...item },
       step,
       values: {
-        itemType: item.type,
-        title: item.title,
+        itemType: proposedChanges.type || item.type,
+        title: Object.prototype.hasOwnProperty.call(proposedChanges, "title") ? proposedChanges.title : item.title,
         date: proposedDate,
         dateDraft: null,
         timeDraft: null,
         start: proposedStart,
         end: proposedEnd,
-        category: item.category || "Personal",
-        notes: item.notes || "",
-        recurrence: item.recurrence ? JSON.parse(JSON.stringify(item.recurrence)) : null,
-        weekdays: item.recurrence?.days ? [...item.recurrence.days] : []
+        category: proposedChanges.category || item.category || "Personal",
+        notes: Object.prototype.hasOwnProperty.call(proposedChanges, "notes") ? proposedChanges.notes : (item.notes || ""),
+        recurrence: proposedChanges.recurrence || (item.recurrence ? JSON.parse(JSON.stringify(item.recurrence)) : null),
+        weekdays: (proposedChanges.recurrence || item.recurrence)?.days ? [...(proposedChanges.recurrence || item.recurrence).days] : [],
+        schedulePending: proposedChanges.schedulePending ?? item.schedulePending === true,
+        status: proposedChanges.status || item.status
       }
     };
 
@@ -3379,6 +4162,7 @@ function renderGuidedDateControl(parent, value) {
     if (candidate.getFullYear() !== yearNumber || candidate.getMonth() !== monthNumber - 1 || candidate.getDate() !== dayNumber) { error.textContent = "Enter a valid date."; error.hidden = false; day.focus(); return; }
     clearError();
     guidedFlow.values.date = `${yearNumber}-${String(monthNumber).padStart(2, "0")}-${String(dayNumber).padStart(2, "0")}`;
+    guidedFlow.values.schedulePending = false;
     guidedFlow.values.dateDraft = null;
     control.querySelectorAll("input, button").forEach(field => { field.disabled = true; });
     guidedAdvance(); await guidedAskCurrentStep();
@@ -3443,6 +4227,7 @@ function renderGuidedTimeControl(parent, start, end) {
     const endTime = parse(endGroup);
     if (!startTime || !endTime || endTime <= startTime) { error.textContent = "End time must be later than start time."; error.hidden = false; return; }
     guidedFlow.values.start = startTime; guidedFlow.values.end = endTime; guidedFlow.values.timeDraft = null;
+    guidedFlow.values.schedulePending = false;
     card.querySelectorAll("input, select, button").forEach(field => { field.disabled = true; field.tabIndex = -1; });
     guidedAdvance(); await guidedAskCurrentStep();
   });
@@ -3466,9 +4251,9 @@ function renderGuidedControls() {
     itemType.className = "guided-summary-type";
     itemType.textContent = values.itemType ? values.itemType[0].toUpperCase() + values.itemType.slice(1) : "";
     const date = document.createElement("p");
-    date.textContent = formatKampalaDate(values.date);
+    date.textContent = values.date ? formatKampalaDate(values.date) : "Date not set";
     const time = document.createElement("p");
-    time.textContent = values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed";
+    time.textContent = values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Time not set";
     const category = document.createElement("p");
     category.textContent = values.category || "Personal";
     controls.append(title, itemType, date, time, category);
@@ -3598,16 +4383,16 @@ async function guidedAskCurrentStep({ wait = false } = {}) {
   const saved = saveGuidedFlow();
   if (shouldWait) await waitForPresentation(startedAt, 350);
   await saved;
-  if (activeConversationId === conversationId) removeWaitingState();
   await appendAssistantWithReveal({ role: "assistant", text: prompt, guidedFlowId: guidedFlow.id, guidedStepId: guidedFlow.step }, conversationId);
   if (activeConversationId === conversationId && guidedFlow) renderGuidedControls();
 }
 function validateGuidedValues() {
   const values = guidedFlow.values;
+  const pendingEdit = guidedFlow.type === "edit_schedule_item" && values.schedulePending === true;
   if (!values.title?.trim()) return "Enter a title.";
-  if (!values.date || !scheduleValidateDate(values.date)) return "Enter a valid date.";
-  if (values.itemType === "activity" && (!values.start || !scheduleValidateTime(values.start))) return "Select a start time.";
-  if (values.itemType === "activity" && (!values.end || !scheduleValidateTime(values.end))) return "Select an end time.";
+  if (!pendingEdit && (!values.date || !scheduleValidateDate(values.date))) return "Enter a valid date.";
+  if (!pendingEdit && values.itemType === "activity" && (!values.start || !scheduleValidateTime(values.start))) return "Select a start time.";
+  if (!pendingEdit && values.itemType === "activity" && (!values.end || !scheduleValidateTime(values.end))) return "Select an end time.";
   if (values.start && !scheduleValidateTime(values.start)) return "Select a valid start time.";
   if (values.end && !scheduleValidateTime(values.end)) return "Select a valid end time.";
   if (values.start && values.end && values.end <= values.start) return "End time must be later than start time.";
@@ -3676,7 +4461,7 @@ async function handleGuidedAnswer(text) {
   await guidedAskCurrentStep({ wait: true });
 }
 function guidedSummaryText(values) {
-  const lines = [values.title, formatKampalaDate(values.date), values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed", values.category || "Personal"];
+  const lines = [values.title, values.date ? formatKampalaDate(values.date) : "Date not set", values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Time not set", values.category || "Personal"];
   if (values.notes) lines.push(values.notes);
   if (values.recurrence) lines.push(`${values.recurrence.frequency[0].toUpperCase()}${values.recurrence.frequency.slice(1)} · every ${values.recurrence.interval}${values.recurrence.frequency === "daily" ? " day(s)" : values.recurrence.frequency === "weekly" ? " week(s)" : " month(s)"}${values.recurrence.frequency === "weekly" ? ` · ${values.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ")}` : ""}`);
   return lines.join("\n");
@@ -3711,11 +4496,13 @@ async function confirmGuidedAdd() {
   const validationError = validateGuidedValues();
   if (validationError) { guidedFlow.step = validationError.startsWith("Select a start") || validationError.startsWith("Select an end") || validationError.startsWith("End time") ? "time_range" : validationError.startsWith("Choose a category") ? "category" : validationError.startsWith("Choose a routine") || validationError.startsWith("Enter a positive recurrence") ? "frequency" : validationError.startsWith("Select at least one weekday") ? "weekdays" : validationError.startsWith("Enter a valid date") ? "date" : "title"; await guidedAskCurrentStep(); return; }
   const values = guidedFlow.values;
-  const updates = {
-    title: values.title.trim(), date: values.date, type: values.itemType, start: values.start || "", end: values.end || "",
-    category: values.category || "Personal", notes: values.notes.trim(), recurrence: values.recurrence, schedulePending: false
-  };
   const isEdit = guidedFlow.type === "edit_schedule_item";
+  const updates = {
+    title: values.title.trim(), date: values.schedulePending ? null : values.date, type: values.itemType, start: values.start || "", end: values.end || "",
+    category: values.category || "Personal", notes: values.notes.trim(), recurrence: values.recurrence,
+    schedulePending: isEdit ? values.schedulePending === true : false,
+    ...(isEdit && values.status ? { status: values.status } : {})
+  };
   const candidateId = isEdit ? guidedFlow.itemId : "__guided_add_item__";
   const candidate = { ...updates, id: candidateId, status: "upcoming" };
   const conflict = candidate.date && candidate.start && candidate.end
@@ -3732,20 +4519,18 @@ async function confirmGuidedAdd() {
   }
   guidedSaveInProgress = true;
   renderGuidedControls();
-  let result;
-  try {
-    if (isEdit) {
-      result = await saUpdateItem(guidedFlow.itemId, updates);
-    } else {
-      result = await saCreateItem({ ...updates, status: "upcoming", postponed: 0 });
-    }
-  }
-  catch { result = { success: false }; }
-  finally { guidedSaveInProgress = false; }
-  if (!result?.success) { await guidedAppendAssistant("The schedule item could not be saved. Try again."); return; }
-  if (result.item && typeof window.refreshAssistantScheduleItem === "function") window.refreshAssistantScheduleItem(result.item, isEdit ? "updated" : "created");
   const flowId = guidedFlow.id;
-  const summary = guidedSummaryText(values);
+  const proposal = registerScheduleProposal({
+    id: crypto.randomUUID(),
+    conversationId: activeConversationId,
+    source: "guided",
+    action: isEdit ? { type: "update_item", targetId: guidedFlow.itemId, changes: updates } : { type: "create_item", item: { ...updates, status: "upcoming", postponed: 0 } },
+    message: "Review the schedule details below."
+  }, activeConversationId);
+  currentProposal = proposal;
+  const result = await confirmScheduleProposal(proposal.id, activeConversationId);
+  guidedSaveInProgress = false;
+  if (!result.success) { renderGuidedControls(); return; }
   await removeGuidedReviewInstruction(flowId);
   guidedFlow.status = "completed"; guidedFlow.step = "summary";
   guidedFlowsByConversation[activeConversationId] = guidedFlow; guidedCompletedFlow = guidedFlow;
@@ -3753,7 +4538,9 @@ async function confirmGuidedAdd() {
   pendingQuickQuestionId = null;
   await saveGuidedFlow();
   assistantEls.conversation.querySelector("#guidedControls-summary")?.remove();
-  await guidedAppendAssistant(isEdit ? `Schedule updated.\n${summary}` : `Added to your schedule.\n${summary}`, { showControls: false, kind: "guided_completion" });
+  currentProposal = null;
+  await firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction, guidedFlow, guidedFlowsByConversation }).catch(showPersistenceFailure);
+  updateAssistantEmptyState();
 }
 async function handleGuidedControl(action, value) {
   if (!guidedFlow) return;
@@ -3888,7 +4675,6 @@ async function runQuickQuestion(id, { logUser = true } = {}) {
     try { result = spec.run(); }
     catch { result = { text: "I couldn't answer that right now." }; }
     await waitForPresentation(waitingStartedAt, 350);
-    if (activeConversationId === requestConvId) removeWaitingState();
     await appendAssistantWithReveal({ role: "assistant", text: result.text, items: result.items || [] }, requestConvId);
     if (activeConversationId === requestConvId) {
       updateAssistantEmptyState();
@@ -4058,6 +4844,20 @@ assistantEls.quickQuestionsPanel?.addEventListener("click", event => {
   handleQuickQuestion(button.dataset.quickQuestion);
 });
 assistantEls.conversation?.addEventListener("click", event => {
+  const choice = event.target.closest("[data-natural-choice]");
+  if (choice && !choice.disabled && assistantEls.conversation.contains(choice)) {
+    choice.disabled = true;
+    if (choice.dataset.naturalChoice.startsWith("target:")) {
+      const targetId = choice.dataset.naturalChoice.slice("target:".length);
+      const rawMessage = pendingClarification?.knownFields?.rawMessage;
+      pendingClarification = { intent: "natural_edit_target", knownFields: { targetId, rawMessage }, missingFields: [] };
+      firebaseStore.saveAssistantState({ activeConversationId, pendingClarification, planningContext: activePlanningContext, entityRegistry, pendingOperation, referencedSets, lastConfirmedAction }).catch(showPersistenceFailure);
+      sendMessage("that one");
+      return;
+    }
+    sendMessage(choice.dataset.naturalChoice);
+    return;
+  }
   const button = event.target.closest("[data-guided-action]");
   if (!button || button.disabled || !assistantEls.conversation.contains(button)) return;
   handleGuidedControl(button.dataset.guidedAction, button.dataset.guidedValue).catch(() => showPersistenceFailure());
@@ -4277,6 +5077,7 @@ assistantEls.conversation?.addEventListener("click", event => {
   if (button.dataset.action === "cancel") cancelProposal();
 });
 
+currentProposal = currentProposal || restorePendingScheduleProposal(conversation, activeConversationId);
 renderConversation();
 if (guidedFlow) { if (!guidedFlow.id) guidedFlow.id = crypto.randomUUID(); renderGuidedHistoryControls(); renderGuidedControls(); }
 else if (guidedCompletedFlow) renderGuidedHistoryControls(guidedCompletedFlow);
