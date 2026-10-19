@@ -35,7 +35,7 @@ const scheduleStatusPresentation = {
 const attentionVisuals = {
   Health: { className: "health", image: "assets/animations/matson-health-animation.svg" },
   Music: { className: "music", image: "assets/illustrations/music.png" },
-  Meetings: { className: "meetings", image: "assets/illustrations/meetings.png" },
+  Meetings: { className: "meetings", image: "assets/animations/matson-meetings-animation.svg" },
   Personal: { className: "personal", image: "assets/illustrations/personal.png" },
   Travel: { className: "travel", image: "assets/illustrations/travel.png" }
 };
