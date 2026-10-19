@@ -34,9 +34,9 @@ const scheduleStatusPresentation = {
 
 const attentionVisuals = {
   Health: { className: "health", image: "assets/animations/matson-health-animation.svg" },
-  Music: { className: "music", image: "assets/illustrations/music.png" },
+  Music: { className: "music", image: "assets/animations/matson-music-animation.svg" },
   Meetings: { className: "meetings", image: "assets/animations/matson-meetings-animation.svg" },
-  Personal: { className: "personal", image: "assets/illustrations/personal.png" },
+  Personal: { className: "personal", image: "assets/animations/matson-personal-animation.svg" },
   Travel: { className: "travel", image: "assets/illustrations/travel.png" }
 };
 const failedAttentionVisualAssets = new Set();
@@ -276,7 +276,14 @@ function renderAttention(dateItems, heroItems = getAttentionItems(dateItems)) {
   cancel.dataset.attentionCancel = attention.id;
   cancel.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>';
   article.append(information, cancel);
-  stage.append(article, illustration);
+  if (visual.className === "personal") {
+    const personalAnimationWrapper = document.createElement("div");
+    personalAnimationWrapper.className = "personal-animation-wrapper";
+    personalAnimationWrapper.append(illustration);
+    stage.append(article, personalAnimationWrapper);
+  } else {
+    stage.append(article, illustration);
+  }
 
   const actions = document.createElement("div");
   actions.className = "attention-controls";

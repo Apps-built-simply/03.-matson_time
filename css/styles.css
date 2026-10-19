@@ -136,9 +136,9 @@ section { margin-top: 28px; }
 /* What needs attention */
 .attention-hero-stage { --illustration-width: 50%; --illustration-right: 5%; --illustration-top-overflow: 0px; --illustration-bottom-overflow: 0px; --illustration-bottom-inset: 0px; --illustration-height: 100%; --illustration-max-height: 100%; position: relative; overflow: visible; padding-top: var(--illustration-top-overflow); padding-bottom: var(--illustration-bottom-overflow); }
 .attention-hero-stage.category-health { --illustration-width: 72%; --illustration-right: 4%; --illustration-top-overflow: 26px; --illustration-height: calc(100% + 18px); --illustration-max-height: calc(100% + 18px); }
-.attention-hero-stage.category-music { --illustration-width: 73%; --illustration-right: 0%; --illustration-top-overflow: 24px; --illustration-bottom-overflow: 34px; }
+.attention-hero-stage.category-music { --illustration-width: 58%; --illustration-right: -6%; --illustration-top-overflow: 24px; --illustration-height: auto; --illustration-max-height: none; --illustration-bottom: 0px; }
 .attention-hero-stage.category-meetings { --illustration-width: min(150%, 560px); --illustration-right: 0%; --illustration-top-overflow: 22px; --illustration-height: auto; --illustration-max-height: none; --illustration-bottom: -12px; overflow-x: clip; overflow-y: visible; clip-path: inset(-220px 0 -30px 0); }
-.attention-hero-stage.category-personal { --illustration-width: 76%; --illustration-right: 2%; --illustration-top-overflow: 22px; --illustration-height: auto; --illustration-max-height: calc(100% + 84px); }
+.attention-hero-stage.category-personal { --illustration-width: 58%; --illustration-right: -7%; --illustration-top-overflow: 22px; --illustration-height: auto; --illustration-max-height: none; --illustration-bottom: -12px; }
 .attention-hero-stage.category-travel { --illustration-width: 49%; --illustration-right: 6%; --illustration-bottom-inset: 12px; --illustration-height: calc(100% - 12px); --illustration-max-height: calc(100% - 12px); }
 .attention-hero-card { --hero-color: var(--hero-personal); --category-accent: var(--category-personal); --category-pill-text: #151515; position: relative; min-height: 190px; overflow: visible; border: 0; border-radius: 11px; padding: 20px 18px 60px; color: #fff; }
 .attention-hero-card::before { position: absolute; z-index: 0; inset: 0; border-radius: inherit; background: var(--hero-color); content: ""; pointer-events: none; }
@@ -149,6 +149,9 @@ section { margin-top: 28px; }
 .attention-hero-card.category-travel { --hero-color: var(--hero-travel); --category-accent: var(--category-travel); --category-pill-text: #fff; }
 .attention-information { position: relative; z-index: 2; display: grid; justify-items: start; gap: 7px; width: min(48%, 340px); }
 .attention-illustration { position: absolute; z-index: 1; top: 0; right: var(--illustration-right); bottom: auto; width: var(--illustration-width); height: var(--illustration-height); max-height: var(--illustration-max-height); object-fit: contain; object-position: right bottom; pointer-events: none; }
+.personal-animation-wrapper { position: absolute; z-index: 1; top: var(--illustration-top-overflow); right: 0; bottom: 0; left: 0; clip-path: inset(-180px 0 0); pointer-events: none; }
+.attention-hero-stage.category-personal .attention-illustration { top: auto; bottom: var(--illustration-bottom); }
+.attention-hero-stage.category-music .attention-illustration { top: auto; bottom: var(--illustration-bottom); }
 .attention-hero-stage.category-meetings .attention-illustration { top: auto; bottom: var(--illustration-bottom); transform: translateX(24%) scaleX(-1); transform-origin: center center; }
 .status { color: var(--color-muted); font-size: .68rem; font-weight: 500; text-transform: uppercase; letter-spacing: .07em; }
 .attention-item h3 { display: -webkit-box; overflow: hidden; max-width: 100%; color: #fff; font-size: 1.15rem; font-weight: 500; line-height: 1.3; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
@@ -1909,9 +1912,9 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: non
 
 @media (max-width: 360px) {
   .attention-hero-stage.category-health { --illustration-width: 62%; --illustration-right: 4%; --illustration-top-overflow: 22px; --illustration-height: calc(100% + 12px); --illustration-max-height: calc(100% + 12px); }
-  .attention-hero-stage.category-music { --illustration-width: 73%; --illustration-right: 0%; --illustration-top-overflow: 20px; --illustration-bottom-overflow: 28px; }
+  .attention-hero-stage.category-music { --illustration-width: 54%; --illustration-right: -4%; --illustration-top-overflow: 20px; --illustration-bottom: 0px; }
   .attention-hero-stage.category-meetings { --illustration-width: min(140%, 480px); }
-  .attention-hero-stage.category-personal { --illustration-width: 76%; --illustration-right: 2%; --illustration-max-height: calc(100% + 84px); }
+  .attention-hero-stage.category-personal { --illustration-width: 54%; --illustration-right: -6%; --illustration-bottom: -8px; }
   .attention-hero-card { padding-inline: 15px; }
   .attention-information { width: 47%; }
 }
