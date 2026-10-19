@@ -135,7 +135,7 @@ section { margin-top: 28px; }
 
 /* What needs attention */
 .attention-hero-stage { --illustration-width: 50%; --illustration-right: 5%; --illustration-top-overflow: 0px; --illustration-bottom-overflow: 0px; --illustration-bottom-inset: 0px; --illustration-height: 100%; --illustration-max-height: 100%; position: relative; overflow: visible; padding-top: var(--illustration-top-overflow); padding-bottom: var(--illustration-bottom-overflow); }
-.attention-hero-stage.category-health { --illustration-width: 65%; --illustration-right: 5%; --illustration-top-overflow: 22px; }
+.attention-hero-stage.category-health { --illustration-width: 72%; --illustration-right: 4%; --illustration-top-overflow: 26px; --illustration-height: calc(100% + 18px); --illustration-max-height: calc(100% + 18px); }
 .attention-hero-stage.category-music { --illustration-width: 73%; --illustration-right: 0%; --illustration-top-overflow: 24px; --illustration-bottom-overflow: 34px; }
 .attention-hero-stage.category-meetings { --illustration-width: 52%; --illustration-right: 6%; --illustration-top-overflow: 22px; }
 .attention-hero-stage.category-personal { --illustration-width: 76%; --illustration-right: 2%; --illustration-top-overflow: 22px; --illustration-height: auto; --illustration-max-height: calc(100% + 84px); }
@@ -1903,7 +1903,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: non
 }
 
 @media (max-width: 360px) {
-  .attention-hero-stage.category-health { --illustration-width: 62%; }
+  .attention-hero-stage.category-health { --illustration-width: 62%; --illustration-right: 4%; --illustration-top-overflow: 22px; --illustration-height: calc(100% + 12px); --illustration-max-height: calc(100% + 12px); }
   .attention-hero-stage.category-music { --illustration-width: 73%; --illustration-right: 0%; --illustration-top-overflow: 20px; --illustration-bottom-overflow: 28px; }
   .attention-hero-stage.category-meetings { --illustration-width: 50%; }
   .attention-hero-stage.category-personal { --illustration-width: 76%; --illustration-right: 2%; --illustration-max-height: calc(100% + 84px); }

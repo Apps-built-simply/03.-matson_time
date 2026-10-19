@@ -6,6 +6,7 @@ let selectedDate = localDateString(new Date());
 let attentionCarouselIndex = 0;
 let attentionCarouselInitialized = false;
 let attentionSelectedItemId = null;
+let attentionRenderSignature = null;
 let attentionItems = [];
 let attentionUnderlineAnimatedItemId = null;
 let cancelTargetId = null;
@@ -32,12 +33,13 @@ const scheduleStatusPresentation = {
 };
 
 const attentionVisuals = {
-  Health: { className: "health", image: "assets/illustrations/health.png" },
+  Health: { className: "health", image: "assets/animations/matson-health-animation.svg" },
   Music: { className: "music", image: "assets/illustrations/music.png" },
   Meetings: { className: "meetings", image: "assets/illustrations/meetings.png" },
   Personal: { className: "personal", image: "assets/illustrations/personal.png" },
   Travel: { className: "travel", image: "assets/illustrations/travel.png" }
 };
+const failedAttentionVisualAssets = new Set();
 
 const els = {
   todayView: document.querySelector("#todayView"), calendarView: document.querySelector("#calendarView"), assistantView: document.querySelector("#assistantView"), progressView: document.querySelector("#progressView"),
@@ -212,6 +214,7 @@ function renderAttention(dateItems, heroItems = getAttentionItems(dateItems)) {
   if (!attentionItems.length) {
     attentionCarouselIndex = 0;
     attentionSelectedItemId = null;
+    attentionRenderSignature = null;
     attentionUnderlineAnimatedItemId = null;
     attentionCarouselInitialized = false;
     const empty = document.createElement("div");
@@ -234,6 +237,9 @@ function renderAttention(dateItems, heroItems = getAttentionItems(dateItems)) {
   attentionSelectedItemId = attention.id;
   const categoryName = attention.category || "Personal";
   const visual = attentionVisuals[categoryName] || attentionVisuals.Personal;
+  const renderSignature = JSON.stringify([attention.id, attention.title, itemTime(attention), categoryName, visual.image, attentionItems.length]);
+  if (renderSignature === attentionRenderSignature && els.now.querySelector(".attention-hero-card")) return;
+  attentionRenderSignature = renderSignature;
   const stage = document.createElement("div");
   stage.className = `attention-hero-stage category-${visual.className}`;
   const article = document.createElement("article");
@@ -241,9 +247,17 @@ function renderAttention(dateItems, heroItems = getAttentionItems(dateItems)) {
   const illustration = document.createElement("img");
   illustration.className = "attention-illustration";
   illustration.src = visual.image;
+  illustration.decoding = "async";
+  illustration.draggable = false;
   illustration.alt = "";
   illustration.setAttribute("aria-hidden", "true");
-  illustration.addEventListener("error", () => { illustration.hidden = true; });
+  illustration.addEventListener("error", () => {
+    illustration.hidden = true;
+    if (!failedAttentionVisualAssets.has(visual.image)) {
+      failedAttentionVisualAssets.add(visual.image);
+      console.error("Matson Time Today hero illustration failed to load.");
+    }
+  }, { once: true });
   const information = document.createElement("div");
   information.className = "attention-information";
   const title = document.createElement("h3");
