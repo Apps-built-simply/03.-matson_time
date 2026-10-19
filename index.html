@@ -10,7 +10,11 @@
 <body>
   <section id="cloudLoading" class="cloud-loading" role="status" aria-live="polite" aria-label="Loading Matson Time.">
     <div class="cloud-loading-content">
-      <img id="appLoaderImage" class="app-loader-image" src="assets/animations/app-loader.svg" alt="" aria-hidden="true" draggable="false">
+      <video id="appLoaderVideo" class="app-loader-image" autoplay muted loop playsinline preload="auto" disablepictureinpicture disableremoteplayback tabindex="-1" aria-hidden="true">
+        <source src="assets/animations/app-loader.webm" type="video/webm">
+        <source src="assets/animations/app-loader.mp4" type="video/mp4">
+      </video>
+      <img id="appLoaderFallback" class="app-loader-image" src="assets/animations/app-loader.svg" alt="" aria-hidden="true" draggable="false" hidden>
       <p id="cloudLoadingText">Loading Matson Time…</p>
       <p id="cloudError" class="connection-error" role="alert" hidden></p>
       <button id="retryCloudButton" class="secondary-button" type="button" hidden>Retry</button>

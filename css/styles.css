@@ -106,7 +106,7 @@ h3 { margin: 0; }
 .connection-error { color: var(--color-error); font-size: .88rem; }
 .cloud-loading-content { display: grid; justify-items: center; gap: 14px; width: min(100%, 360px); text-align: center; color: var(--color-text-secondary); }
 .cloud-loading-content p { margin: 0; }
-.app-loader-image { display: block; width: clamp(82px, 24vw, 100px); max-width: 100%; height: auto; visibility: hidden; object-fit: contain; }
+.app-loader-image { display: block; width: clamp(110px, 34vw, 150px); max-width: 100%; height: auto; visibility: hidden; object-fit: contain; }
 .app-loader-image.is-ready { visibility: visible; }
 .app-loader-image[hidden] { display: none; }
 #cloudLoadingText { color: #929EAE; font-size: .94rem; }

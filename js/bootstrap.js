@@ -2,10 +2,14 @@ const loading = document.querySelector("#cloudLoading");
 const appShell = document.querySelector(".app-shell");
 const cloudError = document.querySelector("#cloudError");
 const retryButton = document.querySelector("#retryCloudButton");
-let loaderImage = document.querySelector("#appLoaderImage");
+const loaderVideo = document.querySelector("#appLoaderVideo");
+let loaderImage = document.querySelector("#appLoaderFallback");
 const APP_LOADER_ANIMATION_CYCLE_MS = 2200; // The nine SVG animations share dur="2.2s".
 const APP_LOADER_MINIMUM_LOOPS = 3; // Keep startup visible for three complete animation loops.
-const APP_LOADER_MINIMUM_DURATION_MS = APP_LOADER_ANIMATION_CYCLE_MS * APP_LOADER_MINIMUM_LOOPS;
+const APP_LOADER_SOURCE_DURATION_SECONDS = 1.066667; // ffprobe: source MOV, 64 frames at 60 fps.
+const APP_LOADER_REDUCED_MOTION_MINIMUM_MS = 600;
+const APP_LOADER_ASSET_FAILURE_MINIMUM_MS = 600;
+const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 let firebaseStore = null;
 let firebaseStorePromise = null;
 let activeUser = null;
@@ -50,39 +54,111 @@ function showLoading() {
   cloudError.hidden = true;
   retryButton.hidden = true;
 }
-function createMinimumLoaderDurationPromise(image, attempt) {
+function createMinimumLoaderDurationPromise(attempt) {
   return new Promise(resolve => {
     let finished = false;
     let durationTimer = null;
+    let started = false;
+    let activeVisual = "video";
+    let videoDurationSeconds = Number.isFinite(loaderVideo.duration) && loaderVideo.duration > 0
+      ? loaderVideo.duration : APP_LOADER_SOURCE_DURATION_SECONDS;
     const finish = () => {
       if (finished) return;
       finished = true;
       if (durationTimer !== null) window.clearTimeout(durationTimer);
-      image.removeEventListener("load", onLoad);
-      image.removeEventListener("error", onError);
+      loaderVideo.removeEventListener("loadedmetadata", onMetadata);
+      loaderVideo.removeEventListener("playing", onPlaying);
+      loaderVideo.removeEventListener("error", onVideoError);
+      loaderVideo.removeEventListener("loadeddata", onReducedMotionFrame);
+      loaderImage.removeEventListener("load", onSvgLoad);
+      loaderImage.removeEventListener("error", onSvgError);
       resolve();
     };
-    const onLoad = () => {
-      if (finished) return;
-      image.classList.add("is-ready");
-      durationTimer = window.setTimeout(finish, APP_LOADER_MINIMUM_DURATION_MS);
+    const beginMinimum = duration => {
+      if (finished || started) return;
+      started = true;
+      durationTimer = window.setTimeout(finish, duration);
     };
-    const onError = () => {
-      if (!image.dataset.assetFailureReported) {
-        image.dataset.assetFailureReported = "true";
-        image.hidden = true;
-        console.error("Matson Time application loader asset failed to load.");
+    const onMetadata = () => {
+      if (Number.isFinite(loaderVideo.duration) && loaderVideo.duration > 0) videoDurationSeconds = loaderVideo.duration;
+      if (prefersReducedMotion.matches) {
+        try { loaderVideo.currentTime = Math.min(videoDurationSeconds / 2, 0.5); }
+        catch { /* Keep autoplay as the fallback if seeking is unavailable. */ }
       }
-      finish();
     };
+    const onPlaying = () => {
+      if (activeVisual !== "video") return;
+      loaderVideo.classList.add("is-ready");
+      if (prefersReducedMotion.matches) {
+        loaderVideo.pause();
+        beginMinimum(APP_LOADER_REDUCED_MOTION_MINIMUM_MS);
+        return;
+      }
+      beginMinimum(videoDurationSeconds * APP_LOADER_MINIMUM_LOOPS * 1000);
+    };
+    const startSvgFallback = () => {
+      if (finished || activeVisual === "svg") return;
+      activeVisual = "svg";
+      loaderVideo.pause();
+      loaderVideo.hidden = true;
+      loaderImage.hidden = false;
+      if (!loaderVideo.dataset.failureReported) {
+        loaderVideo.dataset.failureReported = "true";
+        console.error("Matson Time application loader video could not play.");
+      }
+      if (durationTimer !== null) window.clearTimeout(durationTimer);
+      durationTimer = null;
+      started = false;
+      const onSvgReady = () => {
+        if (finished || activeVisual !== "svg") return;
+        loaderImage.classList.add("is-ready");
+        beginMinimum(prefersReducedMotion.matches
+          ? APP_LOADER_REDUCED_MOTION_MINIMUM_MS
+          : APP_LOADER_ANIMATION_CYCLE_MS * APP_LOADER_MINIMUM_LOOPS);
+      };
+      if (loaderImage.complete) {
+        if (loaderImage.naturalWidth > 0) onSvgReady();
+        else onSvgError();
+      }
+      else {
+        loaderImage.addEventListener("load", onSvgReady, { once: true });
+        loaderImage.addEventListener("error", onSvgError, { once: true });
+      }
+    };
+    const onSvgError = () => {
+      if (activeVisual === "svg") {
+        loaderImage.hidden = true;
+        if (!loaderImage.dataset.assetFailureReported) {
+          loaderImage.dataset.assetFailureReported = "true";
+          console.error("Matson Time application loader fallback asset failed to load.");
+        }
+      }
+      if (activeVisual === "svg") beginMinimum(APP_LOADER_ASSET_FAILURE_MINIMUM_MS);
+    };
+    const onSvgLoad = () => {
+      if (activeVisual !== "svg") return;
+      loaderImage.classList.add("is-ready");
+      beginMinimum(prefersReducedMotion.matches
+        ? APP_LOADER_REDUCED_MOTION_MINIMUM_MS
+        : APP_LOADER_ANIMATION_CYCLE_MS * APP_LOADER_MINIMUM_LOOPS);
+    };
+    const onVideoError = () => startSvgFallback();
 
     attempt.cancelMinimumDuration = finish;
-    image.addEventListener("load", onLoad, { once: true });
-    image.addEventListener("error", onError, { once: true });
-    if (image.complete) {
-      if (image.naturalWidth > 0) onLoad();
-      else onError();
+    loaderVideo.addEventListener("loadedmetadata", onMetadata);
+    loaderVideo.addEventListener("playing", onPlaying);
+    loaderVideo.addEventListener("error", onVideoError);
+    loaderVideo.addEventListener("loadeddata", onReducedMotionFrame);
+    function onReducedMotionFrame() {
+      if (prefersReducedMotion.matches && activeVisual === "video" && loaderVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) onPlaying();
     }
+    if (loaderImage.complete && loaderImage.naturalWidth > 0) loaderImage.classList.add("is-ready");
+    if (loaderVideo.readyState >= HTMLMediaElement.HAVE_METADATA) onMetadata();
+    if (loaderVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && prefersReducedMotion.matches) onReducedMotionFrame();
+
+    const playPromise = loaderVideo.play();
+    if (playPromise && typeof playPromise.catch === "function") playPromise.catch(onVideoError);
+    if (loaderVideo.error) onVideoError();
   });
 }
 function startStartupAttempt({ restartLoader = false } = {}) {
@@ -91,18 +167,16 @@ function startStartupAttempt({ restartLoader = false } = {}) {
   startupAttemptNumber += 1;
 
   if (restartLoader) {
-    const nextImage = loaderImage.cloneNode(false);
-    nextImage.removeAttribute("hidden");
-    nextImage.classList.remove("is-ready");
-    delete nextImage.dataset.assetFailureReported;
-    nextImage.src = `assets/animations/app-loader.svg?startup-attempt=${startupAttemptNumber}`;
-    loaderImage.replaceWith(nextImage);
-    loaderImage = nextImage;
+    loaderVideo.pause();
+    loaderVideo.hidden = false;
+    loaderImage.hidden = true;
+    loaderImage.classList.remove("is-ready");
+    try { loaderVideo.currentTime = 0; } catch { /* play() below restarts where supported. */ }
   }
 
   const attempt = { id: startupAttemptNumber, failed: false, cancelMinimumDuration: null };
   currentStartupAttempt = attempt;
-  attempt.minimumDurationPromise = createMinimumLoaderDurationPromise(loaderImage, attempt);
+  attempt.minimumDurationPromise = createMinimumLoaderDurationPromise(attempt);
   return attempt;
 }
 function failCurrentStartupAttempt() {
@@ -112,6 +186,7 @@ function failCurrentStartupAttempt() {
 }
 function showConnectionError() {
   failCurrentStartupAttempt();
+  loaderVideo.pause();
   loading.classList.add("has-error");
   loading.removeAttribute("aria-label");
   loading.hidden = false;
@@ -253,6 +328,7 @@ async function loadCloudApp() {
     })();
     await Promise.all([applicationInitializationPromise, attempt.minimumDurationPromise]);
     if (currentStartupAttempt !== attempt || attempt.failed) return;
+    loaderVideo.pause();
     loading.hidden = true;
     loading.classList.remove("has-error");
     loading.removeAttribute("aria-hidden");
