@@ -58,6 +58,7 @@ let waitingEl = null;
 let activeRevealController = null;
 let quickQuestionInProgress = false;
 let quickQuestionSelectionPending = false;
+const GUIDED_LAUNCHER_PENDING_KEY = `matson-time-guided-launcher-pending-${firebaseStore.getCurrentUser().uid}`;
 let activeRequestId = null;
 let drawerConversations = [];
 let isDrawerOpen = false;
@@ -2669,7 +2670,35 @@ async function editProposal() {
     return;
   }
 
-  openAddDialogForEdit(currentProposal);
+  const proposal = currentProposal;
+  currentProposal.lifecycle = "cancelled";
+  currentProposal = null;
+  await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+  conversation.forEach(entry => { if (entry.kind === "proposal_summary") entry.resolved = true; });
+
+  if (proposal.action?.item) {
+    const item = proposal.action.item;
+    if (proposal.action.type === "update" || proposal.action.type === "reschedule") {
+      const targetId = proposal.action.targetItemId || item.id;
+      if (targetId) {
+        window.startAssistantScheduleEdit(targetId, {
+          proposedDate: item.date,
+          proposedStart: item.start,
+          proposedEnd: item.end
+        });
+        return;
+      }
+    }
+    window.startAssistantScheduleCreation({
+      itemType: item.type || "activity",
+      title: item.title || "",
+      date: item.date || "",
+      start: item.start || "",
+      end: item.end || "",
+      category: item.category || "Personal",
+      notes: item.notes || ""
+    });
+  }
 }
 
 async function cancelProposal() {
@@ -2690,33 +2719,6 @@ async function cancelProposal() {
   if (wasBulk) appendEntry({ role: "assistant", text: "Cancelled the proposal. No schedule items were changed." });
   await firebaseStore.updateConversationSummary(activeConversationId, conversationSummary("active")).catch(showPersistenceFailure);
   renderConversation();
-}
-
-function openAddDialogForEdit(proposal) {
-  const dialog = document.querySelector("#addDialog");
-  const form = document.querySelector("#addForm");
-  const typeSelect = document.querySelector("#itemType");
-  const timeFields = document.querySelector("#timeFields");
-
-  form.reset();
-  timeFields.hidden = false;
-
-  if (proposal.action.item) {
-    form.title.value = proposal.action.item.title || "";
-    form.date.value = proposal.action.item.date || localDateString(new Date());
-    form.type.value = proposal.action.item.type || "activity";
-    form.start.value = proposal.action.item.start || "";
-    form.end.value = proposal.action.item.end || "";
-    form.category.value = proposal.action.item.category || "Personal";
-    form.notes.value = proposal.action.item.notes || "";
-    typeSelect.value = proposal.action.item.type || "activity";
-  }
-
-  timeFields.hidden = typeSelect.value === "task";
-
-  dialog.showModal();
-  dialog.dataset.proposalId = proposal.id;
-  dialog.dataset.editMode = "true";
 }
 
 function showProcessingError(message) {
@@ -2999,7 +3001,6 @@ function answerFreeTimeWeek() {
 const GUIDED_ADD_INITIAL_VALUES = Object.freeze({ itemType: null, title: null, date: null, dateDraft: null, timeDraft: null, start: null, end: null, category: null, notes: "", recurrence: null, weekdays: [] });
 let guidedSaveInProgress = false;
 let pendingQuickQuestionId = null;
-let guidedEditFormOpen = false;
 let guidedDraftSaveTimer = null;
 function queueGuidedDraftSave() { clearTimeout(guidedDraftSaveTimer); guidedDraftSaveTimer = setTimeout(() => saveGuidedFlow(), 250); }
 
@@ -3039,6 +3040,7 @@ function guidedPrompt(step, flow = guidedFlow) {
   if (step === "weekdays") return "Which days should this routine repeat? Select one or more days, then continue.";
   if (step === "category") return type === "task" ? "Choose a category, or skip this optional step." : "Choose a category.";
   if (step === "notes") return "Would you like to add a note? Type it here or skip this step.";
+  if (step === "edit_choice") return "What would you like to change?";
   return "Review the schedule details below.";
 }
 async function guidedAppendAssistant(text, { wait = false, showControls = true, kind } = {}) {
@@ -3054,50 +3056,203 @@ async function guidedAppendAssistant(text, { wait = false, showControls = true, 
   if (kind === "guided_completion" && activeConversationId === conversationId) assistantEls.conversation?.lastElementChild?.focus({ preventScroll: true });
   if (showControls && activeConversationId === conversationId && guidedFlow) renderGuidedControls();
 }
-async function beginGuidedAdd({ logUser = false } = {}) {
-  if (logUser) appendEntry({ role: "user", text: "Add something to my schedule." });
-  guidedCompletedFlow = null;
-  guidedFlow = { id: crypto.randomUUID(), type: "create_schedule_item", step: "type", values: { ...GUIDED_ADD_INITIAL_VALUES, recurrence: null, weekdays: [] } };
-  updateAssistantEmptyState();
-  await saveGuidedFlow();
-  await guidedAppendAssistant(guidedPrompt("type"));
-}
-function guidedSummaryText(values) {
-  const lines = [values.title, formatKampalaDate(values.date), values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed", values.category || "Personal"];
-  if (values.notes) lines.push(values.notes);
-  if (values.recurrence) lines.push(`${values.recurrence.frequency[0].toUpperCase()}${values.recurrence.frequency.slice(1)} · every ${values.recurrence.interval}${values.recurrence.frequency === "daily" ? " day(s)" : values.recurrence.frequency === "weekly" ? " week(s)" : " month(s)"}${values.recurrence.frequency === "weekly" ? ` · ${values.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ")}` : ""}`);
-  return lines.join("\n");
-}
-async function removeGuidedReviewInstruction(flowId) {
-  if (!flowId) return;
-  const removed = conversation.filter(entry => entry.role === "assistant" && entry.guidedFlowId === flowId && entry.guidedStepId === "summary" && entry.text === "Review the schedule details below.");
-  if (!removed.length) return;
-  conversation = conversation.filter(entry => !removed.includes(entry));
-  assistantEls.conversation?.querySelectorAll("[data-guided-flow-id][data-guided-step='summary']").forEach(message => {
-    if (message.dataset.guidedFlowId === flowId && message.querySelector(".assistant-text")?.textContent === "Review the schedule details below.") message.remove();
-  });
-  const ids = removed.map(entry => entry.id).filter(Boolean);
-  if (ids.length && activeConversationId) {
-    await persistenceQueue.catch(() => {});
-    await firebaseStore.deleteConversationMessages(activeConversationId, ids).catch(showPersistenceFailure);
+
+let scheduleCreationInProgress = false;
+
+async function startAssistantScheduleCreation(prefilledValues = {}) {
+  if (scheduleCreationInProgress) return;
+  scheduleCreationInProgress = true;
+  try {
+    activeRevealController?.abort();
+    removeWaitingState();
+    closeQuickQuestions();
+    document.querySelectorAll("dialog[open]").forEach(d => {
+      if (typeof d.close === "function") d.close();
+    });
+
+    if (typeof window.setView === "function") {
+      window.setView("assistant");
+    }
+
+    let pendingConversationId = null;
+    try { pendingConversationId = sessionStorage.getItem(GUIDED_LAUNCHER_PENDING_KEY); } catch {}
+    const canReusePendingConversation = Boolean(activeConversationId && pendingConversationId === activeConversationId && conversation.length === 0 && !guidedFlow && !currentProposal);
+    if (!canReusePendingConversation) {
+      if (activeConversationId) {
+        await saveGuidedFlow();
+        if (assistantEls.input) composerDrafts.set(activeConversationId, assistantEls.input.value);
+        await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+        await firebaseStore.updateConversationSummary(activeConversationId, { status: "archived" }).catch(() => {});
+      }
+
+      const newId = await firebaseStore.createConversation({ title: "New schedule item", status: "active" });
+      activeConversationId = newId;
+      try { sessionStorage.setItem(GUIDED_LAUNCHER_PENDING_KEY, newId); } catch {}
+      conversation = [];
+      guidedFlow = null;
+      currentProposal = null;
+      pendingClarification = null;
+      lastConfirmedAction = null;
+      activePlanningContext = null;
+      pendingOperation = null;
+      referencedSets = [];
+      entityRegistry = [];
+
+      await firebaseStore.saveAssistantState({
+        activeConversationId: newId,
+        pendingClarification: null,
+        planningContext: null,
+        entityRegistry: [],
+        pendingOperation: null,
+        referencedSets: [],
+        lastConfirmedAction: null,
+        guidedFlow: null,
+        guidedFlowsByConversation
+      }).catch(showPersistenceFailure);
+
+      renderConversation();
+      if (assistantEls.input) assistantEls.input.value = "";
+      updateComposerHeight();
+      updateSendButtonState();
+      loadDrawerConversations().catch(() => {});
+    }
+
+    guidedCompletedFlow = null;
+    guidedFlow = {
+      id: crypto.randomUUID(),
+      type: "create_schedule_item",
+      step: "type",
+      values: {
+        ...GUIDED_ADD_INITIAL_VALUES,
+        recurrence: null,
+        weekdays: [],
+        ...(prefilledValues || {})
+      }
+    };
+    updateAssistantEmptyState();
+    await saveGuidedFlow();
+    await guidedAppendAssistant(guidedPrompt("type"));
+    try { if (sessionStorage.getItem(GUIDED_LAUNCHER_PENDING_KEY) === activeConversationId) sessionStorage.removeItem(GUIDED_LAUNCHER_PENDING_KEY); } catch {}
+    assistantEls.conversation?.querySelector("#guidedControls-type button")?.focus({ preventScroll: true });
+  } catch (error) {
+    console.error("startAssistantScheduleCreation failed", error);
+    if (assistantEls.saveNotice && assistantEls.saveText) {
+      assistantEls.saveText.textContent = "A new conversation could not be started. Try again.";
+      assistantEls.saveNotice.hidden = false;
+      setTimeout(() => { if (assistantEls.saveNotice) assistantEls.saveNotice.hidden = true; }, 4000);
+    }
+  } finally {
+    scheduleCreationInProgress = false;
   }
 }
-window.completeGuidedAddFromForm = async item => {
-  if (!guidedEditFormOpen || !guidedFlow) return;
-  guidedEditFormOpen = false;
-  const flowId = guidedFlow.id;
-  if (item) guidedFlow.values = { ...guidedFlow.values, itemType: item.type, title: item.title, date: item.date, start: item.start || null, end: item.end || null, category: item.category, notes: item.notes || "", recurrence: item.recurrence || null, weekdays: item.recurrence?.days || [] };
-  const summary = guidedSummaryText(guidedFlow.values);
-  await removeGuidedReviewInstruction(flowId);
-  guidedFlow.status = "completed"; guidedFlow.step = "summary";
-  guidedFlowsByConversation[activeConversationId] = guidedFlow; guidedCompletedFlow = guidedFlow;
-  guidedFlow = null;
-  pendingQuickQuestionId = null;
-  await saveGuidedFlow();
-  assistantEls.conversation.querySelector("#guidedControls-summary")?.remove();
-  await guidedAppendAssistant(`Added to your schedule.\n${summary}`, { showControls: false, kind: "guided_completion" });
-};
-window.guidedAddDialogClosed = () => { guidedEditFormOpen = false; };
+
+async function startAssistantScheduleEdit(itemId, options = {}) {
+  if (scheduleCreationInProgress) return;
+  const item = items.find(candidate => candidate.id === itemId);
+  if (!item) return;
+
+  scheduleCreationInProgress = true;
+  try {
+    activeRevealController?.abort();
+    removeWaitingState();
+    closeQuickQuestions();
+    document.querySelectorAll("dialog[open]").forEach(d => {
+      if (typeof d.close === "function") d.close();
+    });
+
+    if (typeof window.setView === "function") {
+      window.setView("assistant");
+    }
+
+    const title = `Edit ${item.title || "item"}`;
+    if (activeConversationId) {
+      await saveGuidedFlow();
+      if (assistantEls.input) composerDrafts.set(activeConversationId, assistantEls.input.value);
+      await firebaseStore.resolveUnresolvedProposals(activeConversationId).catch(() => {});
+      await firebaseStore.updateConversationSummary(activeConversationId, { status: "archived" }).catch(() => {});
+    }
+
+    const newId = await firebaseStore.createConversation({ title, status: "active" });
+    activeConversationId = newId;
+    conversation = [];
+    guidedFlow = null;
+    currentProposal = null;
+    pendingClarification = null;
+    lastConfirmedAction = null;
+    activePlanningContext = null;
+    pendingOperation = null;
+    referencedSets = [];
+    entityRegistry = [];
+
+    await firebaseStore.saveAssistantState({
+        activeConversationId: newId,
+        pendingClarification: null,
+        planningContext: null,
+        entityRegistry: [],
+        pendingOperation: null,
+        referencedSets: [],
+        lastConfirmedAction: null,
+        guidedFlow: null,
+        guidedFlowsByConversation
+    }).catch(showPersistenceFailure);
+
+    renderConversation();
+    if (assistantEls.input) assistantEls.input.value = "";
+    updateComposerHeight();
+    updateSendButtonState();
+    loadDrawerConversations().catch(() => {});
+
+    const proposedDate = options?.proposedDate || item.date || "";
+    const proposedStart = options?.proposedStart !== undefined && options.proposedStart !== "" ? options.proposedStart : (item.start || null);
+    const proposedEnd = options?.proposedEnd !== undefined && options.proposedEnd !== "" ? options.proposedEnd : (item.end || null);
+    const hasProposedChanges = Boolean(options?.proposedDate || options?.proposedStart || options?.proposedEnd);
+    const step = options?.step || (hasProposedChanges ? "summary" : "edit_choice");
+
+    guidedCompletedFlow = null;
+    guidedFlow = {
+      id: crypto.randomUUID(),
+      type: "edit_schedule_item",
+      itemId: item.id,
+      originalItem: { ...item },
+      step,
+      values: {
+        itemType: item.type,
+        title: item.title,
+        date: proposedDate,
+        dateDraft: null,
+        timeDraft: null,
+        start: proposedStart,
+        end: proposedEnd,
+        category: item.category || "Personal",
+        notes: item.notes || "",
+        recurrence: item.recurrence ? JSON.parse(JSON.stringify(item.recurrence)) : null,
+        weekdays: item.recurrence?.days ? [...item.recurrence.days] : []
+      }
+    };
+
+    updateAssistantEmptyState();
+    await saveGuidedFlow();
+    await guidedAppendAssistant(guidedPrompt(step));
+    assistantEls.conversation?.querySelector(`#guidedControls-${step} button`)?.focus({ preventScroll: true });
+  } catch (error) {
+    console.error("startAssistantScheduleEdit failed", error);
+    if (assistantEls.saveNotice && assistantEls.saveText) {
+      assistantEls.saveText.textContent = "A new conversation could not be started. Try again.";
+      assistantEls.saveNotice.hidden = false;
+      setTimeout(() => { if (assistantEls.saveNotice) assistantEls.saveNotice.hidden = true; }, 4000);
+    }
+  } finally {
+    scheduleCreationInProgress = false;
+  }
+}
+
+window.startAssistantScheduleCreation = startAssistantScheduleCreation;
+window.startAssistantScheduleEdit = startAssistantScheduleEdit;
+
+async function beginGuidedAdd({ logUser = false } = {}) {
+  if (logUser) appendEntry({ role: "user", text: "Add something to my schedule." });
+  await startAssistantScheduleCreation();
+}
 function guidedCategoryNames() {
   const names = typeof saGetAvailableCategories === "function" ? saGetAvailableCategories() : [];
   return names.length ? names : [];
@@ -3358,6 +3513,23 @@ function renderGuidedControls() {
         button.setAttribute("aria-pressed", String(values.weekdays.includes(day)));
         controls.appendChild(button);
       });
+    } else if (step === "edit_choice") {
+      const card = document.createElement("div"); card.className = "guided-choice-card"; card.setAttribute("role", "group"); card.setAttribute("aria-label", "Choose a field to change");
+      const fields = [["type", "Type"], ["title", "Title"], ["date", "Date"]];
+      if (values.itemType === "activity" || values.itemType === "routine") fields.push(["time_range", "Time"]);
+      fields.push(["category", "Category"]);
+      if (values.itemType === "routine") fields.push(["frequency", "Recurrence"]);
+      fields.push(["notes", "Note"]);
+      fields.forEach(([field, label]) => {
+        const button = guidedControlButton(label, "edit_field", field);
+        button.className = "guided-choice-row";
+        button.tabIndex = 0;
+        const square = document.createElement("span"); square.className = "guided-choice-square"; square.setAttribute("aria-hidden", "true");
+        const text = document.createElement("span"); text.className = "guided-choice-label"; text.textContent = label;
+        button.replaceChildren(square, text);
+        card.appendChild(button);
+      });
+      controls.appendChild(card);
     }
     const actions = document.createElement("div");
     actions.className = "guided-control-actions";
@@ -3458,16 +3630,29 @@ async function handleGuidedAnswer(text) {
   if (["cancel", "cancel schedule creation", "cancel creation"].includes(answer.toLowerCase())) { await cancelGuidedAdd(); return; }
   if (step === "switch_question") { await guidedAppendAssistant("Choose whether to cancel schedule creation or keep going with it."); return; }
   if (["type", "date", "time_range", "category"].includes(step)) { await guidedAppendAssistant("Use the controls beneath the question to choose this value."); return; }
+  if (step === "edit_choice") {
+    const normalized = answer.toLowerCase();
+    const fieldMap = { type: "type", title: "title", date: "date", time: "time_range", "time range": "time_range", "time range": "time_range", category: "category", note: "notes", notes: "notes", recurrence: "frequency", repeat: "frequency", frequency: "frequency" };
+    const mapped = fieldMap[normalized];
+    if (mapped) { guidedFlow.step = mapped; await guidedAskCurrentStep(); return; }
+    if (["cancel", "cancel editing"].includes(normalized)) { await cancelGuidedAdd(); return; }
+    await guidedAppendAssistant("Choose Type, Title, Date, Time, Category, Recurrence, or Note using the controls.");
+    return;
+  }
   if (step === "summary") {
     const normalized = answer.toLowerCase();
     if (["cancel", "cancel creation"].includes(normalized)) { await cancelGuidedAdd(); return; }
-    if (["edit", "back", "change"].includes(normalized)) { guidedFlow.step = "title"; await guidedAskCurrentStep(); return; }
+    if (["edit", "back", "change"].includes(normalized)) { guidedFlow.step = "edit_choice"; await guidedAskCurrentStep(); return; }
     await guidedAppendAssistant("Use Add to schedule, Edit, or Cancel on the summary card.");
     return;
   }
   if (step === "title") {
     if (!answer || answer.length > 200) { await guidedAppendAssistant("Enter a title of 1 to 200 characters."); return; }
     values.title = answer;
+    if (guidedFlow.type === "create_schedule_item" && activeConversationId) {
+      firebaseStore.updateConversationSummary(activeConversationId, { title: `Add ${answer.slice(0, 40)}` }).catch(() => {});
+      loadDrawerConversations().catch(() => {});
+    }
   } else if (step === "interval") {
     const interval = Number(answer);
     if (!Number.isInteger(interval) || interval < 1 || interval > 365) { await guidedAppendAssistant("Enter a positive whole number from 1 to 365."); return; }
@@ -3490,7 +3675,28 @@ async function handleGuidedAnswer(text) {
   guidedAdvance();
   await guidedAskCurrentStep({ wait: true });
 }
+function guidedSummaryText(values) {
+  const lines = [values.title, formatKampalaDate(values.date), values.start ? `${formatKampalaTime(values.start)}${values.end ? ` – ${formatKampalaTime(values.end)}` : ""}` : "Untimed", values.category || "Personal"];
+  if (values.notes) lines.push(values.notes);
+  if (values.recurrence) lines.push(`${values.recurrence.frequency[0].toUpperCase()}${values.recurrence.frequency.slice(1)} · every ${values.recurrence.interval}${values.recurrence.frequency === "daily" ? " day(s)" : values.recurrence.frequency === "weekly" ? " week(s)" : " month(s)"}${values.recurrence.frequency === "weekly" ? ` · ${values.recurrence.days.map(day => GUIDED_WEEKDAYS[day]).join(", ")}` : ""}`);
+  return lines.join("\n");
+}
+async function removeGuidedReviewInstruction(flowId) {
+  if (!flowId) return;
+  const removed = conversation.filter(entry => entry.role === "assistant" && entry.guidedFlowId === flowId && entry.guidedStepId === "summary" && entry.text === "Review the schedule details below.");
+  if (!removed.length) return;
+  conversation = conversation.filter(entry => !removed.includes(entry));
+  assistantEls.conversation?.querySelectorAll("[data-guided-flow-id][data-guided-step='summary']").forEach(message => {
+    if (message.dataset.guidedFlowId === flowId && message.querySelector(".assistant-text")?.textContent === "Review the schedule details below.") message.remove();
+  });
+  const ids = removed.map(entry => entry.id).filter(Boolean);
+  if (ids.length && activeConversationId) {
+    await persistenceQueue.catch(() => {});
+    await firebaseStore.deleteConversationMessages(activeConversationId, ids).catch(showPersistenceFailure);
+  }
+}
 async function cancelGuidedAdd() {
+  const wasEdit = guidedFlow?.type === "edit_schedule_item";
   await removeGuidedReviewInstruction(guidedFlow?.id);
   if (activeConversationId) delete guidedFlowsByConversation[activeConversationId];
   guidedCompletedFlow = null;
@@ -3498,7 +3704,7 @@ async function cancelGuidedAdd() {
   pendingQuickQuestionId = null;
   await saveGuidedFlow();
   assistantEls.conversation.querySelectorAll(".guided-controls-message").forEach(node => node.remove());
-  await guidedAppendAssistant("Schedule creation cancelled.", { showControls: false });
+  await guidedAppendAssistant(wasEdit ? "Schedule changes cancelled." : "Schedule creation cancelled.", { showControls: false });
 }
 async function confirmGuidedAdd() {
   if (!guidedFlow || guidedSaveInProgress) return;
@@ -3509,9 +3715,11 @@ async function confirmGuidedAdd() {
     title: values.title.trim(), date: values.date, type: values.itemType, start: values.start || "", end: values.end || "",
     category: values.category || "Personal", notes: values.notes.trim(), recurrence: values.recurrence, schedulePending: false
   };
-  const candidate = { ...updates, id: "__guided_add_item__", status: "upcoming" };
+  const isEdit = guidedFlow.type === "edit_schedule_item";
+  const candidateId = isEdit ? guidedFlow.itemId : "__guided_add_item__";
+  const candidate = { ...updates, id: candidateId, status: "upcoming" };
   const conflict = candidate.date && candidate.start && candidate.end
-    ? saDetectConflictsForDate(candidate.date, [...items, candidate]).find(item => item.firstItemId === candidate.id || item.secondItemId === candidate.id)
+    ? saDetectConflictsForDate(candidate.date, [...(isEdit ? items.filter(item => item.id !== guidedFlow.itemId) : items), candidate]).find(item => item.firstItemId === candidate.id || item.secondItemId === candidate.id)
     : null;
   const conflictKey = conflict ? `${candidate.date}|${candidate.start}|${candidate.end}|${conflict.pairKey}` : "";
   if (conflict && guidedFlow.conflictKey !== conflictKey) {
@@ -3525,11 +3733,17 @@ async function confirmGuidedAdd() {
   guidedSaveInProgress = true;
   renderGuidedControls();
   let result;
-  try { result = await saCreateItem({ ...updates, status: "upcoming", postponed: 0 }); }
+  try {
+    if (isEdit) {
+      result = await saUpdateItem(guidedFlow.itemId, updates);
+    } else {
+      result = await saCreateItem({ ...updates, status: "upcoming", postponed: 0 });
+    }
+  }
   catch { result = { success: false }; }
   finally { guidedSaveInProgress = false; }
-  if (!result?.success) { await guidedAppendAssistant("The item could not be saved. Try again."); return; }
-  if (result.item && typeof window.refreshAssistantScheduleItem === "function") window.refreshAssistantScheduleItem(result.item, "created");
+  if (!result?.success) { await guidedAppendAssistant("The schedule item could not be saved. Try again."); return; }
+  if (result.item && typeof window.refreshAssistantScheduleItem === "function") window.refreshAssistantScheduleItem(result.item, isEdit ? "updated" : "created");
   const flowId = guidedFlow.id;
   const summary = guidedSummaryText(values);
   await removeGuidedReviewInstruction(flowId);
@@ -3539,7 +3753,7 @@ async function confirmGuidedAdd() {
   pendingQuickQuestionId = null;
   await saveGuidedFlow();
   assistantEls.conversation.querySelector("#guidedControls-summary")?.remove();
-  await guidedAppendAssistant(`Added to your schedule.\n${summary}`, { showControls: false, kind: "guided_completion" });
+  await guidedAppendAssistant(isEdit ? `Schedule updated.\n${summary}` : `Added to your schedule.\n${summary}`, { showControls: false, kind: "guided_completion" });
 }
 async function handleGuidedControl(action, value) {
   if (!guidedFlow) return;
@@ -3585,8 +3799,18 @@ async function handleGuidedControl(action, value) {
     return;
   }
   if (action === "edit") {
-    guidedEditFormOpen = true;
-    window.openGuidedAddDialog?.(guidedFlow.values);
+    guidedFlow.step = "edit_choice";
+    await guidedAskCurrentStep();
+    return;
+  }
+  if (action === "edit_field") {
+    const field = value;
+    if (["title", "date", "time_range", "category", "notes", "frequency", "type"].includes(field)) {
+      guidedFlow.step = field;
+      await guidedAskCurrentStep();
+      return;
+    }
+    await guidedAppendAssistant("Choose a field to change.");
     return;
   }
   if (action === "confirm") { await confirmGuidedAdd(); return; }
@@ -3732,6 +3956,11 @@ async function handleQuickQuestion(id) {
   if (!spec || quickQuestionInProgress || quickQuestionSelectionPending) return;
   quickQuestionSelectionPending = true;
   try {
+    if (id === "guided_add") {
+      if (quickQuestionsOpen) closeQuickQuestions();
+      await startAssistantScheduleCreation();
+      return;
+    }
     try {
       await ensureConversation();
     } catch {
@@ -3748,11 +3977,6 @@ async function handleQuickQuestion(id) {
       return;
     }
     if (quickQuestionsOpen) closeQuickQuestions();
-    if (id === "guided_add") {
-      appendEntry({ role: "user", text: "Add something to my schedule." });
-      await beginGuidedAdd();
-      return;
-    }
     if (guidedFlow) { guidedFlow = null; await saveGuidedFlow(); }
     await runQuickQuestion(id);
   } finally {

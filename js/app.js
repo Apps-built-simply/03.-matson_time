@@ -51,15 +51,12 @@ const els = {
   calendarYearInput: document.querySelector("#calendarYearInput"), calendarMonthSuggestions: document.querySelector("#calendarMonthSuggestions"), calendarDateError: document.querySelector("#calendarDateError"),
   selectedTitle: document.querySelector("#selectedDateTitle"), selectedCount: document.querySelector("#selectedCount"),
   selectedSchedule: document.querySelector("#selectedSchedule"), selectedConflict: document.querySelector("#selectedConflict"),
-  dialog: document.querySelector("#addDialog"), form: document.querySelector("#addForm"),
-  type: document.querySelector("#itemType"), timeFields: document.querySelector("#timeFields"),
   navToday: document.querySelector("#navToday"), navCalendar: document.querySelector("#navCalendar"), navAssistant: document.querySelector("#navAssistant"), navProgress: document.querySelector("#navProgress"), navAdd: document.querySelector("#navAddButton"),
   prevMonth: document.querySelector("#prevMonthButton"), nextMonth: document.querySelector("#nextMonthButton"),
   cancelDialog: document.querySelector("#attentionCancelDialog"), cancelItemTitle: document.querySelector("#cancelItemTitle"),
   cancelItemDate: document.querySelector("#cancelItemDate"), cancelItemTime: document.querySelector("#cancelItemTime"),
   cancelItemCategory: document.querySelector("#cancelItemCategory"), cancelError: document.querySelector("#cancelItemError"),
   confirmCancel: document.querySelector("#confirmCancelItem"), keepCancel: document.querySelector("#keepCancelItem"),
-  addDialogTitle: document.querySelector("#addDialogTitle"), recurrenceFrequency: document.querySelector("#recurrenceFrequency"),
   postponeDialog: document.querySelector("#postponeDialog"), postponeForm: document.querySelector("#postponeForm"),
   postponeItemTitle: document.querySelector("#postponeItemTitle"), postponeCurrentDate: document.querySelector("#postponeCurrentDate"),
   postponeCurrentTime: document.querySelector("#postponeCurrentTime"), postponeUnknown: document.querySelector("#postponeUnknown"),
@@ -78,11 +75,6 @@ els.scheduleCat.addEventListener("error", () => {
   els.scheduleCat.hidden = true;
   console.error("Matson Time Today schedule illustration failed to load.");
 }, { once: true });
-
-const categorySelect = document.querySelector('#addForm select[name="category"]');
-if (categorySelect && window.cloudCategories?.length) {
-  categorySelect.replaceChildren(...window.cloudCategories.map(category => new Option(category.name, category.name)));
-}
 
 // Local date helpers — every YYYY-MM-DD value is built and read in local time
 function parseLocalDate(value) {
@@ -562,42 +554,6 @@ async function savePostponement(event) {
   }
 }
 
-function openEditItem(id, sourceDialog = els.postponeDialog) {
-  const item = items.find(candidate => candidate.id === id);
-  if (!item) return;
-  editingItemId = id;
-  const form = els.form;
-  form.elements.title.value = item.title;
-  form.elements.date.value = item.date || "";
-  form.elements.type.value = item.type;
-  form.elements.start.value = item.start || "";
-  form.elements.end.value = item.end || "";
-  form.elements.category.value = item.category || "Personal";
-  form.elements.notes.value = item.notes || "";
-  const recurrence = item.recurrence || null;
-  els.recurrenceFrequency.value = recurrence?.frequency || "";
-  form.elements.recurrenceInterval.value = String(recurrence?.interval || 1);
-  addConflictConfirmed = "";
-  clearAddFormError();
-  document.querySelector("#saveItemButton").disabled = false;
-  document.querySelector("#saveItemButton").textContent = "Save changes";
-  if (window.customSelectType) window.customSelectType.sync(false);
-  if (window.customSelectFrequency) window.customSelectFrequency.sync(false);
-  if (window.customSelectCategory) window.customSelectCategory.sync(false);
-  updateDateDisplay(form.elements.date.value);
-  updateTimeDisplay("start", form.elements.start.value);
-  updateTimeDisplay("end", form.elements.end.value);
-  updateCategorySwatch(form.elements.category.value);
-  updateWeekdayButtons(recurrence?.days || []);
-  updateFieldVisibility(item.type);
-  els.addDialogTitle.textContent = "Edit item";
-  els.dialog.querySelector(".eyebrow").textContent = "Update";
-  els.dialog.querySelector('[type="submit"]').textContent = "Save changes";
-  if (sourceDialog?.open) sourceDialog.close("edit");
-  els.dialog.showModal();
-  form.elements.title.focus();
-}
-
 function appendEventDetailRow(labelText, value) {
   const label = document.createElement("dt");
   label.textContent = labelText;
@@ -662,8 +618,12 @@ els.navCalendar.addEventListener("click", () => setView("calendar"));
 // authenticated schedule state has loaded (app.js runs after the first cloud load)
 els.navAdd.disabled = false;
 els.navAdd.removeAttribute("aria-disabled");
-els.navAdd.addEventListener("click", openAddDialog);
-els.emptyAdd.addEventListener("click", openAddDialog);
+els.navAdd.addEventListener("click", () => {
+  if (typeof window.startAssistantScheduleCreation === "function") window.startAssistantScheduleCreation();
+});
+els.emptyAdd.addEventListener("click", () => {
+  if (typeof window.startAssistantScheduleCreation === "function") window.startAssistantScheduleCreation();
+});
 els.navProgress.addEventListener("click", () => setView("progress"));
 
 // Calendar controls
@@ -859,7 +819,9 @@ els.closeEventDetailButton.addEventListener("click", () => closeCalendarEventDet
 els.closeEventDetailAction.addEventListener("click", () => closeCalendarEventDetails());
 els.editEventDetailButton.addEventListener("click", () => {
   const id = els.eventDetailItemId;
-  if (id) openEditItem(id, els.eventDetailDialog);
+  if (!id) return;
+  closeCalendarEventDetails();
+  if (typeof window.startAssistantScheduleEdit === "function") window.startAssistantScheduleEdit(id);
 });
 els.eventDetailDialog.addEventListener("click", event => {
   if (event.target === els.eventDetailDialog) closeCalendarEventDetails();
@@ -937,11 +899,12 @@ const guidanceTitle = document.querySelector("#guidanceTitle");
 const guidanceList = document.querySelector("#guidanceList");
 let guidanceTrigger = null;
 const guidanceCopy = {
-  today: ["Today", ["See what needs attention now.", "Move through attention items using the arrows.", "Mark an item done, postpone it, or cancel it.", "Review the complete schedule below."]],
-  calendar: ["Calendar", ["Select a date to see its schedule.", "Use the month controls to move between months.", "Dates with scheduled items show the existing calendar indicators."]],
+  today: ["Today", ["See what needs attention now.", "Move through attention items using the arrows.", "Mark an item done, postpone it, or cancel it.", "Use Add something to create an item with Assistant.", "Review the complete schedule below."]],
+  calendar: ["Calendar", ["Select a date to see its schedule.", "Use the month controls to move between months.", "Open an event to review it, then use Edit to continue with Assistant.", "Dates with scheduled items show the existing calendar indicators."]],
   assistant: ["Assistant", [
     "Ask questions about your schedule.",
-    "Give natural instructions to create, change, postpone, cancel, or complete items.",
+    "Use the plus button or Quick questions to create a schedule item with Assistant.",
+    "Review guided details before they are saved, and use natural language for planning and reasoning.",
     "Review proposed changes before they are saved.",
     "Open Chats to return to an earlier conversation.",
     "Start a new conversation for a separate topic.",
@@ -1228,133 +1191,6 @@ if (window.visualViewport) {
 // Initialize custom selects after DOM is ready
 initCustomSelects();
 
-function openAddDialog() {
-  editingItemId = null;
-  els.form.reset();
-  addConflictConfirmed = "";
-  clearAddFormError();
-  const category = els.form.elements.category;
-  if (Array.from(category.options).some(option => option.value === "Personal")) category.value = "Personal";
-  else if (category.options.length) category.selectedIndex = 0;
-  els.form.elements.type.value = "activity";
-  els.recurrenceFrequency.value = "";
-  els.form.elements.recurrenceInterval.value = "1";
-  els.form.elements.start.value = "";
-  els.form.elements.end.value = "";
-  window.customSelectType?.sync(false);
-  window.customSelectFrequency?.sync(false);
-  window.customSelectCategory?.sync(false);
-  els.form.date.value = localDateString(new Date());
-  updateDateDisplay(els.form.date.value);
-  updateTimeDisplay("start", "");
-  updateTimeDisplay("end", "");
-  updateWeekdayButtons([]);
-  updateCategorySwatch(category.value);
-  els.addDialogTitle.textContent = "Add new item";
-  els.dialog.querySelector(".eyebrow").textContent = "Create";
-  document.querySelector("#saveItemButton").textContent = "Save item";
-  document.querySelector("#saveItemButton").disabled = false;
-  updateFieldVisibility("activity");
-  els.dialog.showModal();
-  els.form.elements.title.focus();
-}
-
-window.openGuidedAddDialog = values => {
-  openAddDialog();
-  const form = els.form.elements;
-  form.type.value = values.itemType || "activity";
-  form.title.value = values.title || "";
-  form.date.value = values.date || localDateString(new Date());
-  form.start.value = values.start || "";
-  form.end.value = values.end || "";
-  form.category.value = values.category || "Personal";
-  form.notes.value = values.notes || "";
-  form.recurrenceFrequency.value = values.recurrence?.frequency || "";
-  form.recurrenceInterval.value = String(values.recurrence?.interval || 1);
-  updateFieldVisibility(form.type.value);
-  updateDateDisplay(form.date.value);
-  updateTimeDisplay("start", form.start.value);
-  updateTimeDisplay("end", form.end.value);
-  updateWeekdayButtons(values.recurrence?.days || []);
-  updateCategorySwatch(form.category.value);
-  window.customSelectType?.sync(false);
-  window.customSelectFrequency?.sync(false);
-  window.customSelectCategory?.sync(false);
-  form.title.focus();
-};
-
-document.querySelector("#closeAddButton").addEventListener("click", () => { if (!addWriteInProgress) els.dialog.close(); });
-els.dialog.addEventListener("cancel", event => { if (addWriteInProgress) event.preventDefault(); });
-els.dialog.addEventListener("close", () => {
-  editingItemId = null;
-  addConflictConfirmed = "";
-  closeAllPopovers();
-  window.guidedAddDialogClosed?.();
-});
-els.type.addEventListener("change", () => {
-  updateFieldVisibility(els.type.value);
-});
-document.querySelector("#itemCategory").addEventListener("change", event => updateCategorySwatch(event.currentTarget.value));
-
-// ── Field visibility by item type ──────────────────────────────────────────
-
-function updateFieldVisibility(type) {
-  const isTask = type === "task";
-
-  // Close time popovers when time fields become hidden.
-  if (isTask) {
-    closeTimePicker("start");
-    closeTimePicker("end");
-  }
-
-  els.timeFields.hidden = isTask;
-  if (isTask) {
-    els.form.elements.start.value = "";
-    els.form.elements.end.value = "";
-    els.recurrenceFrequency.value = "";
-    els.form.elements.recurrenceInterval.value = "1";
-    updateWeekdayButtons([]);
-    window.customSelectFrequency?.sync(false);
-    updateTimeDisplay("start", "");
-    updateTimeDisplay("end", "");
-  }
-
-  // Recurrence: always show the fieldset header; details depend on frequency
-  const frequency = els.recurrenceFrequency.value;
-  updateFrequencyVisibility(frequency, isTask);
-}
-
-function updateFrequencyVisibility(frequency, isTask = false) {
-  const hasRepeat = Boolean(frequency);
-  const isWeekly = frequency === "weekly";
-  const isDailyOrWeeklyOrMonthly = frequency === "daily" || frequency === "weekly" || frequency === "monthly";
-  if (!isWeekly) updateWeekdayButtons([]);
-
-  // Every control: only when repeating
-  document.querySelector("#everyControl").hidden = !hasRepeat;
-
-  // Unit label
-  const unitEl = document.querySelector("#everyUnit");
-  if (unitEl) {
-    if (frequency === "daily") unitEl.textContent = "day(s)";
-    else if (frequency === "weekly") unitEl.textContent = "week(s)";
-    else if (frequency === "monthly") unitEl.textContent = "month(s)";
-  }
-
-  // Weekday selector: only weekly
-  document.querySelector("#weekdaySelector").hidden = !(isWeekly && hasRepeat);
-
-  // Monthly control: only monthly
-  document.querySelector("#monthlyControl").hidden = !(frequency === "monthly" && hasRepeat);
-
-  // For tasks, hide recurrence details entirely (tasks don't repeat in this version)
-  if (isTask) {
-    document.querySelector("#everyControl").hidden = true;
-    document.querySelector("#weekdaySelector").hidden = true;
-    document.querySelector("#monthlyControl").hidden = true;
-  }
-}
-
 // ── Display updates ────────────────────────────────────────────────────────
 
 function updateDateDisplay(dateString) {
@@ -1408,171 +1244,16 @@ function updateWeekdayButtons(days) {
   });
 }
 
-// ── Form submit ────────────────────────────────────────────────────────────
 
-function clearAddFormError() {
-  const error = document.querySelector("#addFormError");
-  if (error) { error.textContent = ""; error.hidden = true; }
-  els.form.querySelectorAll("[aria-invalid='true']").forEach(control => control.removeAttribute("aria-invalid"));
-}
 
-function showAddFormError(message, control = null) {
-  const error = document.querySelector("#addFormError");
-  if (error) { error.textContent = message; error.hidden = false; }
-  if (control) {
-    control.setAttribute("aria-invalid", "true");
-    control.focus();
-  }
-}
 
-function validateAddForm(values) {
-  const title = els.form.elements.title;
-  const dateTrigger = document.querySelector("#dateTrigger");
-  const startTrigger = document.querySelector("#startTimeTrigger");
-  const endTrigger = document.querySelector("#endTimeTrigger");
-  const categoryTrigger = document.querySelector("#categoryTrigger");
-  const frequencyTrigger = document.querySelector("#recurrenceFrequencyTrigger");
-  const type = values.type;
-  if (!values.title.trim()) return { message: "Enter a title.", control: title };
-  if (!values.date || !scheduleValidateDate(values.date)) return { message: "Select a date.", control: dateTrigger };
-  if (!values.category || !saGetAvailableCategories().includes(values.category)) return { message: "Select a category.", control: categoryTrigger };
-  if (!(["activity", "task", "routine"].includes(type))) return { message: "Select an item type.", control: document.querySelector("#typeTrigger") };
-  if (type === "activity") {
-    if (!values.start || !scheduleValidateTime(values.start)) return { message: "Select a start time.", control: startTrigger };
-    if (!values.end || !scheduleValidateTime(values.end)) return { message: "Select an end time.", control: endTrigger };
-    if (values.end <= values.start) return { message: "End time must be later than start time.", control: endTrigger };
-  }
-  if (type === "routine" && !values.recurrenceFrequency) return { message: "Select a frequency.", control: frequencyTrigger };
-  if (type !== "task" && values.recurrenceFrequency) {
-    if (!["daily", "weekly", "monthly"].includes(values.recurrenceFrequency)) return { message: "Select a valid frequency.", control: frequencyTrigger };
-    const interval = Number(values.recurrenceInterval);
-    if (!Number.isInteger(interval) || interval < 1 || interval > 365) return { message: "Enter a valid recurrence interval.", control: els.form.elements.recurrenceInterval };
-    if (values.recurrenceFrequency === "weekly" && !values.days.length) return { message: "Select at least one weekday.", control: document.querySelector(".weekday-button") };
-  }
-  return null;
-}
 
-els.form.addEventListener("submit", async event => {
-  event.preventDefault();
-  if (addWriteInProgress) return;
-  try {
-  closeAllPopovers();
-  clearAddFormError();
-  // Custom controls use native fields as their source of truth. Synchronize
-  // displays and weekday buttons before constructing the one submit payload.
-  window.customSelectType?.sync(false);
-  window.customSelectFrequency?.sync(false);
-  window.customSelectCategory?.sync(false);
-  const selectedDays = Array.from(document.querySelectorAll(".weekday-button[aria-pressed='true']"))
-    .map(button => Number(button.dataset.day));
-  const data = new FormData(els.form);
-  const recurrenceFrequency = String(data.get("recurrenceFrequency") || "");
-  let recurrence = null;
-  if (recurrenceFrequency && data.get("type") !== "task") {
-    recurrence = {
-      frequency: recurrenceFrequency,
-      interval: Number(data.get("recurrenceInterval")) || 1,
-      days: selectedDays
-    };
-  }
-  const values = {
-    title: String(data.get("title") || ""), date: String(data.get("date") || ""), type: String(data.get("type") || ""),
-    start: data.get("type") === "task" ? "" : String(data.get("start") || ""),
-    end: data.get("type") === "task" ? "" : String(data.get("end") || ""),
-    category: String(data.get("category") || ""), notes: String(data.get("notes") || ""),
-    recurrenceFrequency, recurrenceInterval: String(data.get("recurrenceInterval") || "1"), days: selectedDays
-  };
-  const invalid = validateAddForm(values);
-  if (invalid) { showAddFormError(invalid.message, invalid.control); return; }
-  const updates = {
-    title: values.title.trim(), date: values.date, type: values.type,
-    start: values.start, end: values.end, category: values.category,
-    notes: values.notes.trim(),
-    recurrence,
-    schedulePending: false
-  };
-  const candidate = { ...(editingItemId ? items.find(item => item.id === editingItemId) : {}), ...updates, id: editingItemId || "__new_add_item__", status: editingItemId ? (items.find(item => item.id === editingItemId)?.status || "upcoming") : "upcoming" };
-  const conflict = candidate.date && candidate.start && candidate.end
-    ? saDetectConflictsForDate(candidate.date, [...items.filter(item => item.id !== editingItemId), candidate]).find(item => item.firstItemId === candidate.id || item.secondItemId === candidate.id)
-    : null;
-  const conflictKey = conflict ? `${candidate.date}|${candidate.start}|${candidate.end}|${conflict.pairKey}` : "";
-  if (conflict && conflictKey !== addConflictConfirmed) {
-    addConflictConfirmed = conflictKey;
-    const otherTitle = conflict.firstItemId === candidate.id ? conflict.secondTitle : conflict.firstTitle;
-    showAddFormError(`Schedule conflict: ${candidate.title} overlaps with ${otherTitle} from ${formatTime(conflict.overlapStart)} to ${formatTime(conflict.overlapEnd)}. Revise the time or select Save anyway.`);
-    document.querySelector("#saveItemButton").textContent = "Save anyway";
-    return;
-  }
-  const saveButton = document.querySelector("#saveItemButton");
-  addWriteInProgress = true;
-  saveButton.disabled = true;
-  saveButton.setAttribute("aria-busy", "true");
-  saveButton.textContent = "Saving…";
-  document.querySelector("#closeAddButton").disabled = true;
-  let result;
-  try {
-    result = editingItemId
-      ? await saUpdateItem(editingItemId, updates)
-      : await saCreateItem({ ...updates, status: "upcoming", postponed: 0 });
-  } catch {
-    console.error(editingItemId ? "schedule_update_failed" : "schedule_create_failed");
-    result = { success: false };
-  } finally {
-    addWriteInProgress = false;
-    saveButton.removeAttribute("aria-busy");
-    document.querySelector("#closeAddButton").disabled = false;
-  }
-  if (!result?.success) {
-    saveButton.disabled = false;
-    saveButton.textContent = addConflictConfirmed ? "Save anyway" : (editingItemId ? "Save changes" : "Save item");
-    showAddFormError("The item could not be saved. Try again.");
-    return;
-  }
-  if (result.item && typeof window.refreshAssistantScheduleItem === "function") {
-    window.refreshAssistantScheduleItem(result.item, editingItemId ? "updated" : "created");
-  }
-  if (!editingItemId && result.item) await window.completeGuidedAddFromForm?.(result.item);
-  els.form.reset();
-  editingItemId = null;
-  addConflictConfirmed = "";
-  els.form.date.value = localDateString(new Date());
-  updateDateDisplay(els.form.date.value);
-  els.form.elements.type.value = "activity";
-  els.recurrenceFrequency.value = "";
-  els.form.elements.recurrenceInterval.value = "1";
-  window.customSelectType?.sync(false);
-  window.customSelectFrequency?.sync(false);
-  window.customSelectCategory?.sync(false);
-  updateTimeDisplay("start", "");
-  updateTimeDisplay("end", "");
-  updateWeekdayButtons([]);
-  clearAddFormError();
-  updateFieldVisibility("activity");
-  els.dialog.close();
-  } catch {
-    console.error("[schedule-save] add_validation_exception");
-    addWriteInProgress = false;
-    const saveButton = document.querySelector("#saveItemButton");
-    saveButton.disabled = false;
-    saveButton.removeAttribute("aria-busy");
-    saveButton.textContent = editingItemId ? "Save changes" : "Save item";
-    document.querySelector("#closeAddButton").disabled = false;
-    showAddFormError("The item could not be saved. Try again.");
-  }
-});
 
-els.form.addEventListener("input", () => {
-  clearAddFormError();
-  addConflictConfirmed = "";
-  const button = document.querySelector("#saveItemButton");
-  if (button && !addWriteInProgress) button.textContent = editingItemId ? "Save changes" : "Save item";
-});
-els.form.addEventListener("change", () => {
-  clearAddFormError();
-  addConflictConfirmed = "";
-  const button = document.querySelector("#saveItemButton");
-  if (button && !addWriteInProgress) button.textContent = editingItemId ? "Save changes" : "Save item";
-});
+
+
+
+
+
 
 // ── Date picker ────────────────────────────────────────────────────────────
 
@@ -1665,29 +1346,7 @@ function selectDate(dateStr) {
   closeDatePicker();
 }
 
-document.querySelector("#datePrevMonth").addEventListener("click", () => {
-  datePickerState.month--;
-  if (datePickerState.month < 0) { datePickerState.month = 11; datePickerState.year--; }
-  renderDateGrid();
-});
-document.querySelector("#dateNextMonth").addEventListener("click", () => {
-  datePickerState.month++;
-  if (datePickerState.month > 11) { datePickerState.month = 0; datePickerState.year++; }
-  renderDateGrid();
-});
-document.querySelector("#dateToday").addEventListener("click", () => {
-  const now = new Date();
-  const todayStr = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-" + String(now.getDate()).padStart(2, "0");
-  selectDate(todayStr);
-});
-document.querySelector("#dateClear").addEventListener("click", () => {
-  const hidden = document.querySelector("#dateHidden");
-  hidden.value = "";
-  updateDateDisplay("");
-  closeDatePicker();
-});
-document.querySelector("#closeDatePopover").addEventListener("click", closeDatePicker);
-document.querySelector("#dateTrigger").addEventListener("click", openDatePicker);
+
 
 // ── Time picker (shared) ───────────────────────────────────────────────────
 
@@ -1765,47 +1424,8 @@ function clearTimePicker(field) {
   closeTimePicker(field);
 }
 
-for (const field of ["start", "end"]) {
-  document.querySelectorAll(`#${field}HourScroll .time-hour`).forEach(btn => {
-    btn.addEventListener("click", () => setTimeValue("hour", btn.dataset.value));
-  });
-  document.querySelectorAll(`#${field}MinuteScroll .time-minute`).forEach(btn => {
-    btn.addEventListener("click", () => setTimeValue("minute", btn.dataset.value));
-  });
-  document.querySelectorAll(`#${field}AmPmScroll .time-ampm`).forEach(btn => {
-    btn.addEventListener("click", () => setTimeValue("ampm", btn.dataset.value));
-  });
-  document.querySelector(`#${field}TimeConfirm`).addEventListener("click", () => confirmTimePicker());
-  document.querySelector(`#${field}TimeClear`).addEventListener("click", () => clearTimePicker(field));
-  document.querySelector(`#${field}TimeTrigger`).addEventListener("click", () => openTimePicker(field));
-  document.querySelector(`#close${field.charAt(0).toUpperCase() + field.slice(1)}TimePopover`).addEventListener("click", () => closeTimePicker(field));
-}
-
-document.querySelector("#startTimeClear").hidden = true;
-document.querySelector("#endTimeClear").hidden = true;
-
-// ── Weekday selector ───────────────────────────────────────────────────────
-
-document.querySelectorAll(".weekday-button").forEach(btn => {
-  btn.addEventListener("click", () => {
-    const pressed = btn.getAttribute("aria-pressed") === "true";
-    btn.setAttribute("aria-pressed", String(!pressed));
-    clearAddFormError();
-    addConflictConfirmed = "";
-    document.querySelector("#saveItemButton").textContent = editingItemId ? "Save changes" : "Save item";
-  });
-});
 
 // ── Frequency change ───────────────────────────────────────────────────────
-
-if (window.customSelectFrequency) {
-  const origChoose = window.customSelectFrequency.choose.bind(window.customSelectFrequency);
-  window.customSelectFrequency.choose = (index) => {
-    origChoose(index);
-    const freq = document.querySelector("#recurrenceFrequency").value;
-    updateFrequencyVisibility(freq, els.type.value === "task");
-  };
-}
 
 document.querySelector("#postponeForm").addEventListener("input", () => {
   postponeConflictConfirmed = "";
@@ -1829,7 +1449,24 @@ els.postponeKeepDuration.addEventListener("change", () => {
 els.postponeForm.addEventListener("submit", savePostponement);
 document.querySelector("#cancelPostponeButton").addEventListener("click", () => { if (!postponeWriteInProgress) els.postponeDialog.close("cancel"); });
 document.querySelector("#closePostponeButton").addEventListener("click", () => { if (!postponeWriteInProgress) els.postponeDialog.close("cancel"); });
-document.querySelector("#editPostponedItem").addEventListener("click", () => { if (postponeTargetId && !postponeWriteInProgress) openEditItem(postponeTargetId); });
+document.querySelector("#editPostponedItem").addEventListener("click", () => {
+  if (!postponeTargetId || postponeWriteInProgress) return;
+  const item = items.find(candidate => candidate.id === postponeTargetId);
+  if (!item) return;
+  const draft = getPostponeSchedule(item);
+  const hasDraft = els.postponeUnknown.checked || els.postponeNewDate.value !== (item.date || "")
+    || els.postponeNewStart.value !== (item.start || "") || els.postponeNewEnd.value !== (item.end || "");
+  const canCarryDraft = !draft.error && !draft.schedulePending;
+  if (hasDraft && !canCarryDraft && !window.confirm("Discard the postponement details and edit the item in Assistant?")) return;
+  els.postponeDialog.close("edit");
+  if (typeof window.startAssistantScheduleEdit === "function") {
+    window.startAssistantScheduleEdit(postponeTargetId, canCarryDraft && hasDraft ? {
+      proposedDate: draft.date,
+      proposedStart: draft.start,
+      proposedEnd: draft.end
+    } : {});
+  }
+});
 els.postponeDialog.addEventListener("click", event => { if (event.target === els.postponeDialog && !postponeWriteInProgress) els.postponeDialog.close("cancel"); });
 els.postponeDialog.addEventListener("cancel", event => { if (postponeWriteInProgress) event.preventDefault(); });
 els.postponeDialog.addEventListener("close", () => {

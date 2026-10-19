@@ -1867,15 +1867,6 @@ button.primary-button[type="submit"] { margin-top: var(--notes-action-gap); marg
 dialog:not([open]) {
   display: none;
 }
-dialog#addDialog {
-  overflow: hidden;
-}
-dialog#addDialog[open] { display: block; }
-dialog#addDialog form { display: block; overflow-y: auto; overscroll-behavior: contain; padding: var(--form-padding); padding-bottom: calc(var(--form-padding) + 24px + env(safe-area-inset-bottom)); scrollbar-width: none; }
-dialog#addDialog form::-webkit-scrollbar { display: none; }
-dialog#addDialog { width: min(480px, calc(100% - 24px)); max-height: 94dvh; border: 1px solid var(--color-border); border-radius: 16px; padding: 0; background: var(--color-surface); color: var(--color-text); box-shadow: 0 24px 80px rgba(0, 0, 0, .5); }
-.form-error { margin: 4px 0 10px; color: #fca5a5; font-size: .88rem; line-height: 1.45; }
-.form-error[hidden] { display: none; }
 
 .guidance-dialog { width: min(400px, calc(100% - 32px)); border-color: #343840; border-radius: 14px; background: #1C1E23; box-shadow: 0 18px 48px rgba(0, 0, 0, .36); }
 .guidance-content { padding: 20px; }
